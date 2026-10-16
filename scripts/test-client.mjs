@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const e2e = process.argv.includes('--e2e');
 const fakeBin = join(root, 'test', 'fake-zcode.cjs');
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS) || 600000;
 let failures = 0;
 
 function assertThat(cond, label) {
@@ -27,6 +28,7 @@ class McpClient {
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = '';
+    this.dead = null;
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk) => {
       this.buffer += chunk;
@@ -37,16 +39,37 @@ class McpClient {
         if (!line.trim()) continue;
         const msg = JSON.parse(line);
         if (msg.id !== undefined && this.pending.has(msg.id)) {
-          this.pending.get(msg.id)(msg);
+          const { resolve, timer } = this.pending.get(msg.id);
+          clearTimeout(timer);
           this.pending.delete(msg.id);
+          resolve(msg);
         }
       }
     });
+    const die = (err) => {
+      if (this.dead) return;
+      this.dead = err;
+      for (const { reject, timer } of this.pending.values()) {
+        clearTimeout(timer);
+        reject(err);
+      }
+      this.pending.clear();
+    };
+    this.child.on('exit', (code) => die(new Error(`server exited (code ${code})`)));
+    this.child.on('error', (err) => die(err));
   }
   request(method, params) {
     const id = this.nextId++;
-    return new Promise((resolve) => {
-      this.pending.set(id, resolve);
+    return new Promise((resolve, reject) => {
+      if (this.dead) {
+        reject(this.dead);
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`request ${method} timed out after ${requestTimeoutMs}ms`));
+      }, requestTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
       this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   }
