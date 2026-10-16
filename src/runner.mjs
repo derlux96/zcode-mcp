@@ -145,7 +145,9 @@ export async function createWorktree(cwd) {
   const slug = newWorktreeSlug();
   const branch = `zcode/${slug}`;
   const dir = join(cwd, '.zcode-worktrees', slug);
-  await run(['worktree', 'add', '-b', branch, dir], cwd);
+  // Write the exclude entry before any git mutation: non-standard .git
+  // layouts (subdirectory cwd, linked worktrees) fail cleanly here, before
+  // the branch or worktree exists (Controller Ruling 7).
   const excludePath = join(cwd, '.git', 'info', 'exclude');
   let exclude = '';
   try {
@@ -156,6 +158,7 @@ export async function createWorktree(cwd) {
   if (!exclude.includes('.zcode-worktrees/')) {
     appendFileSync(excludePath, `${exclude.endsWith('\n') || exclude === '' ? '' : '\n'}.zcode-worktrees/\n`);
   }
+  await run(['worktree', 'add', '-b', branch, dir], cwd);
   return { dir, branch, slug };
 }
 
