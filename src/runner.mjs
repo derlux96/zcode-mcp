@@ -159,11 +159,17 @@ export async function createWorktree(cwd) {
     appendFileSync(excludePath, `${exclude.endsWith('\n') || exclude === '' ? '' : '\n'}.zcode-worktrees/\n`);
   }
   await run(['worktree', 'add', '-b', branch, dir], cwd);
-  return { dir, branch, slug };
+  // Starting commit: worktreeSummary diffs against it, so committed and
+  // staged work (ZCode is expected to commit during tasks) is not missed.
+  const startSha = (await run(['rev-parse', 'HEAD'], cwd)).trim();
+  return { dir, branch, slug, startSha };
 }
 
-export async function worktreeSummary(dir) {
-  const diffStat = (await run(['diff', '--stat'], dir)).trim();
+export async function worktreeSummary(dir, startSha) {
+  // Diff against the worktree's starting commit: `git diff --stat` with no
+  // ref is working-tree-vs-index, so staged and committed files would
+  // vanish. One ref diff covers committed + staged + unstaged.
+  const diffStat = (await run(startSha ? ['diff', '--stat', startSha] : ['diff', '--stat'], dir)).trim();
   const status = await run(['status', '--porcelain'], dir);
   const changedFiles = status.split('\n').map((l) => l.trim()).filter(Boolean);
   // git diff --stat never lists untracked files; surface them so new files

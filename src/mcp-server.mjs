@@ -106,30 +106,44 @@ function buildRunHandler(store) {
 
     const sessionId = res.sessionId || newRunId();
     const status = res.timedOut ? 'timeout' : res.code === 0 ? 'completed' : 'failed';
-    store.append({
-      id: sessionId,
-      kind: res.sessionId ? 'session' : 'run',
-      cwd,
-      mode,
-      promptPreview: prompt.slice(0, 80),
-      startedAt: new Date().toISOString(),
-      status,
-    });
+    // Bookkeeping after task completion must never lose the task result:
+    // a failure here degrades to a warning line instead of a -32603 that
+    // would discard everything ZCode produced.
+    let bookkeepingWarning = null;
+    try {
+      store.append({
+        id: sessionId,
+        kind: res.sessionId ? 'session' : 'run',
+        cwd,
+        mode,
+        promptPreview: prompt.slice(0, 80),
+        startedAt: new Date().toISOString(),
+        status,
+      });
+    } catch (error) {
+      bookkeepingWarning = `[warning] session bookkeeping failed: ${error.message}`;
+    }
 
     const lines = [
       `status: ${status} (exit ${res.code}${res.timedOut ? ', timed out' : ''})`,
       `session_id: ${sessionId}${res.sessionId ? '' : '  (server run-id, not resumable)'}`,
     ];
     if (worktree) {
-      const summary = await worktreeSummary(worktree.dir);
+      let summary = null;
+      try {
+        summary = await worktreeSummary(worktree.dir, worktree.startSha);
+      } catch (error) {
+        lines.push(`[warning] worktree summary failed: ${error.message}`);
+      }
       lines.push(
         `worktree_branch: ${worktree.branch}`,
         `worktree_dir: ${worktree.dir}`,
-        `changed_files: ${summary.changedFiles.length ? summary.changedFiles.join(', ') : 'none'}`,
-        `diff_stat:\n${summary.diffStat || '(no changes)'}`,
+        `changed_files: ${summary ? (summary.changedFiles.length ? summary.changedFiles.join(', ') : 'none') : '(unavailable)'}`,
+        `diff_stat:\n${summary ? (summary.diffStat || '(no changes)') : '(unavailable)'}`,
         'worktree kept — merge it (git merge) or remove it (git worktree remove) explicitly.'
       );
     }
+    if (bookkeepingWarning) lines.push(bookkeepingWarning);
     lines.push('--- zcode output ---', res.stdout);
     if (res.stderr.trim()) lines.push('--- zcode stderr ---', res.stderr);
 
