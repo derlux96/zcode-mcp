@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
-import { statSync } from 'node:fs';
+import { appendFileSync, readFileSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
 
 export const OUTPUT_CAP = 100000;
 export const DEFAULT_TIMEOUT_MS = 600000;
@@ -118,4 +119,52 @@ export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume
 
 export function newRunId() {
   return `run_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+}
+
+const run = (args, cwd) =>
+  new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`git ${args[0]} failed: ${err || out}`))));
+  });
+
+export function newWorktreeSlug() {
+  return `${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+}
+
+export async function assertGitRepo(cwd) {
+  const out = await run(['rev-parse', '--is-inside-work-tree'], cwd);
+  if (out.trim() !== 'true') throw new Error(`${cwd} is not a git work tree`);
+}
+
+export async function createWorktree(cwd) {
+  const slug = newWorktreeSlug();
+  const branch = `zcode/${slug}`;
+  const dir = join(cwd, '.zcode-worktrees', slug);
+  await run(['worktree', 'add', '-b', branch, dir], cwd);
+  const excludePath = join(cwd, '.git', 'info', 'exclude');
+  let exclude = '';
+  try {
+    exclude = readFileSync(excludePath, 'utf8');
+  } catch {
+    // no exclude file yet — create it below
+  }
+  if (!exclude.includes('.zcode-worktrees/')) {
+    appendFileSync(excludePath, `${exclude.endsWith('\n') || exclude === '' ? '' : '\n'}.zcode-worktrees/\n`);
+  }
+  return { dir, branch, slug };
+}
+
+export async function worktreeSummary(dir) {
+  const diffStat = (await run(['diff', '--stat'], dir)).trim();
+  const status = await run(['status', '--porcelain'], dir);
+  const changedFiles = status.split('\n').map((l) => l.trim()).filter(Boolean);
+  // git diff --stat never lists untracked files; surface them so new files
+  // created in the worktree appear in the summary.
+  const untracked = changedFiles.filter((l) => l.startsWith('??'));
+  return { diffStat: [diffStat, ...untracked].filter(Boolean).join('\n'), changedFiles };
 }
