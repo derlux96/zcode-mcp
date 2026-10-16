@@ -53,7 +53,7 @@ const toolSchemas = {
         model: {
           type: 'string',
           description:
-            'Run via the internal app-server protocol with an explicit model: "modelId" (resolved against this machine\'s model catalog) or "providerId/modelId" (exact). Setting model switches off the default CLI path; resume and target do not apply in this mode. Find catalog ids via zcode_check with include_models.',
+            'Run via the internal app-server protocol with an explicit model: "modelId" (resolved against this machine\'s model catalog) or "providerId/modelId" (exact). Setting model switches off the default CLI path, which runs autonomously (yolo semantics): mode other than yolo, resume, and target do not apply. Find catalog ids via zcode_check with include_models.',
         },
         reasoning_level: {
           type: 'string',
@@ -160,7 +160,7 @@ function capBody(body) {
  * skill/agent contract stays uniform.
  */
 async function runWithModelMode(store, args, v) {
-  const { prompt, cwd, resume, target, timeoutMs, isolateWorktree } = v;
+  const { prompt, cwd, mode, resume, target, timeoutMs, isolateWorktree } = v;
   const model = args.model;
   const reasoningLevel = args.reasoning_level === undefined ? 'high' : args.reasoning_level;
   // Everything that can be rejected without a spawn is rejected here, before
@@ -177,6 +177,9 @@ async function runWithModelMode(store, args, v) {
   if (target) {
     return failText('Invalid arguments: target is not supported together with model');
   }
+  if (mode !== 'yolo') {
+    return failText('Invalid arguments: mode is not supported when model is set — protocol mode runs autonomously (yolo semantics); omit mode');
+  }
 
   let binPath;
   try {
@@ -185,22 +188,9 @@ async function runWithModelMode(store, args, v) {
     return failText(`ZCode binary not found. ${error.message}`);
   }
 
-  // Worktree isolation applies first: the protocol session then runs in the
-  // worktree directory, exactly like the CLI path.
-  let worktree = null;
-  if (isolateWorktree) {
-    try {
-      await assertGitRepo(cwd);
-      worktree = await createWorktree(cwd);
-    } catch (error) {
-      return failText(`isolate_worktree requires a git repository: ${error.message}`);
-    }
-  }
-  const effectiveCwd = worktree ? worktree.dir : cwd;
-
-  // Resolve the model spec. "providerId/modelId" splits statically; a bare
-  // modelId is resolved against the machine catalog via a throwaway session
-  // (create only, no turn) so the user gets an actionable listing on a miss.
+  // Resolve the model BEFORE creating a worktree: an unresolvable model must
+  // not leak a git branch + .zcode-worktrees dir. The catalog fetch is
+  // machine-level, so it runs against cwd — the worktree does not exist yet.
   const spec = model.trim();
   const slash = spec.indexOf('/');
   let providerId;
@@ -211,7 +201,7 @@ async function runWithModelMode(store, args, v) {
   } else {
     let catalog = null;
     try {
-      catalog = await getModelCatalog({ binPath, cwd: effectiveCwd, timeoutMs: MODEL_CATALOG_TIMEOUT_MS });
+      catalog = await getModelCatalog({ binPath, cwd, timeoutMs: MODEL_CATALOG_TIMEOUT_MS });
     } catch (error) {
       return failText(`Model catalog unavailable, cannot resolve '${spec}': ${error.message}`);
     }
@@ -225,6 +215,19 @@ async function runWithModelMode(store, args, v) {
     }
     ({ providerId, modelId } = resolved);
   }
+
+  // Worktree isolation: the protocol session runs in the worktree directory,
+  // exactly like the CLI path.
+  let worktree = null;
+  if (isolateWorktree) {
+    try {
+      await assertGitRepo(cwd);
+      worktree = await createWorktree(cwd);
+    } catch (error) {
+      return failText(`isolate_worktree requires a git repository: ${error.message}`);
+    }
+  }
+  const effectiveCwd = worktree ? worktree.dir : cwd;
 
   // runTaskWithModel resolves with the turn outcome and rejects on timeouts,
   // protocol errors, and child death.

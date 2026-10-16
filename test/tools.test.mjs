@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createProtocol } from '../src/protocol.mjs';
 import { buildTools } from '../src/mcp-server.mjs';
 import { SessionStore } from '../src/state.mjs';
-import { makeTempDir, removeDir, fakeBin, makeGitRepo } from './helpers.mjs';
+import { makeTempDir, removeDir, fakeBin, makeGitRepo, run } from './helpers.mjs';
 
 const fakeAppserverBin = new URL('./fake-appserver.cjs', import.meta.url).pathname;
 
@@ -121,6 +121,8 @@ test('zcode_sessions lists recorded entries and flags run-ids', async () => {
 test('zcode_run with a bare model id: completed, real sess_ id, state entry', async () => {
   await withAppserver('ok', async () => {
     const cwd = makeTempDir('zcode-runb-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
     try {
       const reply = await call('zcode_run', { prompt: 'say hi', cwd, model: 'small' });
       const text = textOf(reply);
@@ -133,7 +135,11 @@ test('zcode_run with a bare model id: completed, real sess_ id, state entry', as
       assert.equal(entries[0].kind, 'session');
       assert.equal(entries[0].id, 'sess_fakeB1');
       assert.equal(entries[0].status, 'completed');
+      // Bare modelId costs two sessions: throwaway catalog fetch + the run.
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      assert.equal(received.filter((m) => m.method === 'session/create').length, 2);
     } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
       removeDir(cwd);
     }
   });
@@ -154,6 +160,8 @@ test('zcode_run with "providerId/modelId" passes the resolved selection on the w
         modelId: 'big',
         options: { reasoningLevel: 'high' }, // default when reasoning_level is absent
       });
+      // "providerId/modelId" splits statically: no throwaway catalog session.
+      assert.equal(received.filter((m) => m.method === 'session/create').length, 1);
     } finally {
       delete process.env.FAKE_APPSERVER_LOG;
       removeDir(cwd);
@@ -273,11 +281,50 @@ test('zcode_run model mode honors isolate_worktree (session runs in the worktree
       assert.match(text, /status: completed/);
       assert.match(text, /worktree_branch: zcode\//);
       const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-      const create = received.find((m) => m.method === 'session/create');
-      assert.ok(create.params.workspace.workspacePath.startsWith(`${repo}/.zcode-worktrees/`), 'the worktree dir is the protocol workspace');
+      const creates = received.filter((m) => m.method === 'session/create');
+      assert.equal(creates.length, 2, 'catalog fetch + run session');
+      assert.equal(creates[0].params.workspace.workspacePath, repo, 'catalog fetch runs against cwd before the worktree exists');
+      assert.ok(creates[1].params.workspace.workspacePath.startsWith(`${repo}/.zcode-worktrees/`), 'the run session uses the worktree dir');
     } finally {
       delete process.env.FAKE_APPSERVER_LOG;
       removeDir(repo);
+    }
+  });
+});
+
+test('zcode_run model mode with an unresolvable model creates NO worktree', async () => {
+  await withAppserver('ok', async () => {
+    const repo = makeGitRepo();
+    try {
+      const reply = await call('zcode_run', { prompt: 'x', cwd: repo, model: 'does-not-exist', isolate_worktree: true });
+      assert.equal(reply.result.isError, true);
+      assert.match(textOf(reply), /Available models:/);
+      assert.equal(existsSync(join(repo, '.zcode-worktrees')), false, 'no worktree dir leaked');
+      assert.equal(run(repo, 'git', ['branch', '--list', 'zcode/*']).trim(), '', 'no zcode/ branch leaked');
+      assert.equal(store.list().length, 0);
+    } finally {
+      removeDir(repo);
+    }
+  });
+});
+
+test('zcode_run model mode rejects mode instead of silently dropping it', async () => {
+  await withAppserver('ok', async () => {
+    const cwd = makeTempDir('zcode-runb-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'small', mode: 'plan' });
+      assert.equal(reply.result.isError, true);
+      assert.match(textOf(reply), /mode/);
+      assert.equal(existsSync(log), false, 'rejection happens before any spawn');
+      assert.equal(store.list().length, 0);
+      // The default yolo is what protocol mode actually does: explicit is fine.
+      const yolo = await call('zcode_run', { prompt: 'x', cwd, model: 'small', mode: 'yolo' });
+      assert.match(textOf(yolo), /status: completed/);
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
     }
   });
 });
@@ -295,11 +342,20 @@ test('zcode_check with include_models appends the catalog from the app-server', 
 
 test('zcode_check without include_models keeps the v1 output (no models section)', async () => {
   await withAppserver('ok', async () => {
-    const reply = await call('zcode_check', {});
-    const text = textOf(reply);
-    assert.match(text, /"ok": true/);
-    assert.doesNotMatch(text, /models:/);
-    assert.doesNotMatch(text, /warning/);
+    const cwd = makeTempDir('zcode-check-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const reply = await call('zcode_check', {});
+      const text = textOf(reply);
+      assert.match(text, /"ok": true/);
+      assert.doesNotMatch(text, /models:/);
+      assert.doesNotMatch(text, /warning/);
+      assert.equal(existsSync(log), false, 'fast path: no app-server spawn at all');
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
   });
 });
 
