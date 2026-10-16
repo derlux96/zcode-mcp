@@ -398,3 +398,41 @@ export async function runTaskWithModel({
     await client.close();
   }
 }
+
+/**
+ * Fetch the machine's model catalog (settings.model.available from a
+ * session/create response, notes §10) without running a turn: spawn the
+ * app-server, create one throwaway session, close. Returns the catalog
+ * array, or null when the response carries none. Rejects on protocol
+ * errors, timeouts, and child death — callers decide how to degrade.
+ */
+export async function getModelCatalog({
+  binPath,
+  cwd,
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  spawnFn,
+} = {}) {
+  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
+    throw new TypeError('cwd must be an absolute path');
+  }
+  let isDir = false;
+  try {
+    isDir = statSync(cwd).isDirectory();
+  } catch {
+    // reported below
+  }
+  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+
+  const client = new AppServerClient({ binPath, cwd, spawnFn });
+  try {
+    await client.settle();
+    const created = await client.request(
+      'session/create',
+      { workspace: { workspacePath: cwd, workspaceKey: cwd } },
+      { timeoutMs },
+    );
+    return (created.settings && created.settings.model && created.settings.model.available) || null;
+  } finally {
+    await client.close();
+  }
+}

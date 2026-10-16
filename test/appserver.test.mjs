@@ -9,6 +9,7 @@ import {
   runTaskWithModel,
   resolveModel,
   resolveBin,
+  getModelCatalog,
   DEFAULT_TASK_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
 } from '../src/appserver.mjs';
@@ -275,6 +276,47 @@ test('resolveModel resolves both spec syntaxes; misses return null', () => {
   assert.equal(resolveModel(catalog, 'unknown-model'), null);
   assert.equal(resolveModel(null, 'small'), null);
   assert.equal(resolveModel(catalog, ''), null);
+});
+
+// --- getModelCatalog ---
+
+test('getModelCatalog returns the create-response catalog without running a turn', async () => {
+  await withMode('ok', async () => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'cat.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const catalog = await getModelCatalog({ binPath: fakeBin, cwd, timeoutMs: 5000 });
+      assert.ok(Array.isArray(catalog));
+      assert.deepEqual(
+        catalog.map((e) => `${e.ref.providerId}/${e.ref.modelId}`),
+        ['glm-test/small', 'glm-test/big', 'fake-openrouter/nimbus-xl'],
+      );
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      assert.ok(received.some((m) => m.method === 'session/create'), 'create fetches the catalog');
+      assert.equal(received.some((m) => m.method === 'session/send'), false, 'no turn is run');
+      assert.equal(received.some((m) => m.method === 'session/subscribe'), false, 'no subscribe needed');
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
+test('getModelCatalog rejects cleanly when the child dies', async () => {
+  await withMode('die', async () => {
+    const cwd = makeTempDir();
+    try {
+      await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd }), AppServerError);
+    } finally {
+      removeDir(cwd);
+    }
+  });
+});
+
+test('getModelCatalog validates cwd like runTaskWithModel', async () => {
+  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: 'relative' }), TypeError);
+  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: '/nowhere/at/all' }), TypeError);
 });
 
 // --- helpers and defaults ---
