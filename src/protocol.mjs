@@ -1,0 +1,63 @@
+export const PARSE_ERROR = -32700;
+export const INVALID_REQUEST = -32600;
+export const METHOD_NOT_FOUND = -32601;
+export const INVALID_PARAMS = -32602;
+export const INTERNAL_ERROR = -32603;
+
+const SUPPORTED_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+const DEFAULT_VERSION = '2025-06-18';
+const DEFAULT_SERVER_INFO = { name: 'zcode-delegate', version: '1.0.0' };
+
+function ok(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function fail(id, code, message) {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+function negotiateVersion(params) {
+  const requested = params && params.protocolVersion;
+  return SUPPORTED_VERSIONS.includes(requested) ? requested : DEFAULT_VERSION;
+}
+
+export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } = {}) {
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  return {
+    async handleMessage(msg) {
+      if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
+        return msg && msg.id !== undefined ? fail(msg.id, INVALID_REQUEST, 'Invalid Request') : null;
+      }
+      if (msg.id === undefined) return null; // notification
+      const { id, method, params } = msg;
+      try {
+        switch (method) {
+          case 'initialize':
+            return ok(id, {
+              protocolVersion: negotiateVersion(params),
+              capabilities: { tools: {} },
+              serverInfo,
+            });
+          case 'ping':
+            return ok(id, {});
+          case 'tools/list':
+            return ok(id, {
+              tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+            });
+          case 'tools/call': {
+            const tool = byName.get(params && params.name);
+            if (!tool) {
+              return fail(id, INVALID_PARAMS, `Unknown tool: ${params && params.name}`);
+            }
+            const result = await tool.handler((params && params.arguments) || {});
+            return ok(id, result);
+          }
+          default:
+            return fail(id, METHOD_NOT_FOUND, `Method not found: ${method}`);
+        }
+      } catch (error) {
+        return fail(id, INTERNAL_ERROR, error && error.message ? error.message : String(error));
+      }
+    },
+  };
+}
