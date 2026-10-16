@@ -14,6 +14,10 @@ if (process.env.FAKE_ZCODE_ECHO_ARGS) {
   console.log(JSON.stringify({ argv: args }));
   process.exit(0);
 }
+if (process.env.FAKE_ZCODE_DUMP_ENV) {
+  console.log(JSON.stringify({ builtinConfig: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || null }));
+  process.exit(0);
+}
 if (mode === 'bigoutput') {
   console.log('x'.repeat(500000));
   // Exit naturally instead of process.exit(0): a 500k write to a pipe is

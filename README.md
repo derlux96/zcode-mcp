@@ -9,6 +9,9 @@ through its official headless CLI. Zero npm dependencies — the MCP server is p
 - Node.js ≥ 18
 - ZCode installed and logged in (`zcode login`). Default binary search order:
   `ZCODE_BIN` env → `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs` (macOS) → `zcode` on PATH.
+- On macOS app-bundle installs the server automatically sets `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`
+  for the spawned CLI (the CLI cannot locate its builtin provider config from a fresh shell);
+  an explicitly pre-set value is never overridden.
 
 ## What the plugin provides
 

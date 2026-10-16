@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
-import { appendFileSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 export const OUTPUT_CAP = 100000;
 export const DEFAULT_TIMEOUT_MS = 600000;
@@ -70,11 +70,26 @@ function extractSessionId(text) {
   return m ? m[0] : null;
 }
 
+// The macOS app bundle's zcode.cjs cannot find its builtin provider config
+// (sibling directory config/provider/zcode-builtin.json) when spawned from a
+// fresh shell — its own lookup resolves to a nonexistent system path. Shells
+// launched by the ZCode app inherit ZCODE_BUILTIN_PROVIDER_CONFIG_FILE; MCP
+// clients spawning this server do not, so inject the sibling config here.
+function buildSpawnEnv(binPath) {
+  const env = { ...process.env };
+  if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
+    const candidate = resolve(dirname(binPath), '../config/provider/zcode-builtin.json');
+    if (existsSync(candidate)) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = candidate;
+  }
+  return env;
+}
+
 export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
+  const env = buildSpawnEnv(binPath);
   const child = isNodeScript
-    ? spawn(process.execPath, [binPath, ...cliArgs], { cwd })
-    : spawn(binPath, cliArgs, { cwd });
+    ? spawn(process.execPath, [binPath, ...cliArgs], { cwd, env })
+    : spawn(binPath, cliArgs, { cwd, env });
 
   return new Promise((resolve) => {
     let stdout = '';
