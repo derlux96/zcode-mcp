@@ -109,13 +109,13 @@ Aufruf: `execFile("node", [<bin>, "-p", prompt, "--cwd", cwd, "--mode", mode, "-
 
 Rückgabe: ZCode-Output (Text), plus wenn extrahierbar: `session_id` (für `resume`) und Exit-Status. Ausgabe-Cap: 100.000 Zeichen, darüber abgeschnitten mit Kennzeichnung.
 
-**`isolate_worktree: true`:** Voraussetzung `cwd` ist Git-Repo (sonst klarer Fehler). Ablauf: `git worktree add <worktree-dir> -b zcode/<slug>` (Slug: Zeitstempel + 6-stelliger Random-Suffix), Task im Worktree ausführen, danach `git diff --stat` + geänderte Dateien einsammeln. Rückgabe: Branch-Name, Worktree-Pfad, Diff-Stat. **Worktree bleibt bestehen** (Nutzer/Grok soll prüfen und mergen können); `git worktree remove` passiert nicht automatisch.
+**`isolate_worktree: true`:** Voraussetzung `cwd` ist Git-Repo (sonst klarer Fehler). Ablauf: `git worktree add <worktree-dir> -b zcode/<slug>` (Slug: Zeitstempel + 6-stelliger Random-Suffix), Task im Worktree ausführen, danach `git diff --stat` + geänderte Dateien einsammeln. Rückgabe: Branch-Name, Worktree-Pfad, Diff-Stat. **Worktree bleibt bestehen** (Nutzer/Grok soll prüfen und mergen können); `git worktree remove` passiert nicht automatisch — die Skill-Doku (§4.1) muss das Mergen/Entfernen ausdrücklich als Verantwortung von Grok/Nutzer benennen.
 
 **`zcode_sessions`** — optionaler Parameter `cwd` (Filter). Listet die Sessions, die über diesen Server liefen, aus dem eigenen State-File (siehe 3.3): Session-ID, cwd, mode, Prompt-Kurzfassung (erste ~80 Zeichen), Zeitstempel, letzter bekannter Status. Kein Lesen interner ZCode-Speicher.
 
 ### 3.3 Session-State
 - Datei `~/.zcode-mcp/sessions.json`, Array von Session-Einträgen, Dateirechte `0600`.
-- `zcode_run` extrahiert die Session-ID best-effort aus dem `--json`-Output; falls das CLI sie (noch) nicht liefert, generiert der Server eine eigene Run-ID und kennzeichnet das im Eintrag. Das ist die einzige State-Quelle für `zcode_sessions`.
+- `zcode_run` extrahiert die Session-ID best-effort aus dem `--json`-Output; falls das CLI sie (noch) nicht liefert, generiert der Server eine eigene Run-ID und kennzeichnet das im Eintrag. **Einträge mit eigener Run-ID sind explizit als nicht-resumable markiert** — weder Grok noch der Nutzer darf `--resume` darauf anwenden (wäre eine nicht-existente ZCode-Session). Das ist die einzige State-Quelle für `zcode_sessions`.
 - State wächst unbegrenzt? Nein — Cap: die letzten 200 Einträge.
 
 ### 3.4 Binary-Discovery (`discover.mjs`)
@@ -132,8 +132,9 @@ Frontmatter (`name: zcode-delegate`, `description:` …) plus Abschnitte:
 2. **Mode matrix** — `plan` für riskante/neue Änderungen (erst Plan prüfen!), `build` für Implementierung nach freigegebenem Plan, `edit` für kleine gezielte Fixe, `yolo` für klar abgegrenzte, autonom abschließbare Tasks (Default des CLI).
 3. **Writing delegation prompts** — Template: Ziel, betroffene Dateien, Edge-Cases, Test-Anforderung, Definition-of-Done. Grok schreibt die Spezifikation, ZCode führt aus.
 4. **Verification loop** — Nach jedem `zcode_run`: Ergebnis lesen, Diff-Stat prüfen (bei `isolate_worktree`), Test-Ausgaben kontrollieren. Bei Fehlern: `resume` mit Korrektur-Hinweis statt neuem Task.
-5. **Resume pattern** — Mehr-Iterationen-Arbeit über `zcode_sessions` → `resume` auf derselben Session halten (Kontext bleibt erhalten).
+5. **Resume pattern** — Mehr-Iterationen-Arbeit über `zcode_sessions` → `resume` auf derselben Session halten (Kontext bleibt erhalten). Nur echte ZCode-Session-IDs resumen; Server-Run-IDs sind nicht-resumable.
 6. **Pre-flight** — Erster Kontakt in einer Maschine: `zcode_check` aufrufen.
+7. **Worktree-Verantwortung** — Nach `isolate_worktree`: Diff prüfen, dann Branch mergen ODER Worktree/Branch explizit verwerfen (`git worktree remove` / `git branch -D`). Der Server räumt nie auf; liegengebliebene Worktrees aktiv dem Nutzer melden.
 
 ### 4.2 `agents/zcode-worker.md` (Englisch)
 Grok-Subagent im üblichen Frontmatter-Format (`name`, `description`, `tools`): **Delegation Engineer**. Rolle: erhält eine Task-Spec, führt `zcode_check` (einmalig) + `zcode_run` aus, verifiziert Diff und Test-Output, iteriert bei Fehlern maximal zweimal via `resume`, berichtet strukturiert zurück (Ergebnis, geänderte Dateien, Tests, offene Punkte). Bricht bei wiederholtem Scheitern ab, statt Endlos-Loops zu feuern.
