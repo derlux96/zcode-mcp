@@ -140,18 +140,35 @@ if (e2e) {
   const check2 = await e2eClient.request('tools/call', { name: 'zcode_check', arguments: {} });
   assertThat(/"ok": true/.test(check2.result.content[0].text), 'e2e zcode_check against real binary');
 
+  // Mode A runs can fail on machines whose default provider model is dead
+  // ("Model is unavailable" — a provider-config problem, not a plugin bug).
+  // On such machines the mode-A sess_-dependent assertions skip with a
+  // reason; any other failure still fails, and the mode-B explicit-model
+  // proof below stays a hard assertion on every machine.
+  const assertOrSkipOnDeadDefault = (cond, label, runOutput) => {
+    if (cond) {
+      console.log(`  ok: ${label}`);
+    } else if (/Model is unavailable/.test(runOutput)) {
+      console.log(`  skipped (default provider model unavailable on this machine): ${label}`);
+    } else {
+      failures++;
+      console.error(`  FAIL: ${label}`);
+    }
+  };
+
   const run1 = await e2eClient.request('tools/call', {
     name: 'zcode_run',
     arguments: { prompt: 'Create a file named hello.txt in the current directory containing exactly the text: zcode-plugin-e2e', cwd: repo, mode: 'edit', timeout_ms: 300000 },
   });
   const text1 = run1.result.content[0].text;
-  assertThat(/session_id: sess_/.test(text1), 'e2e plain run returned a real sess_ session id');
+  assertOrSkipOnDeadDefault(/session_id: sess_/.test(text1), 'e2e plain run returned a real sess_ session id', text1);
   // The fallback line `session_id: run_... (server run-id, not resumable)`
   // must NOT satisfy this check — the spec expects a real session id.
   const stateEntries = JSON.parse(readFileSync(e2eStateFile, 'utf8'));
-  assertThat(
+  assertOrSkipOnDeadDefault(
     Array.isArray(stateEntries) && stateEntries.some((e) => e.kind === 'session' && typeof e.id === 'string' && e.id.startsWith('sess_')),
-    'e2e state file records a real session entry (sess_)'
+    'e2e state file records a real session entry (sess_)',
+    text1
   );
 
   const run2 = await e2eClient.request('tools/call', {
@@ -161,6 +178,40 @@ if (e2e) {
   const text2 = run2.result.content[0].text;
   assertThat(/worktree_branch: zcode\//.test(text2), 'e2e isolated run created zcode/ branch');
   assertThat(/worktree kept/.test(text2), 'e2e isolated run documents merge responsibility');
+
+  // --- mode-B proof: catalog-driven model selection (hard assertions) ---
+  // No config assumptions: the model is picked from what this machine's own
+  // catalog reports. Matches the exact output of formatModelCatalog:
+  // a "models:" header line followed by providerId/modelId rows.
+  const checkModels = await e2eClient.request('tools/call', { name: 'zcode_check', arguments: { include_models: true } });
+  const modelsLines = checkModels.result.content[0].text.split('\n');
+  const modelsHeaderIdx = modelsLines.findIndex((l) => l.trim() === 'models:');
+  // modelIds may themselves contain slashes (e.g. openrouter/stealth/x), so
+  // only the providerId segment is constrained: everything after the first
+  // slash, with no whitespace, is the modelId.
+  const MODEL_ROW = /^[A-Za-z0-9][A-Za-z0-9._-]*\/\S+$/;
+  const catalogRows = [];
+  if (modelsHeaderIdx >= 0) {
+    for (const line of modelsLines.slice(modelsHeaderIdx + 1)) {
+      const t = line.trim();
+      if (!t) continue;
+      if (MODEL_ROW.test(t)) catalogRows.push(t);
+      else break;
+    }
+  }
+  const pickedModel = catalogRows[0];
+  assertThat(pickedModel !== undefined, `e2e zcode_check include_models lists a usable providerId/modelId (got ${catalogRows.length} entries)`);
+
+  if (pickedModel) {
+    console.log('e2e mode-B model picked from catalog:', pickedModel);
+    const run3 = await e2eClient.request('tools/call', {
+      name: 'zcode_run',
+      arguments: { prompt: 'Create model-proof.txt containing: ok', cwd: repo, model: pickedModel, reasoning_level: 'low', timeout_ms: 300000 },
+    });
+    const text3 = run3.result.content[0].text;
+    assertThat(/status: completed/.test(text3), `e2e explicit-model run completed (model ${pickedModel})`);
+    assertThat(/session_id: sess_/.test(text3), `e2e explicit-model run returned a real sess_ session id (model ${pickedModel})`);
+  }
 
   await e2eClient.close();
   rmSync(repo, { recursive: true, force: true });

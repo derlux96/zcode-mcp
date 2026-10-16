@@ -24,6 +24,13 @@ with optional `--resume`/`--target`, a timeout, and optional git-worktree isolat
 (`isolate_worktree: true` → new `zcode/<slug>` branch; the worktree is kept and must be
 merged or removed explicitly).
 
+Two optional parameters select the model explicitly: `model` (`"modelId"` or
+`"providerId/modelId"` — the available ids are listed by `zcode_check` with
+`include_models: true`) switches the run to ZCode's internal app-server protocol with
+that model, in which case `mode`, `resume`, and `target` do not apply (the run is
+autonomous, yolo semantics); `reasoning_level` (`low|medium|high|max`, default `high`)
+tunes the reasoning effort for the selected model.
+
 ## Local testing
 
 ```bash
@@ -57,6 +64,12 @@ npx @modelcontextprotocol/inspector node src/mcp-server.mjs
    - Prompt: `Delegate to ZCode in an isolated worktree: add a README section "reviewed"`
      → expected `zcode_run` with `isolate_worktree: true`, result contains
      `worktree_branch: zcode/` and the merge/remove reminder.
+6. Delegation with an explicit model:
+   - Prompt: `Check which models ZCode offers, then delegate to ZCode with the first
+     listed model: create model.txt containing "reviewed" in /path/to/repo`
+     → expected `zcode_check` with `include_models: true`, then `zcode_run` with
+     `model: <providerId/modelId>` and `reasoning_level` set, result contains
+     `status: completed` and `session_id: sess_`.
 
 ## Security notes
 

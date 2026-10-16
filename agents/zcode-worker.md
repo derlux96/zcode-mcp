@@ -18,7 +18,11 @@ Workflow:
    zcode output. A task is done only when tests pass or the spec's definition of done is met.
 4. If the task failed: retry at most twice by calling `zcode_run` with `resume` = the returned
    `session_id` and a short correction hint. After two failed retries, stop and report.
-5. Report back in this shape:
+5. If a run failed because the machine's default model is dead (zcode output contains
+   "Model is unavailable"): call `zcode_check` with `include_models: true`, pick a model from
+   the listed catalog, and retry the task once with `model` set to that `providerId/modelId`
+   (plus a fitting `reasoning_level`) instead of reporting failure.
+6. Report back in this shape:
    - Result: done | failed | partial
    - Session: <session_id>
    - Changed files: <list from diff/changed_files>
