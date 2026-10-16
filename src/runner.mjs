@@ -75,7 +75,9 @@ function extractSessionId(text) {
 // fresh shell — its own lookup resolves to a nonexistent system path. Shells
 // launched by the ZCode app inherit ZCODE_BUILTIN_PROVIDER_CONFIG_FILE; MCP
 // clients spawning this server do not, so inject the sibling config here.
-function buildSpawnEnv(binPath) {
+// Exported for reuse by src/appserver.mjs (mode B spawns the same binary as
+// an app-server child): one source of truth for the env handling.
+export function buildSpawnEnv(binPath) {
   const env = { ...process.env };
   if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
     const candidate = resolve(dirname(binPath), '../config/provider/zcode-builtin.json');
