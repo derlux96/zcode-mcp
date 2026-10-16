@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Exercises the MCP server exactly like a real client would: spawn, stdio, JSON-RPC lines.
 import { spawn } from 'node:child_process';
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -132,7 +132,8 @@ await client.close();
 // --- e2e mode: real ZCode binary, real task ---
 if (e2e) {
   delete process.env.ZCODE_BIN; // use discovery
-  const e2eClient = new McpClient({ ZCODE_MCP_STATE: join(tempDir(), 'sessions.json') });
+  const e2eStateFile = join(tempDir(), 'sessions.json');
+  const e2eClient = new McpClient({ ZCODE_MCP_STATE: e2eStateFile });
   const repo = makeDemoRepoCopy();
   console.log('e2e repo:', repo);
 
@@ -144,7 +145,14 @@ if (e2e) {
     arguments: { prompt: 'Create a file named hello.txt in the current directory containing exactly the text: zcode-plugin-e2e', cwd: repo, mode: 'edit', timeout_ms: 300000 },
   });
   const text1 = run1.result.content[0].text;
-  assertThat(/session_id:/.test(text1), 'e2e plain run returned a session id');
+  assertThat(/session_id: sess_/.test(text1), 'e2e plain run returned a real sess_ session id');
+  // The fallback line `session_id: run_... (server run-id, not resumable)`
+  // must NOT satisfy this check — the spec expects a real session id.
+  const stateEntries = JSON.parse(readFileSync(e2eStateFile, 'utf8'));
+  assertThat(
+    Array.isArray(stateEntries) && stateEntries.some((e) => e.kind === 'session' && typeof e.id === 'string' && e.id.startsWith('sess_')),
+    'e2e state file records a real session entry (sess_)'
+  );
 
   const run2 = await e2eClient.request('tools/call', {
     name: 'zcode_run',
