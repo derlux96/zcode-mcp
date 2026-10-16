@@ -67,6 +67,10 @@ test('runTaskWithModel happy path: sessionId, response, and exact wire params', 
         modelId: 'small',
         options: { reasoningLevel: 'low' },
       });
+      // Unknown server-initiated requests are answered with {id, result:{}}
+      // (notes §2: the auth-header probe arrives at send; any answer is fine).
+      const authAnswer = received.find((m) => m.id === 'server-3');
+      assert.deepEqual(authAnswer, { id: 'server-3', result: {} });
     } finally {
       delete process.env.FAKE_APPSERVER_LOG;
       removeDir(cwd);
@@ -172,6 +176,35 @@ test('waitForEvent times out without killing the child; close() then kills it', 
       assert.equal(client.isRunning(), true, 'a wait timeout alone must not kill the child');
       await client.close();
       assert.equal(client.isRunning(), false);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('event buffer saturation does not blind live waiters (2005 events before turn.completed)', async () => {
+  await withMode('flood', async () => {
+    const cwd = makeTempDir();
+    const client = new AppServerClient({ binPath: fakeBin, cwd });
+    try {
+      await client.request('session/create', createParams(cwd));
+      await client.request('session/subscribe', { sessionId: 'sess_fakeB1', deliveryKind: 'desktop-continuous' });
+      // The waiter must be live while the flood streams: send triggers 2005
+      // model.streaming events before turn.completed, pushing the buffer past
+      // its cap into shift-on-push — the condition that used to strand
+      // waiters whose scan start pinned at the cap.
+      const ack = client.request('session/send', { sessionId: 'sess_fakeB1', content: 'flood me' });
+      const event = await client.waitForEvent('turn.completed', { timeoutMs: 5000 });
+      await ack;
+      assert.equal(event.type, 'turn.completed');
+      assert.equal(event.payload.response, 'fake model task done');
+      // Saturation actually held: buffer capped at 2000, oldest dropped,
+      // turn.completed is the newest entry. 2005 flood + 3 turn events -
+      // 2000 cap = 8 dropped, so evt_flood_8 is the oldest survivor.
+      assert.equal(client.events.length, 2000);
+      assert.equal(client.events[client.events.length - 1].type, 'turn.completed');
+      assert.equal(client.events[0].eventId, 'evt_flood_8');
     } finally {
       await client.close();
       removeDir(cwd);

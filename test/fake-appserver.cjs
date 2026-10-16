@@ -15,6 +15,10 @@
 //             payload.error.message "fake model failure"
 //   slowhang  answers create + subscribe, acks send, then never emits the
 //             turn event (client timeout path)
+//   flood     acks send, then emits 2005 model.streaming session/event
+//             notifications before turn.completed — exceeds the client's
+//             EVENT_BUFFER_CAP (2000) while a waiter is live (regression
+//             for event-buffer saturation blinding live waiters)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //
@@ -86,27 +90,32 @@ const CATALOG = [
 ];
 
 // --- server-initiated requests (the bidirectional trap, notes §2) ---
-const openServerRequests = new Map(); // id -> true while awaiting an answer
+const openServerRequests = new Map(); // id -> validate(msg) while awaiting an answer
 
-function sendServerRequest(id, params) {
-  openServerRequests.set(id, true);
+function sendServerRequest(id, method, params, validate) {
+  openServerRequests.set(id, validate);
   setTimeout(() => {
     if (openServerRequests.has(id)) failConnection(`server request ${id} unanswered after 2s`);
   }, 2000);
-  send({ id, method: 'session/requestRuntimePreferences', params });
+  send({ id, method, params });
 }
 
 function isPrefsAnswer(msg) {
   return !!(msg && msg.result && typeof msg.result === 'object' && msg.result.nativeSearchEnhancementsEnabled === false);
 }
 
+function isAnyResult(msg) {
+  return !!(msg && msg.result && typeof msg.result === 'object');
+}
+
 let pendingCreate = null; // create request whose response waits on the trap
 let created = false;
 
 function answerArrived(msg) {
-  if (!openServerRequests.has(msg.id)) return false;
+  const validate = openServerRequests.get(msg.id);
+  if (validate === undefined) return false;
   openServerRequests.delete(msg.id);
-  if (!isPrefsAnswer(msg)) {
+  if (!validate(msg)) {
     failConnection(`server request ${msg.id} answered with an invalid result: ${JSON.stringify(msg.result ?? null)}`);
     return true;
   }
@@ -122,7 +131,7 @@ function answerArrived(msg) {
 
 function handleCreate(req) {
   pendingCreate = req;
-  sendServerRequest('server-1', { sessionId: SESSION_ID, scope: 'runtime-materialization' });
+  sendServerRequest('server-1', 'session/requestRuntimePreferences', { sessionId: SESSION_ID, scope: 'runtime-materialization' }, isPrefsAnswer);
 }
 
 function sendCreateResponse(req) {
@@ -172,13 +181,41 @@ function handleSubscribe(req) {
   send({ id: req.id, result: { eventSeq: 0, events: [], sessionId: SESSION_ID } });
 }
 
+// Keep above the client's EVENT_BUFFER_CAP (2000): the flood must push the
+// event buffer into shift-on-push saturation before turn.completed lands.
+const FLOOD_EVENTS = 2005;
+
 function handleSend(req) {
   if (!created) return notActive(req);
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: 1 } });
   if (MODE === 'slowhang') return;
-  // Notes §2: a second prefs request (scope user-execution) arrives at first send.
-  sendServerRequest('server-2', { sessionId: SESSION_ID, scope: 'user-execution' });
+  if (MODE === 'flood') {
+    setTimeout(() => {
+      for (let i = 0; i < FLOOD_EVENTS; i++) {
+        send({
+          method: 'session/event',
+          params: {
+            deliveryKind: 'desktop-continuous',
+            sessionId: SESSION_ID,
+            turnId: 'turn_fake1',
+            traceId: 'ebd62caf-0000-4000-8000-000000000001',
+            eventId: `evt_flood_${i}`,
+            seq: 100 + i,
+            timestamp: 1792184703100,
+            type: 'model.streaming',
+            payload: { assistantMessageId: 'msg_fake0001', delta: 'x', done: false, kind: 'reasoning_delta' },
+          },
+        });
+      }
+      emitTurn(req);
+    }, 25);
+    return;
+  }
+  // Notes §2: a second prefs request (scope user-execution) arrives at first
+  // send, plus the MCP auth-header probe (any answer is fine there).
+  sendServerRequest('server-2', 'session/requestRuntimePreferences', { sessionId: SESSION_ID, scope: 'user-execution' }, isPrefsAnswer);
+  sendServerRequest('server-3', 'interaction/requestOfficialMcpAuthHeaders', { mcpKey: 'image_search', pluginId: 'image-search@zcode-plugins-official', requestId: 'official-mcp-auth:1', targetOrigin: 'https://zcode.z.ai', workspace: { workspacePath: '/tmp/zt/ws', workspaceKey: '/tmp/zt/ws' } }, isAnyResult);
   setTimeout(() => emitTurn(req), 25);
 }
 

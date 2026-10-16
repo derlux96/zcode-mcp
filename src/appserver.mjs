@@ -178,7 +178,7 @@ export class AppServerClient {
     if (msg.method !== 'session/event' || !msg.params || typeof msg.params !== 'object') return;
     if (this._events.length >= EVENT_BUFFER_CAP) this._events.shift();
     this._events.push(msg.params);
-    this._wakeEventWaiters();
+    this._dispatchEvent(msg.params);
   }
 
   _handleServerRequest(msg) {
@@ -234,7 +234,7 @@ export class AppServerClient {
       );
     }
     return new Promise((resolve, reject) => {
-      const waiter = { scanFrom: this._events.length, match, resolve, timer: null };
+      const waiter = { match, resolve, timer: null };
       waiter.timer = setTimeout(() => {
         const idx = this._eventWaiters.indexOf(waiter);
         if (idx >= 0) this._eventWaiters.splice(idx, 1);
@@ -244,21 +244,19 @@ export class AppServerClient {
     });
   }
 
-  _wakeEventWaiters() {
+  /**
+   * Deliver one incoming session/event directly to matching waiters. No
+   * index bookkeeping on purpose: the buffer is capped and shifts once
+   * saturated, which used to strand waiters whose scan start pinned at the
+   * cap while every new event landed below it.
+   */
+  _dispatchEvent(params) {
     for (let i = this._eventWaiters.length - 1; i >= 0; i--) {
       const waiter = this._eventWaiters[i];
-      let hit = null;
-      for (let j = waiter.scanFrom; j < this._events.length; j++) {
-        if (waiter.match(this._events[j])) {
-          hit = this._events[j];
-          break;
-        }
-      }
-      waiter.scanFrom = this._events.length;
-      if (hit) {
+      if (waiter.match(params)) {
         this._eventWaiters.splice(i, 1);
         clearTimeout(waiter.timer);
-        waiter.resolve(hit);
+        waiter.resolve(params);
       }
     }
   }
