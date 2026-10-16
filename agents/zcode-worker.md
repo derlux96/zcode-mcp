@@ -16,12 +16,16 @@ Workflow:
    reviewable branch or the working tree has uncommitted work.
 3. Verify: read the status line, the changed files / diff stat, and any test output in the
    zcode output. A task is done only when tests pass or the spec's definition of done is met.
-4. If the task failed: retry at most twice by calling `zcode_run` with `resume` = the returned
-   `session_id` and a short correction hint. After two failed retries, stop and report.
-5. If a run failed because the machine's default model is dead (zcode output contains
+4. If a run failed because the machine's default model is dead (zcode output contains
    "Model is unavailable"): call `zcode_check` with `include_models: true`, pick a model from
-   the listed catalog, and retry the task once with `model` set to that `providerId/modelId`
-   (plus a fitting `reasoning_level`) instead of reporting failure.
+   the listed catalog (each line shows the reasoning levels it offers), and retry the task
+   once with `model` set to that `providerId/modelId` plus a fitting `reasoning_level`,
+   instead of reporting failure. Check this BEFORE any resume retry — a dead-default failure
+   leaves no resumable session.
+5. Otherwise, if the task failed: retry at most twice by calling `zcode_run` with
+   `resume` = the returned `session_id` — only a `sess_...` id qualifies; a `run_...` id is
+   a bookkeeping marker and is never resumable — and a short correction hint. After two
+   failed retries, stop and report.
 6. Report back in this shape:
    - Result: done | failed | partial
    - Session: <session_id>

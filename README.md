@@ -28,8 +28,11 @@ Two optional parameters select the model explicitly: `model` (`"modelId"` or
 `"providerId/modelId"` — the available ids are listed by `zcode_check` with
 `include_models: true`) switches the run to ZCode's internal app-server protocol with
 that model, in which case `mode`, `resume`, and `target` do not apply (the run is
-autonomous, yolo semantics); `reasoning_level` (`low|medium|high|max`, default `high`)
-tunes the reasoning effort for the selected model.
+autonomous, yolo semantics); `reasoning_level` (`low|medium|high|xhigh|max`, default
+`high`) tunes the reasoning effort for the selected model. When the selected model's
+catalog entry does not offer the requested level, the run substitutes the entry's
+default level and reports it in the result (`[notice] reasoning_level ... using ...
+instead`).
 
 ## Local testing
 

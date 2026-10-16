@@ -67,6 +67,43 @@ export function resolveModel(catalog, modelSpec) {
   return entry ? { providerId: entry.ref.providerId, modelId: entry.ref.modelId } : null;
 }
 
+/**
+ * A catalog entry's reasoning.levels (notes §10: [{value,label},...]) as
+ * plain strings. [] when the entry carries no levels info.
+ */
+export function entryReasoningLevels(entry) {
+  const levels = entry && entry.reasoning && Array.isArray(entry.reasoning.levels)
+    ? entry.reasoning.levels
+    : [];
+  return levels
+    .map((l) => (typeof l === 'string' ? l : l && typeof l === 'object' && typeof l.value === 'string' ? l.value : null))
+    .filter((v) => typeof v === 'string');
+}
+
+/**
+ * Catalog-aware reasoning level (Controller Ruling 14): real catalogs offer
+ * per-model level sets like ['low','medium','xhigh'] — 'high' does not exist
+ * there. When the selected model's entry lists levels and the requested one
+ * is not among them, substitute the entry's defaultLevel.
+ * Returns { level, substitution } where substitution is
+ * {requested, used} or null (no catalog info, level already offered, or no
+ * usable default — in all those cases the request passes through verbatim).
+ */
+export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
+  const entry = Array.isArray(catalog)
+    ? catalog.find((e) => e && e.ref && e.ref.providerId === providerId && e.ref.modelId === modelId)
+    : null;
+  const levels = entryReasoningLevels(entry);
+  if (!levels.length || levels.includes(requested)) {
+    return { level: requested, substitution: null };
+  }
+  const fallback = entry.reasoning.defaultLevel;
+  if (typeof fallback !== 'string' || !levels.includes(fallback)) {
+    return { level: requested, substitution: null };
+  }
+  return { level: fallback, substitution: { requested, used: fallback } };
+}
+
 export class AppServerClient {
   constructor({ binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn } = {}) {
     if (typeof binPath !== 'string' || binPath === '') throw new TypeError('binPath is required');
@@ -313,8 +350,11 @@ export class AppServerClient {
 /**
  * One-shot mode B task: create a session with an explicit model selection,
  * run the prompt to turn completion, and tear the server down.
- * Returns { ok, sessionId, response, failed, error, catalog } on turn
- * completion; rejects on timeouts, protocol errors, and child death.
+ * Returns { ok, sessionId, response, failed, error, catalog,
+ * reasoningSubstitution } on turn completion — reasoningSubstitution is
+ * {requested, used} when the requested reasoningLevel was not offered by
+ * the model's catalog entry and its defaultLevel was sent instead, else
+ * null. Rejects on timeouts, protocol errors, and child death.
  */
 export async function runTaskWithModel({
   binPath,
@@ -363,6 +403,13 @@ export async function runTaskWithModel({
     if (!sessionId) throw new AppServerError('session/create response is missing session.sessionId');
     const catalog = (created.settings && created.settings.model && created.settings.model.available) || null;
 
+    // Catalog-aware reasoning level (Controller Ruling 14): live catalogs
+    // offer level sets like ['low','medium','xhigh'] — 'high' (our default)
+    // does not exist there. Adjust the send's level against the selected
+    // model's own entry and report the substitution for the caller to print.
+    const { level: effectiveReasoningLevel, substitution: reasoningSubstitution } =
+      resolveReasoningLevel(catalog, providerId, modelId, reasoningLevel);
+
     // Gates session/event delivery on the real server (notes §4).
     await client.request('session/subscribe', { sessionId, deliveryKind: 'desktop-continuous' });
 
@@ -371,7 +418,7 @@ export async function runTaskWithModel({
     await client.request('session/send', {
       sessionId,
       content: prompt,
-      modelSelection: { providerId, modelId, options: { reasoningLevel } },
+      modelSelection: { providerId, modelId, options: { reasoningLevel: effectiveReasoningLevel } },
     });
 
     const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs });
@@ -384,6 +431,7 @@ export async function runTaskWithModel({
         failed: true,
         error: { code: err.code ?? null, message: err.message ?? 'turn failed without an error payload' },
         catalog,
+        reasoningSubstitution,
       };
     }
     return {
@@ -393,6 +441,7 @@ export async function runTaskWithModel({
       failed: false,
       error: null,
       catalog,
+      reasoningSubstitution,
     };
   } finally {
     await client.close();

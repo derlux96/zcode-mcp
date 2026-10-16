@@ -31,10 +31,12 @@ broken or unsuitable for the task, or when a cheaper/faster model is enough.
 - Syntax: `"providerId/modelId"` for an exact pick; a bare `"modelId"` is
   resolved against this machine's model catalog (first provider offering it).
 - Discover what the machine offers: `zcode_check` with `include_models: true`
-  lists one `providerId/modelId` per line under `models:`. Pick from that list.
+  lists one `providerId/modelId (reasoning: levels)` line per model under
+  `models:`. Pick from that list.
 - `reasoning_level` tunes effort for the selected model: `low` for mechanical
-  edits, `high` (default) for normal work, `max` for architecture or hard
-  debugging.
+  edits, `high` (default) for normal work, `xhigh`/`max` for architecture or
+  hard debugging. A level the model does not offer is replaced by its default
+  with a `[notice]` line in the result.
 - With `model` set the run uses the internal protocol path: `mode`, `resume`,
   and `target` do not apply (the run is autonomous, yolo semantics).
   `isolate_worktree` and the timeout still work as usual.

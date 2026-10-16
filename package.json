@@ -1,6 +1,6 @@
 {
   "name": "zcode-delegate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Delegate coding tasks from Grok or Cursor to a locally installed ZCode agent via its official headless CLI.",
   "type": "module",
   "private": true,

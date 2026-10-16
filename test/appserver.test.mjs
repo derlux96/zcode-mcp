@@ -8,6 +8,7 @@ import {
   AppServerError,
   runTaskWithModel,
   resolveModel,
+  resolveReasoningLevel,
   resolveBin,
   getModelCatalog,
   DEFAULT_TASK_TIMEOUT_MS,
@@ -278,6 +279,112 @@ test('resolveModel resolves both spec syntaxes; misses return null', () => {
   assert.equal(resolveModel(catalog, ''), null);
 });
 
+// --- catalog-aware reasoning substitution (Controller Ruling 14) ---
+
+test('resolveReasoningLevel unit behavior across catalog shapes', () => {
+  const nimbus = { ref: { providerId: 'fake-openrouter', modelId: 'nimbus-xl' }, reasoning: { levels: [{ value: 'low' }, { value: 'medium' }, { value: 'xhigh' }], defaultLevel: 'xhigh' } };
+  const offered = resolveReasoningLevel([nimbus], 'fake-openrouter', 'nimbus-xl', 'low');
+  assert.deepEqual(offered, { level: 'low', substitution: null });
+  const missing = resolveReasoningLevel([nimbus], 'fake-openrouter', 'nimbus-xl', 'high');
+  assert.deepEqual(missing, { level: 'xhigh', substitution: { requested: 'high', used: 'xhigh' } });
+  // Entry without levels info (or absent from the catalog): pass through.
+  const plain = { ref: { providerId: 'fake-local', modelId: 'plain' } };
+  assert.deepEqual(resolveReasoningLevel([plain], 'fake-local', 'plain', 'high'), { level: 'high', substitution: null });
+  assert.deepEqual(resolveReasoningLevel(null, 'glm-test', 'small', 'high'), { level: 'high', substitution: null });
+  // defaultLevel not itself offered: unusable, keep the request verbatim.
+  const broken = { ref: { providerId: 'p', modelId: 'm' }, reasoning: { levels: [{ value: 'low' }], defaultLevel: 'turbo' } };
+  assert.deepEqual(resolveReasoningLevel([broken], 'p', 'm', 'high'), { level: 'high', substitution: null });
+});
+
+test('runTaskWithModel substitutes the entry default when the level is not offered', async () => {
+  await withMode('ok', async () => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const res = await runTaskWithModel({
+        binPath: fakeBin,
+        cwd,
+        prompt: 'x',
+        providerId: 'fake-openrouter',
+        modelId: 'nimbus-xl',
+        reasoningLevel: 'high', // nimbus-xl offers low|medium|xhigh only
+        timeoutMs: 5000,
+      });
+      assert.equal(res.ok, true);
+      assert.deepEqual(res.reasoningSubstitution, { requested: 'high', used: 'xhigh' });
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const send = received.find((m) => m.method === 'session/send');
+      assert.deepEqual(send.params.modelSelection, {
+        providerId: 'fake-openrouter',
+        modelId: 'nimbus-xl',
+        options: { reasoningLevel: 'xhigh' },
+      });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
+test('runTaskWithModel passes an explicit xhigh through unchanged', async () => {
+  await withMode('ok', async () => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const res = await runTaskWithModel({
+        binPath: fakeBin,
+        cwd,
+        prompt: 'x',
+        providerId: 'fake-openrouter',
+        modelId: 'nimbus-xl',
+        reasoningLevel: 'xhigh',
+        timeoutMs: 5000,
+      });
+      assert.equal(res.ok, true);
+      assert.equal(res.reasoningSubstitution, null);
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const send = received.find((m) => m.method === 'session/send');
+      assert.deepEqual(send.params.modelSelection.options, { reasoningLevel: 'xhigh' });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
+test('runTaskWithModel never substitutes an offered level; no levels info passes through', async () => {
+  await withMode('ok', async () => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const offered = await runTaskWithModel({
+        binPath: fakeBin, cwd, prompt: 'x',
+        providerId: 'fake-openrouter', modelId: 'nimbus-xl',
+        reasoningLevel: 'low', timeoutMs: 5000,
+      });
+      assert.equal(offered.ok, true);
+      assert.equal(offered.reasoningSubstitution, null);
+      const noInfo = await runTaskWithModel({
+        binPath: fakeBin, cwd, prompt: 'x',
+        providerId: 'fake-local', modelId: 'plain',
+        reasoningLevel: 'high', timeoutMs: 5000, // plain carries no levels info
+      });
+      assert.equal(noInfo.ok, true);
+      assert.equal(noInfo.reasoningSubstitution, null);
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const sends = received.filter((m) => m.method === 'session/send');
+      assert.deepEqual(sends[0].params.modelSelection.options, { reasoningLevel: 'low' });
+      assert.deepEqual(sends[1].params.modelSelection.options, { reasoningLevel: 'high' });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
 // --- getModelCatalog ---
 
 test('getModelCatalog returns the create-response catalog without running a turn', async () => {
@@ -290,7 +397,7 @@ test('getModelCatalog returns the create-response catalog without running a turn
       assert.ok(Array.isArray(catalog));
       assert.deepEqual(
         catalog.map((e) => `${e.ref.providerId}/${e.ref.modelId}`),
-        ['glm-test/small', 'glm-test/big', 'fake-openrouter/nimbus-xl'],
+        ['glm-test/small', 'glm-test/big', 'fake-openrouter/nimbus-xl', 'fake-local/plain'],
       );
       const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
       assert.ok(received.some((m) => m.method === 'session/create'), 'create fetches the catalog');

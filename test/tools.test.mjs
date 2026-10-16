@@ -195,7 +195,10 @@ test('zcode_run with an unresolvable model is an error listing the available mod
       assert.equal(reply.result.isError, true);
       const text = textOf(reply);
       assert.match(text, /does-not-exist/);
-      assert.match(text, /Available models:\nglm-test\/small\nglm-test\/big\nfake-openrouter\/nimbus-xl/);
+      assert.match(
+        text,
+        /Available models:\nglm-test\/small \(reasoning: low,medium,high\)\nglm-test\/big \(reasoning: low,high,max\)\nfake-openrouter\/nimbus-xl \(reasoning: low,medium,xhigh\)\nfake-local\/plain$/,
+      );
       assert.equal(store.list().length, 0, 'nothing recorded for a rejected model');
     } finally {
       removeDir(cwd);
@@ -209,7 +212,7 @@ test('zcode_run rejects an invalid reasoning_level before spawning anything', as
     const log = join(cwd, 'rx.log');
     process.env.FAKE_APPSERVER_LOG = log;
     try {
-      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'small', reasoning_level: 'xhigh' });
+      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'small', reasoning_level: 'extreme' });
       assert.equal(reply.result.isError, true);
       assert.match(textOf(reply), /reasoning_level/);
       assert.equal(existsSync(log), false, 'validation must fail before any app-server spawn');
@@ -329,6 +332,73 @@ test('zcode_run model mode rejects mode instead of silently dropping it', async 
   });
 });
 
+// --- zcode_run reasoning-level substitution (Controller Ruling 14) ---
+
+test('zcode_run substitutes an unoffered reasoning_level and prints the notice', async () => {
+  await withAppserver('ok', async () => {
+    const cwd = makeTempDir('zcode-runb-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      // Default level is high; nimbus-xl offers low|medium|xhigh only.
+      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'fake-openrouter/nimbus-xl' });
+      assert.match(textOf(reply), /status: completed/);
+      assert.match(
+        textOf(reply),
+        /\[notice\] reasoning_level high not offered by fake-openrouter\/nimbus-xl; using xhigh instead/,
+      );
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const send = received.find((m) => m.method === 'session/send');
+      assert.deepEqual(send.params.modelSelection, {
+        providerId: 'fake-openrouter',
+        modelId: 'nimbus-xl',
+        options: { reasoningLevel: 'xhigh' },
+      });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
+test('zcode_run with explicit xhigh passes through without a notice', async () => {
+  await withAppserver('ok', async () => {
+    const cwd = makeTempDir('zcode-runb-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'fake-openrouter/nimbus-xl', reasoning_level: 'xhigh' });
+      assert.match(textOf(reply), /status: completed/);
+      assert.doesNotMatch(textOf(reply), /\[notice\]/);
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const send = received.find((m) => m.method === 'session/send');
+      assert.deepEqual(send.params.modelSelection.options, { reasoningLevel: 'xhigh' });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
+test('zcode_run with an offered reasoning_level: no substitution, no notice', async () => {
+  await withAppserver('ok', async () => {
+    const cwd = makeTempDir('zcode-runb-');
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    try {
+      const reply = await call('zcode_run', { prompt: 'x', cwd, model: 'fake-openrouter/nimbus-xl', reasoning_level: 'low' });
+      assert.match(textOf(reply), /status: completed/);
+      assert.doesNotMatch(textOf(reply), /\[notice\]/);
+      const received = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const send = received.find((m) => m.method === 'session/send');
+      assert.deepEqual(send.params.modelSelection.options, { reasoningLevel: 'low' });
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      removeDir(cwd);
+    }
+  });
+});
+
 // --- zcode_check include_models ---
 
 test('zcode_check with include_models appends the catalog from the app-server', async () => {
@@ -336,7 +406,10 @@ test('zcode_check with include_models appends the catalog from the app-server', 
     const reply = await call('zcode_check', { include_models: true });
     const text = textOf(reply);
     assert.match(text, /"ok": true/);
-    assert.match(text, /models:\nglm-test\/small\nglm-test\/big\nfake-openrouter\/nimbus-xl$/);
+    assert.match(
+      text,
+      /models:\nglm-test\/small \(reasoning: low,medium,high\)\nglm-test\/big \(reasoning: low,high,max\)\nfake-openrouter\/nimbus-xl \(reasoning: low,medium,xhigh\)\nfake-local\/plain$/,
+    );
   });
 });
 

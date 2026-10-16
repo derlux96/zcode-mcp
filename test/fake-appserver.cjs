@@ -58,7 +58,7 @@ function failConnection(reason) {
 }
 
 // Model catalog (notes §10: rides on session/create at
-// settings.model.available; two providers, three models).
+// settings.model.available; three providers, four models).
 const CATALOG = [
   {
     ref: { providerId: 'glm-test', modelId: 'small' },
@@ -79,12 +79,25 @@ const CATALOG = [
     properties: { inputFormat: { supportsText: true, supportsImage: true, supportsVideo: true, supportsAudio: false, supportsPdf: false }, outputFormat: { supportsText: true } },
   },
   {
+    // Mirrors the live registry gotcha (notes §7): levels EXCLUDE 'high'
+    // (our default) and defaultLevel is 'xhigh', so a requested 'high'
+    // must be substituted (Controller Ruling 14).
     ref: { providerId: 'fake-openrouter', modelId: 'nimbus-xl' },
     label: 'nimbus-xl',
     providerLabel: 'Fake OpenRouter',
     contextWindow: 1000000,
     maxOutputTokens: 524288,
-    reasoning: { levels: [{ value: 'low', label: 'low' }, { value: 'xhigh', label: 'xhigh' }, { value: 'max', label: 'max' }], defaultLevel: 'max' },
+    reasoning: { levels: [{ value: 'low', label: 'low' }, { value: 'medium', label: 'medium' }, { value: 'xhigh', label: 'xhigh' }], defaultLevel: 'xhigh' },
+    properties: { inputFormat: { supportsText: true, supportsImage: false, supportsVideo: false, supportsAudio: false, supportsPdf: false }, outputFormat: { supportsText: true } },
+  },
+  {
+    // No reasoning block: entries without levels info must pass any level
+    // through and list without the parenthetical.
+    ref: { providerId: 'fake-local', modelId: 'plain' },
+    label: 'plain',
+    providerLabel: 'Fake Local',
+    contextWindow: 128000,
+    maxOutputTokens: 16384,
     properties: { inputFormat: { supportsText: true, supportsImage: false, supportsVideo: false, supportsAudio: false, supportsPdf: false }, outputFormat: { supportsText: true } },
   },
 ];

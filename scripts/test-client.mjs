@@ -182,20 +182,22 @@ if (e2e) {
   // --- mode-B proof: catalog-driven model selection (hard assertions) ---
   // No config assumptions: the model is picked from what this machine's own
   // catalog reports. Matches the exact output of formatModelCatalog:
-  // a "models:" header line followed by providerId/modelId rows.
+  // a "models:" header line followed by "providerId/modelId (reasoning: ...)"
+  // rows (the parenthetical is optional; entries without levels info omit it).
   const checkModels = await e2eClient.request('tools/call', { name: 'zcode_check', arguments: { include_models: true } });
   const modelsLines = checkModels.result.content[0].text.split('\n');
   const modelsHeaderIdx = modelsLines.findIndex((l) => l.trim() === 'models:');
   // modelIds may themselves contain slashes (e.g. openrouter/stealth/x), so
   // only the providerId segment is constrained: everything after the first
-  // slash, with no whitespace, is the modelId.
-  const MODEL_ROW = /^[A-Za-z0-9][A-Za-z0-9._-]*\/\S+$/;
+  // slash, with no whitespace, is the modelId; the optional
+  // " (reasoning: ...)" suffix carries the offered levels and is stripped.
+  const MODEL_ROW = /^[A-Za-z0-9][A-Za-z0-9._-]*\/\S+(?:\s+\(reasoning:\s*[^)]*\))?$/;
   const catalogRows = [];
   if (modelsHeaderIdx >= 0) {
     for (const line of modelsLines.slice(modelsHeaderIdx + 1)) {
       const t = line.trim();
       if (!t) continue;
-      if (MODEL_ROW.test(t)) catalogRows.push(t);
+      if (MODEL_ROW.test(t)) catalogRows.push(t.replace(/\s+\(reasoning:\s*[^)]*\)$/, ''));
       else break;
     }
   }

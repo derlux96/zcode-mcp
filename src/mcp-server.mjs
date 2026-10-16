@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { createProtocol, PARSE_ERROR } from './protocol.mjs';
 import { discoverZCode, ZCodeNotFoundError } from './discover.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
-import { runTaskWithModel, resolveModel, getModelCatalog, resolveBin } from './appserver.mjs';
+import { runTaskWithModel, resolveModel, getModelCatalog, resolveBin, entryReasoningLevels } from './appserver.mjs';
 import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
   assertGitRepo, createWorktree, worktreeSummary, newRunId,
@@ -14,7 +14,7 @@ import {
 const text = (s) => ({ content: [{ type: 'text', text: s }] });
 const failText = (s) => ({ isError: true, content: [{ type: 'text', text: s }] });
 
-const REASONING_LEVELS = ['low', 'medium', 'high', 'max'];
+const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Budget for the throwaway catalog session (create only, no turn) in both
 // the zcode_check models section and bare-modelId resolution.
 const MODEL_CATALOG_TIMEOUT_MS = 15000;
@@ -30,7 +30,7 @@ const toolSchemas = {
         include_models: {
           type: 'boolean',
           description:
-            'Append the available model catalog (one providerId/modelId per line), fetched via a throwaway app-server session. Best-effort: on failure a [warning] line is appended instead and the check result is unaffected.',
+            'Append the available model catalog (one "providerId/modelId (reasoning: low,medium,xhigh)" line per model), fetched via a throwaway app-server session. Best-effort: on failure a [warning] line is appended instead and the check result is unaffected.',
         },
       },
       additionalProperties: false,
@@ -58,7 +58,7 @@ const toolSchemas = {
         reasoning_level: {
           type: 'string',
           enum: REASONING_LEVELS,
-          description: 'Reasoning effort for the selected model; only used when model is set. Default high.',
+          description: 'Reasoning effort for the selected model; only used when model is set. Default high. A level the model does not offer is replaced by its catalog default and noted in the result.',
         },
       },
       required: ['prompt', 'cwd'],
@@ -77,12 +77,18 @@ const toolSchemas = {
   },
 };
 
-/** Catalog -> "providerId/modelId" lines, or null when nothing usable. */
+/** Catalog -> "providerId/modelId (reasoning: low,medium,xhigh)" lines, or
+ *  null when nothing usable. The parenthetical is omitted for entries with
+ *  no reasoning-level info (notes §10: reasoning.levels[].value). */
 function formatModelCatalog(catalog) {
   if (!Array.isArray(catalog)) return null;
   const rows = catalog
     .filter((e) => e && e.ref && e.ref.providerId && e.ref.modelId)
-    .map((e) => `${e.ref.providerId}/${e.ref.modelId}`);
+    .map((e) => {
+      const base = `${e.ref.providerId}/${e.ref.modelId}`;
+      const levels = entryReasoningLevels(e);
+      return levels.length ? `${base} (reasoning: ${levels.join(',')})` : base;
+    });
   return rows.length ? rows : null;
 }
 
@@ -266,6 +272,13 @@ async function runWithModelMode(store, args, v) {
     `status: ${status} (model ${providerId}/${modelId})`,
     `session_id: ${sessionId}${res ? '' : '  (server run-id, not resumable)'}`,
   ];
+  // Catalog-driven substitution notice (Controller Ruling 14): the level we
+  // actually sent differs from the one requested.
+  if (res && res.reasoningSubstitution) {
+    lines.push(
+      `[notice] reasoning_level ${res.reasoningSubstitution.requested} not offered by ${providerId}/${modelId}; using ${res.reasoningSubstitution.used} instead`,
+    );
+  }
   lines.push(...(await worktreeLines(worktree)));
   if (bookkeepingWarning) lines.push(bookkeepingWarning);
   if (res && !res.ok && res.error) {
