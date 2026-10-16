@@ -1,0 +1,8 @@
+{
+  "name": "zcode-delegate",
+  "version": "1.0.0",
+  "description": "Delegate coding tasks from Grok or Cursor to a locally installed ZCode agent via its official headless CLI.",
+  "author": { "name": "derlux" },
+  "homepage": "https://github.com/derlux/grok-zcode-plugin",
+  "keywords": ["zcode", "delegation", "coding-agent", "orchestration"]
+}
