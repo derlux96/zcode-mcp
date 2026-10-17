@@ -80,6 +80,7 @@ test('zcode_check schema documents probe_model and its cost', async () => {
   const prop = reply.result.tools.find((t) => t.name === 'zcode_check').inputSchema.properties.probe_model;
   assert.equal(prop.type, 'boolean');
   assert.match(prop.description, /one tiny model request/i);
+  assert.match(prop.description, /up to ~75 s/);
 });
 
 test('without probe_model there is no modelProbe and no app-server spawn', async () => {
@@ -126,7 +127,7 @@ test('probe 429: never retried (exactly one send), errorKind quota', async () =>
   const { payload } = await check({ probe_model: true });
   assert.equal(payload.modelProbe.ok, false);
   assert.equal(payload.modelProbe.errorKind, 'quota');
-  assert.match(payload.modelProbe.error, /1113/);
+  assert.match(payload.modelProbe.error, /HTTP 429/);
   assert.equal(sends().length, 1);
 });
 
@@ -192,4 +193,50 @@ test('stdio: zcode_check probe_model leaves no process and no temp dir behind', 
   } finally {
     await scope.cleanup(); // asserts that no process carrying a marker survived
   }
+});
+
+// --- review fixes ---
+
+test('real model_not_found payload (localized message, detail "Model creation failed") gets kind model and the hint', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'fail-zh-model-creation';
+  const { payload } = await check({ probe_model: true });
+  assert.equal(payload.modelProbe.errorKind, 'model');
+  assert.equal(payload.modelProbe.error, 'Provider Registry 中不存在 Model: glm-test/small | Model creation failed');
+  assert.equal(payload.modelProbe.hint, LOGIN_HINT);
+});
+
+test('status-only 1113 payload: kind quota, real message, one send', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'fail-status-1113-always';
+  const { payload } = await check({ probe_model: true });
+  assert.equal(payload.modelProbe.errorKind, 'quota');
+  assert.match(payload.modelProbe.error, /^\[1113\]\[Insufficient balance/);
+  assert.equal(sends().length, 1);
+});
+
+function checkHandler(probe) {
+  const tools = buildTools({ store: new SessionStore(process.env.ZCODE_MCP_STATE), reapFn: async () => ({ lost: [], deleted: [], killed: [] }), probe });
+  return tools.find((t) => t.name === 'zcode_check').handler;
+}
+
+test('the probe has a total budget that includes start-up', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const handler = checkHandler({ tmpRoot: ctx.tmpRoot, totalMs: 1200, timeoutMs: 60000, idleTimeoutMs: 60000 });
+  const t0 = Date.now();
+  const payload = JSON.parse((await handler({ probe_model: true }, {})).content[0].text);
+  assert.ok(Date.now() - t0 < 8000);
+  assert.equal(payload.modelProbe.ok, false);
+  assert.equal(payload.modelProbe.errorKind, 'timeout');
+  assert.match(payload.modelProbe.error, /total budget of 1200 ms/);
+});
+
+test('cancelling the zcode_check request ends the probe', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const handler = checkHandler({ tmpRoot: ctx.tmpRoot, timeoutMs: 60000, idleTimeoutMs: 60000 });
+  const ctl = new AbortController();
+  setTimeout(() => ctl.abort(), 800);
+  const t0 = Date.now();
+  const payload = JSON.parse((await handler({ probe_model: true }, { signal: ctl.signal })).content[0].text);
+  assert.ok(Date.now() - t0 < 8000);
+  assert.equal(payload.modelProbe.ok, false);
+  assert.equal(payload.modelProbe.errorKind, 'cancelled');
 });

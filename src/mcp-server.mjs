@@ -54,7 +54,7 @@ const toolSchemas = {
         probe_model: {
           type: 'boolean',
           description:
-            'Also send one tiny model request (costs one tiny model request: "reply OK", no tools, in a throwaway temp dir, up to 60 s, never retried) through the protocol path with ZCode\'s current model, and report modelProbe {ok, durationMs, model, errorKind, error, hint}. Catches a broken login, key or provider baseUrl before the first real job. A failure adds a warning; the top-level ok (binary reachable) is unaffected. Default false.',
+            'Also send one tiny model request (costs one tiny model request: "reply OK", no tools, in a throwaway temp dir, never retried; the probe can take up to ~75 s including app-server start-up, and cancelling the zcode_check call ends it) through the protocol path with ZCode\'s current model, and report modelProbe {ok, durationMs, model, errorKind, error, hint}. Catches a broken login, key or provider baseUrl before the first real job. A failure adds a warning; the top-level ok (binary reachable) is unaffected. Default false.',
         },
       },
       additionalProperties: false,
@@ -93,7 +93,7 @@ const toolSchemas = {
           type: 'integer',
           minimum: 0,
           maximum: MAX_TRANSIENT_RETRIES,
-          description: `Protocol path only: how often a turn that failed with a temporary provider error (HTTP 429/5xx, overload, rate limit, network) is continued in the same session after a wait (30 s, 60 s, 2, 5, 10, 15 min, ±10 %; a numeric retry-after is honoured). Default 6, max ${MAX_TRANSIENT_RETRIES}, 0 disables it. Auth, model and configuration errors are never retried. Waits count against timeout_ms. Rejected on the CLI path, which cannot continue a session (rerun with resume instead).`,
+          description: `Protocol path only: how often a turn that failed with a temporary provider error (HTTP 429/5xx, overload, rate limit, network) is continued in the same session after a wait (30 s, 60 s, 2, 5, 10, 15 min, ±10 %; a numeric retry-after is honoured). Default 6, max ${MAX_TRANSIENT_RETRIES}, 0 disables it. Balance errors (Z.ai 1113, insufficient balance) are retried at most twice. Auth, model and configuration errors are never retried. Waits count against timeout_ms. Rejected on the CLI path, which cannot continue a session (rerun with resume instead).`,
         },
       },
       required: ['prompt', 'cwd'],
@@ -248,9 +248,9 @@ function probeSection(probe) {
   return out;
 }
 
-// probe: test hook ({ timeoutMs, idleTimeoutMs, tmpRoot }) for probeModel.
+// probe: test hook ({ timeoutMs, idleTimeoutMs, totalMs, tmpRoot }) for probeModel.
 function buildCheckHandler(reaper, probe = {}) {
-  return async (args = {}) => {
+  return async (args = {}, ctx = {}) => {
     if (args.include_models !== undefined && typeof args.include_models !== 'boolean') {
       return failText('Invalid arguments: include_models must be a boolean');
     }
@@ -280,7 +280,7 @@ function buildCheckHandler(reaper, probe = {}) {
     const warnings = [...versionWarnings(ok, version.stdout.trim()), ...providers.warnings];
     let modelProbe;
     if (args.probe_model === true) {
-      modelProbe = probeSection(await probeModel(probe));
+      modelProbe = probeSection(await probeModel({ ...probe, signal: ctx.signal }));
       if (!modelProbe.ok) warnings.push(oneLine(`model probe failed: ${modelProbe.errorKind}: ${modelProbe.error}`));
     }
     const payload = JSON.stringify({
