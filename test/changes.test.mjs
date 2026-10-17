@@ -46,7 +46,7 @@ test('file deleted by the job and file reverted by the job appear', withRepo((di
   rmSync(join(dir, 'a.txt'));
   run(dir, 'git', ['checkout', '--', 'README.md']); // test setup simulating the job
   const r = changesSince(dir, base);
-  assert.deepEqual(r.changedFiles.map((l) => l.split(' ')[1]).sort(), ['README.md', 'a.txt']);
+  assert.deepEqual([...r.changedFiles].sort(), ['D a.txt', 'M README.md']);
 }));
 
 test('non-git directory is unavailable', () => {
@@ -99,3 +99,75 @@ test('does not mutate the index or working tree', withRepo((dir) => {
   changesSince(dir, captureBaseline(dir));
   assert.equal(run(dir, 'git', ['status', '--porcelain']), before);
 }));
+
+test('rename yields the new path once', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  run(dir, 'git', ['mv', 'README.md', 'DOCS.md']);
+  const r = changesSince(dir, base);
+  assert.deepEqual(r.changedFiles, ['R DOCS.md']);
+}));
+
+test('job commits an edit: reported as M', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  assert.match(base.head, /^[0-9a-f]{40}$/);
+  writeFileSync(join(dir, 'README.md'), 'job\n');
+  run(dir, 'git', ['commit', '-qam', 'job']);
+  const r = changesSince(dir, base);
+  assert.deepEqual(r.changedFiles, ['M README.md']);
+  assert.match(r.diffStat, /README\.md/);
+}));
+
+test('job creates and commits a new file: reported as A', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'new.txt'), 'n\n');
+  run(dir, 'git', ['add', 'new.txt']);
+  run(dir, 'git', ['commit', '-qm', 'new']);
+  const r = changesSince(dir, base);
+  assert.deepEqual(r.changedFiles, ['A new.txt']);
+  assert.match(r.diffStat, /new\.txt/);
+}));
+
+test('commit plus further uncommitted edit is reported once', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'README.md'), 'one\n');
+  run(dir, 'git', ['commit', '-qam', 'one']);
+  writeFileSync(join(dir, 'README.md'), 'two\n');
+  const r = changesSince(dir, base);
+  assert.deepEqual(r.changedFiles, ['M README.md']);
+}));
+
+test('baseline without commit and job makes the first commit', () => {
+  const dir = makeTempDir();
+  try {
+    run(dir, 'git', ['init', '-q']);
+    run(dir, 'git', ['config', 'user.email', 't@e.com']);
+    run(dir, 'git', ['config', 'user.name', 'T']);
+    const base = captureBaseline(dir);
+    assert.equal(base.head, null);
+    writeFileSync(join(dir, 'x.txt'), 'x\n');
+    run(dir, 'git', ['add', 'x.txt']);
+    run(dir, 'git', ['commit', '-qm', 'first']);
+    assert.deepEqual(changesSince(dir, base).changedFiles, ['A x.txt']);
+  } finally { removeDir(dir); }
+});
+
+test('nothing changed and no commit stays empty', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  assert.deepEqual(changesSince(dir, base), { available: true, changedFiles: [], diffStat: '' });
+}));
+
+test('baseline-dirty file with unchanged hash is excluded even if job commits other files', withRepo((dir) => {
+  writeFileSync(join(dir, 'README.md'), 'user\n');
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'o.txt'), 'o\n');
+  run(dir, 'git', ['add', 'o.txt']);
+  run(dir, 'git', ['commit', '-qm', 'o']);
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['A o.txt']);
+}));
+
+test('missing baseline gitRoot is unavailable', () => {
+  const dir = makeGitRepo();
+  const base = captureBaseline(dir);
+  removeDir(dir);
+  assert.equal(changesSince(process.cwd(), base).available, false);
+});
