@@ -81,6 +81,27 @@ test('timeout kills the child and flags timedOut', async () => {
   }
 });
 
+test('abort signal stops the child and reports kind cancelled; onSpawn sees the child', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  try {
+    const ctl = new AbortController();
+    let spawnedPid = null;
+    const pending = runZCodeTask({
+      binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 30000, signal: ctl.signal,
+      onSpawn: (child) => { spawnedPid = child.pid; },
+    });
+    assert.ok(Number.isInteger(spawnedPid));
+    setTimeout(() => ctl.abort(), 100);
+    const res = await pending;
+    assert.equal(res.timedOut, true);
+    assert.equal(res.timeoutKind, 'cancelled');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
 test('idle timeout aborts a silent child and reports kind idle', async () => {
   const cwd = makeTempDir();
   process.env.FAKE_ZCODE_MODE = 'hang';

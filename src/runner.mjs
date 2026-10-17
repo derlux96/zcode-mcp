@@ -112,12 +112,15 @@ export function buildSpawnEnv(binPath) {
 // Idle detection only works on a stream that carries progress. The CLI path
 // (`--json`) writes nothing until the task ends, so it has no idle timer and
 // relies on the absolute timeout alone.
-export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs }) {
+// `signal` (AbortSignal) stops the child exactly like a timeout, reported as
+// timeoutKind 'cancelled'; `onSpawn(child)` is called once the child has a pid.
+export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn }) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
   const child = isNodeScript
     ? spawn(process.execPath, [binPath, ...cliArgs], { cwd, env })
     : spawn(binPath, cliArgs, { cwd, env });
+  if (onSpawn && child.pid !== undefined) onSpawn(child);
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -143,20 +146,27 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
     };
     const timer = setTimeout(() => stop('total'), timeoutMs);
     touch();
+    const onAbort = () => stop('cancelled');
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearTimeout(idleTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
 
     child.stdout.on('data', (d) => { stdout += d; touch(); });
     child.stderr.on('data', (d) => { stderr += d; touch(); });
     child.on('error', (err) => {
-      clearTimeout(timer);
-      clearTimeout(idleTimer);
-      if (killTimer) clearTimeout(killTimer);
+      cleanup();
       stderr += `\n[zcode-delegate] failed to spawn: ${err.message}`;
       resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, timeoutKind, sessionId: null });
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
-      clearTimeout(idleTimer);
-      if (killTimer) clearTimeout(killTimer);
+      cleanup();
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
@@ -169,11 +179,11 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
   });
 }
 
-export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs }) {
+export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn }) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn });
 }
 
 export function newRunId() {
