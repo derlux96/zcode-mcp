@@ -31,6 +31,20 @@
 //             (request-timeout path after the session exists)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
+//   fail-429-then-ok      the first FAKE_APPSERVER_FAIL_TIMES (default 1) turns
+//             fail with Z.ai's 1113/HTTP 429 text, every later turn completes
+//   fail-network-then-ok  same, with "TypeError: fetch failed"
+//   fail-429-always       every turn fails with the 1113/HTTP 429 text
+//   fail-auth             every turn fails with an HTTP 401 invalid api key
+//   fail-model-request-failed  every turn fails with the generic
+//             "Model request failed." (what a wrong baseUrl produces)
+//
+// Turn counting for the fail-* modes: FAKE_APPSERVER_COUNTER names a file that
+// holds the number of session/send requests seen so far (read, incremented and
+// written per send, so tests can read it); without it the count lives in memory.
+// FAKE_APPSERVER_RETRY_AFTER: seconds, added as "retry-after" to the turn.failed
+// error payload of the fail-* modes. FAKE_APPSERVER_HANG_AFTER: n; sends after
+// the n-th are acknowledged but their turn never ends (deadline tests).
 //
 // FAKE_APPSERVER_CREATE_DELAY_MS: delays every session/create response
 // (slow model catalog lookups).
@@ -46,7 +60,7 @@
 // {nativeSearchEnhancementsEnabled:false} (strict schema server-side).
 'use strict';
 
-const { appendFileSync } = require('node:fs');
+const { appendFileSync, readFileSync, writeFileSync } = require('node:fs');
 const readline = require('node:readline');
 
 const MODE = process.env.FAKE_APPSERVER_MODE || 'ok';
@@ -215,12 +229,56 @@ function handleSubscribe(req) {
 // event buffer into shift-on-push saturation before turn.completed lands.
 const FLOOD_EVENTS = 2005;
 
+const MSG_1113 = 'HTTP 429: [1113] Insufficient balance or no resource package. Please recharge.';
+// mode -> [message, failures before the turns complete (Infinity = always)]
+const FAIL_MODES = {
+  'fail-429-then-ok': [MSG_1113, null],
+  'fail-network-then-ok': ['TypeError: fetch failed', null],
+  'fail-429-always': [MSG_1113, Infinity],
+  'fail-auth': ['HTTP 401 Unauthorized: invalid api key', Infinity],
+  'fail-model-request-failed': ['Model request failed.', Infinity],
+};
+
+let memSends = 0;
+function countSend() {
+  const file = process.env.FAKE_APPSERVER_COUNTER;
+  if (!file) return ++memSends;
+  let n = 0;
+  try { n = Number(readFileSync(file, 'utf8')) || 0; } catch { /* first send */ }
+  n += 1;
+  writeFileSync(file, String(n));
+  return n;
+}
+
+// The failure for send number n of a fail-* mode, or null when this turn completes.
+function scriptedFailure(n) {
+  const entry = FAIL_MODES[MODE];
+  if (!entry) return null;
+  const times = entry[1] === null ? (Number(process.env.FAKE_APPSERVER_FAIL_TIMES) || 1) : entry[1];
+  if (n > times) return null;
+  const error = { type: 'provider_error', code: null, message: entry[0] };
+  const ra = Number(process.env.FAKE_APPSERVER_RETRY_AFTER);
+  if (ra > 0) error['retry-after'] = ra;
+  return error;
+}
+
 function handleSend(req) {
   if (!created) return notActive(req);
   if (MODE === 'nosendack') return;
+  const n = countSend();
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
-  send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: 1 } });
+  send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: n } });
   if (MODE === 'slowhang') return;
+  if (FAIL_MODES[MODE]) {
+    // Later sends continue the same session: no second prefs/auth probe.
+    if (n === 1) {
+      sendServerRequest('server-2', 'session/requestRuntimePreferences', { sessionId: SESSION_ID, scope: 'user-execution' }, isPrefsAnswer);
+    }
+    const hangAfter = Number(process.env.FAKE_APPSERVER_HANG_AFTER);
+    if (hangAfter > 0 && n > hangAfter) return;
+    setTimeout(() => emitTurn(req, { n, failure: scriptedFailure(n) }), 25);
+    return;
+  }
   if (MODE === 'flood') {
     setTimeout(() => {
       for (let i = 0; i < FLOOD_EVENTS; i++) {
@@ -294,14 +352,15 @@ function handleSend(req) {
   setTimeout(() => emitTurn(req), 25);
 }
 
-function emitTurn(req) {
+function emitTurn(req, scripted = null) {
   const input = (req.params && req.params.content) || '';
-  const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_fake1', traceId: 'ebd62caf-0000-4000-8000-000000000001' };
+  const n = scripted ? scripted.n : 1;
+  const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001' };
   send({
     method: 'session/event',
     params: {
       ...base,
-      eventId: 'evt_fake_0001',
+      eventId: scripted ? `evt_fake_${n}_1` : 'evt_fake_0001',
       seq: 10,
       timestamp: 1792184703000,
       type: 'turn.started',
@@ -312,7 +371,7 @@ function emitTurn(req) {
     method: 'session/event',
     params: {
       ...base,
-      eventId: 'evt_fake_0002',
+      eventId: scripted ? `evt_fake_${n}_2` : 'evt_fake_0002',
       seq: 11,
       timestamp: 1792184703100,
       type: 'model.streaming',
@@ -321,6 +380,13 @@ function emitTurn(req) {
   });
   const FAILURES = { fail: 'fake model failure', 'rate-limit': '429 rate limit', 'auth-fail': 'project_token_login_failed' };
   const failMsg = FAILURES[MODE];
+  if (scripted) {
+    const tail = scripted.failure
+      ? { type: 'turn.failed', payload: { error: scripted.failure, turnPhase: 'model_request', inputId: `in_fake${n}` } }
+      : { type: 'turn.completed', payload: { response: `fake model task done after ${n} turn(s)`, resultType: 'success', inputId: `in_fake${n}` } };
+    send({ method: 'session/event', params: { ...base, eventId: `evt_fake_${n}_3`, seq: 10 * n + 2, timestamp: Date.now(), ...tail } });
+    return;
+  }
   const tail = failMsg !== undefined
     ? {
         eventId: 'evt_fake_0003',
