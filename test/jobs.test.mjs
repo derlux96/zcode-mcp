@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
 import {
-  chooseJobPath, isJobAlive, startJob, getJob, waitJob, cancelJob, listJobs, REASONING_LEVELS,
+  aliveFrom, chooseJobPath, isJobAlive, startJob, getJob, waitJob, cancelJob, listJobs, REASONING_LEVELS,
 } from '../src/jobs.mjs';
 import { createJobDir, patchStatus, readJson, readStatus, stateHome, jobsRoot } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey, releaseCwdLock } from '../src/locks.mjs';
@@ -477,4 +477,13 @@ test('a worktree that cannot be created is reported as such, not as a missing re
   assert.equal(r.ok, false);
   assert.match(r.error, /^Could not create worktree: /);
   assert.deepEqual(listJobs(), []);
+});
+
+test('aliveFrom: a null pidStart counts as alive while the pid exists and its command line has the token', () => {
+  const token = 'jobs.test.mjs'; // the test file name is in this process' command line
+  const job = { token, createdAt: new Date(Date.now() - 3600e3).toISOString() };
+  const status = { state: 'running', pid: process.pid, pidStart: null };
+  assert.equal(aliveFrom(job, status), true);
+  assert.equal(aliveFrom({ ...job, token: 'not-in-any-command-line-9f3a' }, status), false);
+  assert.equal(aliveFrom(job, { ...status, pid: 2 ** 22 + 12345 }), false);
 });

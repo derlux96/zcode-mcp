@@ -50,8 +50,10 @@ export function aliveFrom(job, status, match = identityAlive) {
     const created = Date.parse(job.createdAt);
     return Number.isFinite(created) && Date.now() - created < STARTUP_GRACE_MS;
   }
-  if (typeof status.pidStart !== 'string') return false;
-  return match({ pid: status.pid, start: status.pidStart, token: job.token });
+  // pidStart null = the runner could not record it (identity_unrecorded): the token
+  // in its command line identifies it instead.
+  const start = typeof status.pidStart === 'string' ? status.pidStart : null;
+  return match({ pid: status.pid, start, token: job.token });
 }
 
 // Callers pass only jobDir(id) results (or listJobDirs entries), never raw tool input.

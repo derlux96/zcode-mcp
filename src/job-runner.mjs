@@ -21,6 +21,9 @@ import { discoverZCode } from './discover.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
+// ps can fail transiently: identity capture is retried this often before it is given up.
+const IDENTITY_ATTEMPTS = 5;
+const IDENTITY_RETRY_DELAY_MS = 100;
 const ACTIVITY_WRITE_MS = 1000;
 const PROGRESS_LINES = 5;
 
@@ -162,10 +165,10 @@ async function collectChanges(job, params) {
 // Records the spawned child (ZCode CLI or app-server) as the job's running child.
 // childPgid: the child leads its own process group, so the manager/reaper (and the
 // fatal handler via activeChildPgid) can signal the whole group after verifying it.
-function childRecorder(setStatus, warn) {
+function childRecorder(setStatus, warn, identity = getProcessIdentity, retryDelayMs = IDENTITY_RETRY_DELAY_MS) {
   return (child) => {
     activeChildPgid = child.pid;
-    const id = getProcessIdentity(child.pid);
+    const id = identity(child.pid);
     const t = now();
     try {
       setStatus({
@@ -180,7 +183,24 @@ function childRecorder(setStatus, warn) {
     } catch {
       warn('status_write_failed');
     }
+    if (id && id.unknown) retryChildIdentity(child.pid, setStatus, warn, identity, retryDelayMs);
   };
+}
+
+// ps failed while the child was recorded: keep trying in the background while this
+// child is still the active one; the signalling code never trusts a null childStart.
+async function retryChildIdentity(pid, setStatus, warn, identity, delayMs) {
+  for (let i = 0; i < IDENTITY_ATTEMPTS - 1; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    if (activeChildPgid !== pid) return;
+    const id = identity(pid);
+    if (id && !id.unknown) {
+      try { setStatus({ childStart: id.start }); } catch { /* best effort */ }
+      return;
+    }
+    if (!id) return; // gone
+  }
+  warn('identity_unrecorded');
 }
 
 // The child (and, with I3's sweep, its whole group) has ended: record it so the
@@ -192,7 +212,7 @@ function childExited(setStatus) {
 
 // CLI path. `idle`: pass idle_timeout_ms on (false for the protocol fallback:
 // the CLI writes nothing until it ends, so an idle limit would kill live work).
-async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, idle }) {
+async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, idle, identity, identityRetryDelayMs }) {
   const binPath = discoverZCode();
   let lastActivityWrite = 0;
   const res = await runZCodeTask({
@@ -206,7 +226,7 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
     idleTimeoutMs: idle ? params.idle_timeout_ms : undefined,
     signal,
     killGroup: true,
-    onSpawn: childRecorder(setStatus, warn),
+    onSpawn: childRecorder(setStatus, warn, identity, identityRetryDelayMs),
     onStdout: (chunk) => {
       try { appendFileSync(outputLogPath, chunk); } catch { warn('output_log_failed'); }
       const n = Date.now();
@@ -235,7 +255,7 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
 // lastActivityAt and progress reach status.json at most once per
 // ACTIVITY_WRITE_MS (first one at once, a trailing write for the rest),
 // so an event flood costs a handful of writes.
-async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs }) {
+async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs, identity, identityRetryDelayMs }) {
   const binPath = resolveBin();
   const eventsLog = join(dir, 'events.log');
   const progress = [];
@@ -289,7 +309,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     ...(requestTimeoutMs ? { requestTimeoutMs } : {}),
     killGroup: true,
     signal,
-    onSpawn: childRecorder(setStatus, warn),
+    onSpawn: childRecorder(setStatus, warn, identity, identityRetryDelayMs),
     onEvent,
   });
 
@@ -376,7 +396,14 @@ export async function runJob(dir, opts = {}) {
     else opts.signal.addEventListener('abort', abort, { once: true });
   }
   try {
-    const self = getProcessIdentity(process.pid);
+    const identity = opts.identity || getProcessIdentity;
+    const retryDelayMs = opts.identityRetryDelayMs ?? IDENTITY_RETRY_DELAY_MS;
+    let self = identity(process.pid);
+    for (let i = 1; i < IDENTITY_ATTEMPTS && self && self.unknown; i++) {
+      await new Promise((r) => setTimeout(r, retryDelayMs));
+      self = identity(process.pid);
+    }
+    if (!self || self.unknown) warn('identity_unrecorded');
     setStatus({
       state: 'starting',
       pid: process.pid,
@@ -399,7 +426,7 @@ export async function runJob(dir, opts = {}) {
     cancelPoll.unref();
     checkCancel();
 
-    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs };
+    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs, identity, identityRetryDelayMs: retryDelayMs };
     let run = job.path === 'protocol' ? await runProtocol(ctx) : await runCli({ ...ctx, idle: true });
     if (run === null) {
       warn('idle_detection_unavailable');

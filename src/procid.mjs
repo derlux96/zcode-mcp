@@ -42,7 +42,13 @@ function compare({ pid, start, token }, opts) {
   }
   const id = getProcessIdentity(pid, opts);
   if (id && id.unknown) return 'unknown';
-  if (!id || id.start !== start) return 'mismatch';
+  if (!id) return 'mismatch';
+  // No recorded start (ps stayed unknown while the process recorded itself): the
+  // secret token in the command line is then the identity.
+  if (start === null || start === undefined) {
+    return token !== undefined && id.command.includes(token) ? 'match' : 'mismatch';
+  }
+  if (id.start !== start) return 'mismatch';
   return token === undefined || id.command.includes(token) ? 'match' : 'mismatch';
 }
 

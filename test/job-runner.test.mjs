@@ -574,3 +574,25 @@ test('runnerEnvOptions clamps the heartbeat and ignores the fatal hook outside t
     { heartbeatMs: 50, fatalAfterMs: 1500 },
   );
 });
+
+// ps may fail transiently while the runner records itself: retry, and when it stays
+// unknown say so (the job must not look dead after the startup grace).
+test('identity capture retries an unknown ps sample until it works', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  let calls = 0;
+  const identity = (pid) => (++calls <= 2 ? { pid, unknown: true } : { pid, start: 'Mon Jan  1 00:00:00 2024', command: 'x' });
+  await runJob(dir, { identity, identityRetryDelayMs: 5 });
+  assert.equal(readStatus(dir).pidStart, 'Mon Jan  1 00:00:00 2024');
+  assert.ok(!(readStatus(dir).warnings || []).includes('identity_unrecorded'));
+});
+
+test('identity stays unknown: job still completes, pidStart/childStart null, warning identity_unrecorded', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const identity = (pid) => ({ pid, unknown: true });
+  await runJob(dir, { identity, identityRetryDelayMs: 5 });
+  const st = readStatus(dir);
+  assert.equal(st.state, 'completed');
+  assert.equal(st.pidStart, null);
+  assert.ok(st.warnings.includes('identity_unrecorded'));
+  assert.equal(readResult(dir).state, 'completed');
+});
