@@ -15,6 +15,9 @@ export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 21600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
 export const LEFTOVER_GRACE_MS = 2000;
+// After ZCode exited and the group sweep ended, stdout/stderr may still be held open by a
+// leftover outside the group (setsid/daemonized): wait this long, then destroy the pipes.
+export const STDIO_GRACE_MS = 3000;
 
 const SESSION_RE = /sess_[A-Za-z0-9._-]+/;
 const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
@@ -128,7 +131,7 @@ export function buildSpawnEnv(binPath) {
 // leftoverKilled: true. The group id cannot be reused while it has members.
 export async function runZCodeArgs(binPath, cliArgs, {
   cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn, onStdout, killGroup = false,
-  leftoverGraceMs = LEFTOVER_GRACE_MS,
+  leftoverGraceMs = LEFTOVER_GRACE_MS, stdioGraceMs = STDIO_GRACE_MS,
 }) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
@@ -163,9 +166,10 @@ export async function runZCodeArgs(binPath, cliArgs, {
     let timeoutKind = null; // 'total' | 'idle'
     let killTimer = null;
     let idleTimer = null;
+    let exited = false; // ZCode itself is gone: its exit status stands, no stop may rewrite it
 
     const stop = (kind) => {
-      if (timedOut) return;
+      if (timedOut || exited) return;
       timedOut = true;
       timeoutKind = kind;
       clearTimeout(idleTimer);
@@ -174,7 +178,7 @@ export async function runZCodeArgs(binPath, cliArgs, {
     };
     // Any output from ZCode counts as activity and restarts the idle timer.
     const touch = () => {
-      if (!idleTimeoutMs) return;
+      if (!idleTimeoutMs || exited) return;
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => stop('idle'), idleTimeoutMs);
     };
@@ -186,8 +190,10 @@ export async function runZCodeArgs(binPath, cliArgs, {
       if (signal.aborted) onAbort();
       else signal.addEventListener('abort', onAbort, { once: true });
     }
+    let pipeTimer = null;
     const cleanup = () => {
       clearTimeout(timer);
+      if (pipeTimer) clearTimeout(pipeTimer);
       clearTimeout(idleTimer);
       if (killTimer) clearTimeout(killTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -214,7 +220,22 @@ export async function runZCodeArgs(binPath, cliArgs, {
     let sweep = Promise.resolve(false);
     child.on('exit', (code) => {
       exitCode = code;
+      exited = true;
+      // The sweep can last a while: a cancel/idle/total timer firing in it must not
+      // report a ZCode that already exited as cancelled/timeout.
+      clearTimeout(timer);
+      clearTimeout(idleTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
       if (killGroup) sweep = sweepGroup(child.pid, leftoverGraceMs);
+      // A leftover that left the group and holds the pipes would delay 'close' until
+      // forever: after the sweep plus a bounded wait, destroy the streams and resolve
+      // with what was read.
+      sweep.then(() => {
+        pipeTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+        }, stdioGraceMs);
+      });
     });
     child.on('close', async (code) => {
       const leftoverKilled = await sweep;
@@ -247,12 +268,12 @@ async function sweepGroup(pgid, graceMs) {
 
 export async function runZCodeTask({
   binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs,
-  signal, onSpawn, onStdout, killGroup, leftoverGraceMs,
+  signal, onSpawn, onStdout, killGroup, leftoverGraceMs, stdioGraceMs,
 }) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup, leftoverGraceMs });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup, leftoverGraceMs, stdioGraceMs });
 }
 
 export function newRunId() {

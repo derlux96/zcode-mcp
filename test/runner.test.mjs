@@ -203,6 +203,52 @@ test('killGroup: a leftover holding the pipes and ignoring SIGTERM is SIGKILLed 
   assert.ok(ms < 10000, `returned promptly (${ms} ms)`);
 });
 
+// A stop arriving during the post-exit sweep must not rewrite a clean exit 0.
+test('killGroup: a cancel arriving during the leftover sweep leaves a clean exit completed', async () => {
+  const ctl = new AbortController();
+  setTimeout(() => ctl.abort(), 800); // ZCode exits at ~300 ms, the sweep then lasts ~1.5 s
+  const { res, dead } = await leaveGrandchild(
+    { FAKE_GRANDCHILD_STDIO: 'inherit', FAKE_GRANDCHILD_IGNORE_TERM: '1' },
+    { leftoverGraceMs: 1500, signal: ctl.signal },
+  );
+  assert.equal(res.code, 0);
+  assert.equal(res.timedOut, false);
+  assert.equal(res.timeoutKind, null);
+  assert.equal(dead, true);
+});
+
+test('killGroup: the total timer firing during the leftover sweep leaves a clean exit completed', async () => {
+  const { res, dead } = await leaveGrandchild(
+    { FAKE_GRANDCHILD_STDIO: 'inherit', FAKE_GRANDCHILD_IGNORE_TERM: '1' },
+    { leftoverGraceMs: 1500, timeoutMs: 800 },
+  );
+  assert.equal(res.code, 0);
+  assert.equal(res.timedOut, false);
+  assert.equal(dead, true);
+});
+
+test('a daemonized leftover holding the pipes does not delay the result past stdioGraceMs', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'daemonize-pipe-holder';
+  let gc;
+  try {
+    const t0 = Date.now();
+    const res = await runZCodeTask({
+      binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 0, killGroup: true, leftoverGraceMs: 300, stdioGraceMs: 500,
+    });
+    gc = Number(res.stderr.match(/grandchild pid (\d+)/)[1]);
+    assert.ok(Date.now() - t0 < 5000, `resolved promptly (${Date.now() - t0} ms)`);
+    assert.equal(res.code, 0);
+    assert.equal(res.timedOut, false);
+    assert.match(res.stdout, /daemon left/);
+    assert.equal(res.sessionId, 'sess_daemon01');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    if (gc) safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode-leftover' });
+    removeDir(cwd);
+  }
+});
+
 test('killGroup: a clean exit reports no leftovers', async () => {
   const cwd = makeTempDir();
   try {

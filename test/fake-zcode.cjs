@@ -75,6 +75,16 @@ if (mode === 'hang') {
   process.stderr.write(`grandchild pid ${gc.pid}\n`);
   console.log(JSON.stringify({ result: 'done, background process left', session: { id: 'sess_leave01' } }));
   setTimeout(() => process.exit(0), 300); // the grandchild has installed its handler
+} else if (mode === 'daemonize-pipe-holder') {
+  // Finishes normally (exit 0) after daemonizing a pipe-holding child into its
+  // own session/process group (setsid-like), so a group sweep cannot reach it.
+  const { spawn } = require('node:child_process');
+  const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);', 'fake-zcode-leftover'], {
+    stdio: 'inherit', detached: true,
+  });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  console.log(JSON.stringify({ result: 'done, daemon left', session: { id: 'sess_daemon01' } }));
+  setTimeout(() => process.exit(0), 300);
 } else if (mode === 'write-hang') {
   // Leaves a partial change in cwd, then works forever (cancel tests).
   require('node:fs').writeFileSync('partial.txt', 'partial\n');
