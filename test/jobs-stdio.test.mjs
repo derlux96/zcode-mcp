@@ -3,7 +3,8 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { TestScope, fakeAppserverBin, assertNoLeftoverProcesses, waitFor, sleep } from './helpers.mjs';
+import { getProcessIdentity } from '../src/procid.mjs';
+import { TestScope, fakeAppserverBin, assertNoLeftoverProcesses, safeSignal, waitFor, sleep } from './helpers.mjs';
 
 let scope;
 const fresh = () => { scope = new TestScope(); return scope; };
@@ -35,8 +36,11 @@ test('kill -9 of the server mid-job still ends the job and the result is retriev
   const a = s.client({ FAKE_ZCODE_MODE: 'slow-start' });
   await a.initialize();
   const jobId = await startJob(s, a, { cwd });
+  await waitFor(() => { const x = s.jobStatus(jobId); return x && x.state === 'running' && Number.isInteger(x.childPid); }, { what: 'job running with a child' });
   a.kill('SIGKILL');
   await a.exited;
+  const mid = s.jobStatus(jobId);
+  assert.ok(!['completed', 'failed', 'timeout', 'cancelled', 'lost'].includes(mid.state), `job already ${mid.state} when the server died`);
   const b = s.client({ FAKE_ZCODE_MODE: 'slow-start' });
   await b.initialize();
   const done = await awaitState(b, jobId, 'completed');
@@ -49,10 +53,15 @@ test('closing stdin does not kill a running job', async () => {
   const a = s.client({ FAKE_ZCODE_MODE: 'chatty' });
   await a.initialize();
   const jobId = await startJob(s, a, { cwd: s.cwd() });
+  const st = await waitFor(() => { const x = s.jobStatus(jobId); return x && Number.isInteger(x.pid) ? x : null; }, { what: 'runner pid' });
   a.closeStdin();
-  const exit = await Promise.race([a.exited, sleep(5000).then(() => null)]);
+  let timer;
+  const exit = await Promise.race([a.exited, new Promise((r) => { timer = setTimeout(() => r(null), 5000); })]);
+  clearTimeout(timer);
   assert.ok(exit, 'server did not exit after stdin closed');
   assert.equal(exit.code, 0);
+  const runner = getProcessIdentity(st.pid);
+  assert.ok(runner && runner.command.includes('job-runner.mjs'), 'runner still alive right after the server exited');
   const b = s.client();
   await b.initialize();
   const done = await awaitState(b, jobId, 'completed');
@@ -103,10 +112,7 @@ test('malformed JSON line and unknown method keep the server alive', async () =>
   a.writeRaw('{"truncated": ');
   a.writeRaw(JSON.stringify({ jsonrpc: '2.0', foo: 'bar' })); // object without id: a notification
   await assert.rejects(a.request('no/such/method', {}), (e) => e.code === -32601);
-  const unknownTool = await a.request('tools/call', { name: 'zcode_nope', arguments: {} }).then(
-    (r) => ({ r }), (e) => ({ e }),
-  );
-  assert.ok(unknownTool.e ? unknownTool.e.code === -32602 || unknownTool.e.code === -32601 : unknownTool.r.isError === true, JSON.stringify(unknownTool));
+  await assert.rejects(a.request('tools/call', { name: 'zcode_nope', arguments: {} }), (e) => e.code === -32602 && /Unknown tool/.test(e.message));
   const check = await a.callTool('zcode_check', {});
   assert.equal(check.isError, false, check.text);
   assert.equal(a.hasExited, undefined);
@@ -131,14 +137,14 @@ test('notifications/cancelled while zcode_run waits: no response is emitted and 
   await a.initialize();
   const { id, promise } = a.requestWithId('tools/call', {
     name: 'zcode_run', arguments: { prompt: 'wait', cwd: s.cwd(), mode: 'yolo', wait_ms: 60000 },
-  }, { timeoutMs: 3000 });
+  }, { timeoutMs: 6000 });
   promise.catch(() => {});
   const jobId = s.track(await waitFor(async () => {
     const list = await a.callTool('zcode_status', {});
     return (/(job_[0-9a-z]+_[0-9a-f]{6})/.exec(list.text) || [])[1];
   }, { what: 'job to appear' }));
   a.notify('notifications/cancelled', { requestId: id });
-  await assert.rejects(promise, /timed out/); // 3 s, well past the chatty job's end
+  await assert.rejects(promise, /timed out/); // 6 s, well past the chatty job's end
   assert.ok(!a.messages.some((m) => m.id === id), 'a cancelled request gets no response');
   const done = await awaitState(a, jobId, 'completed');
   assert.match(done.text, /sess_chatty1/);
@@ -167,8 +173,10 @@ test("a job started by a killed server shows lost after its runner is killed, an
   const st = await waitFor(() => { const x = s.jobStatus(jobId); return x && Number.isInteger(x.childPgid) && Number.isInteger(x.pid) ? x : null; }, { what: 'runner and child pids' });
   a.kill('SIGKILL');
   await a.exited;
-  process.kill(st.pid, 'SIGKILL');
-  process.kill(-st.childPgid, 'SIGKILL');
+  const marker = s.markers[0];
+  assert.ok(safeSignal(st.pid, 'SIGKILL', { expectStart: st.pidStart, marker }), 'runner signalled');
+  assert.equal(st.childPgid, st.childPid);
+  assert.ok(safeSignal(st.childPid, 'SIGKILL', { expectStart: st.childStart, group: true }), 'child group signalled');
   const b = s.client({ FAKE_ZCODE_MODE: 'silent' });
   await b.initialize();
   const status = await b.callTool('zcode_status', { job_id: jobId });
@@ -184,9 +192,42 @@ test('protocol-path job end to end through stdio', async () => {
   const a = s.client({ ZCODE_APPSERVER_BIN: fakeAppserverBin });
   await a.initialize();
   const r = await a.callTool('zcode_run', { prompt: 'protocol task', cwd: s.cwd(), wait_ms: 5000 });
-  s.track(jobIdOf(r.text));
+  const jobId = s.track(jobIdOf(r.text));
   assert.equal(r.isError, false, r.text);
+  s.watchChild(jobId); // the app-server's command line carries no marker: prove it is gone by pid
   assert.match(r.text, /^status: completed \(protocol\)/);
   assert.match(r.text, /sess_/);
   assert.match(r.text, /fake model task done/);
+});
+
+test('safeSignal never signals pids 0, 1, -1, NaN or non-numbers', () => {
+  const calls = [];
+  const kill = (...a) => calls.push(a);
+  for (const bad of [0, 1, -1, NaN, 'x', null, undefined, 1.5]) {
+    assert.equal(safeSignal(bad, 'SIGKILL', { marker: '', expectStart: 'x', kill }), false, String(bad));
+    assert.equal(safeSignal(bad, 'SIGKILL', { group: true, kill }), false);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('safeSignal signals a live process only with a matching start or marker', async () => {
+  const marker = `zcode-safesignal-${process.pid}-${Date.now()}`;
+  const child = spawn('sh', ['-c', `sleep 30; true # ${marker}`], { stdio: 'ignore' });
+  const closed = new Promise((r) => child.on('close', r));
+  try {
+    const id = await waitFor(() => getProcessIdentity(child.pid), { what: 'child identity' });
+    const calls = [];
+    const kill = (...a) => calls.push(a);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { expectStart: 'Thu Jan  1 00:00:00 1970', kill }), false);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { marker: 'no-such-marker', kill }), false);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { kill }), false);
+    assert.deepEqual(calls, []);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { expectStart: id.start, kill }), true);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { marker, group: true, kill }), true);
+    assert.deepEqual(calls, [[child.pid, 'SIGKILL'], [-child.pid, 'SIGKILL']]);
+    assert.equal(safeSignal(child.pid, 'SIGKILL', { expectStart: id.start }), true); // real signal
+    await closed;
+  } finally {
+    child.kill('SIGKILL');
+  }
 });

@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
+import { getProcessIdentity, signalGroup } from '../src/procid.mjs';
 import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 
 export function makeTempDir(prefix = 'zcode-test-') {
@@ -156,6 +158,33 @@ export class StdioClient {
   }
 }
 
+/**
+ * Signals a process (or, with group: true, its process group) only when it is
+ * provably ours: pid is an integer > 1 and its identity matches the recorded
+ * start time (expectStart) or its command line contains `marker`. Returns true
+ * when signalled. Only ESRCH is swallowed. `kill` is injectable for tests.
+ */
+export function safeSignal(pid, signal, { expectStart, marker, group = false, kill } = {}) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  const id = getProcessIdentity(pid);
+  if (!id) return false;
+  const byStart = typeof expectStart === 'string' && id.start === expectStart;
+  const byMarker = typeof marker === 'string' && marker !== '' && id.command.includes(marker);
+  if (!byStart && !byMarker) return false;
+  try {
+    if (group) {
+      if (!kill) return signalGroup(pid, signal);
+      kill(-pid, signal);
+    } else {
+      (kill || process.kill)(pid, signal);
+    }
+    return true;
+  } catch (err) {
+    if (err.code === 'ESRCH') return false;
+    throw err;
+  }
+}
+
 /** Throws when a process whose command line contains one of `markers` is alive (polls up to ~3 s). */
 export async function assertNoLeftoverProcesses(markers, { timeoutMs = 3000 } = {}) {
   const find = () => execFileSync('ps', ['-axo', 'pid,command'], { encoding: 'utf8' })
@@ -181,7 +210,7 @@ export class TestScope {
     this.dirs = [this.home];
     this.clients = [];
     this.jobIds = new Set();
-    this.extraPids = new Set();
+    this.watched = []; // { pid, start }: recorded children that must be dead after cleanup
     this.markers = [basename(this.home)];
   }
 
@@ -211,6 +240,13 @@ export class TestScope {
     try { return JSON.parse(readFileSync(join(this.home, 'jobs', jobId, 'status.json'), 'utf8')); } catch { return null; }
   }
 
+  /** Records a job's current child (ZCode CLI or app-server) so cleanup can prove it is gone. */
+  watchChild(jobId) {
+    const st = this.jobStatus(jobId);
+    assert(st && Number.isInteger(st.childPid), `job ${jobId} recorded no child pid`);
+    this.watched.push({ pid: st.childPid, start: st.childStart });
+  }
+
   async cleanup() {
     const live = this.clients.filter((c) => !c.hasExited);
     let helper = live[0];
@@ -221,19 +257,20 @@ export class TestScope {
       } catch { /* fall through to pid kills */ }
     }
     // Fallback: only the pids recorded in this test's own job status files.
+    const marker = this.markers[0];
     for (const id of this.jobIds) {
       const s = this.jobStatus(id);
       if (!s || ['completed', 'failed', 'timeout', 'cancelled', 'lost'].includes(s.state)) continue;
-      for (const [pid, group] of [[s.pid, false], [s.childPgid, true]]) {
-        if (!Number.isInteger(pid)) continue;
-        try { process.kill(group ? -pid : pid, 'SIGKILL'); } catch { /* gone */ }
-      }
+      safeSignal(s.pid, 'SIGKILL', { expectStart: s.pidStart, marker });
+      if (s.childPgid === s.childPid) safeSignal(s.childPid, 'SIGKILL', { expectStart: s.childStart, group: true });
     }
-    for (const pid of this.extraPids) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
     for (const c of this.clients) c.kill('SIGKILL');
     await Promise.all(this.clients.map((c) => c.exited));
     try {
       await assertNoLeftoverProcesses(this.markers);
+      for (const w of this.watched) {
+        await waitFor(() => { const id = getProcessIdentity(w.pid); return !id || id.start !== w.start; }, { timeoutMs: 3000, what: `recorded child ${w.pid} to be gone` });
+      }
     } finally {
       for (const d of this.dirs) removeDir(d);
     }
