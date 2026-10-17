@@ -322,3 +322,19 @@ test('runTaskWithModel: only one of providerId/modelId is a TypeError', async ()
     TypeError,
   );
 });
+
+test('a cancel whose app-server exit is seen before the runner aborts still ends cancelled', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
+  await new Promise((r) => setTimeout(r, 500)); // past session/send: no startup retry
+  writeFileSync(join(dir, 'cancel'), '');
+  process.kill(-st.childPgid, 'SIGKILL'); // only the app-server group, not the runner
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.errorKind, 'cancelled');
+  assert.equal(res.timeoutKind, 'cancelled');
+  assert.equal(readStatus(dir).state, 'cancelled');
+});

@@ -2,7 +2,7 @@ import { test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
 import { createJobDir, readStatus, readResult, stateHome, TERMINAL_STATES } from '../src/jobstore.mjs';
@@ -10,6 +10,7 @@ import { captureBaseline } from '../src/changes.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
 import { SessionStore } from '../src/state.mjs';
 import { runJob } from '../src/job-runner.mjs';
+import { cancelJob } from '../src/jobs.mjs';
 import { OUTPUT_CAP } from '../src/runner.mjs';
 
 const runnerPath = fileURLToPath(new URL('../src/job-runner.mjs', import.meta.url));
@@ -429,4 +430,42 @@ test('a fatal runner error kills ZCode\'s group before releasing the lock', asyn
     try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     for (const pid of members) { try { process.kill(pid, 'SIGKILL'); } catch {} } // after the assertions
   }
+});
+
+test('a cancel whose ZCode exit is seen before the runner aborts still ends cancelled', async () => {
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
+  writeFileSync(join(dir, 'cancel'), '');
+  process.kill(-st.childPgid, 'SIGKILL'); // only ZCode's group, not the runner
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.errorKind, 'cancelled');
+  assert.equal(res.timeoutKind, 'cancelled');
+  assert.equal(readStatus(dir).state, 'cancelled');
+});
+
+test('ZCode killed without a cancel request still ends failed with errorKind crash', async () => {
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
+  process.kill(-st.childPgid, 'SIGKILL');
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'crash');
+});
+
+test('a runner started after the manager already ended the job writes nothing', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() }, { lockCwd: tempCwd() });
+  const v = await cancelJob(basename(dir), { termGraceMs: 200 });
+  assert.equal(v.state, 'cancelled');
+  const status = readStatus(dir);
+  const result = readResult(dir);
+  await runJob(dir);
+  assert.deepEqual(readStatus(dir), status);
+  assert.deepEqual(readResult(dir), result);
 });

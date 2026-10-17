@@ -47,6 +47,7 @@ function aliveFrom(job, status) {
   return matchesIdentity({ pid: status.pid, start: status.pidStart, token: job.token });
 }
 
+// Callers pass only jobDir(id) results (or listJobDirs entries), never raw tool input.
 export function isJobAlive(dir) {
   if (!dir) return false;
   return aliveFrom(readJson(join(dir, 'job.json')), readStatus(dir));
@@ -58,7 +59,10 @@ function viewOf(jobId, dir) {
   let status = readStatus(dir);
   let alive = aliveFrom(job, status);
   // The runner may have written its terminal state and exited between the reads.
-  if (!alive) status = readStatus(dir);
+  if (!alive) {
+    status = readStatus(dir);
+    alive = aliveFrom(job, status);
+  }
   const recorded = (status && status.state) || 'starting';
   const state = isTerminal(recorded) || alive ? recorded : 'lost';
   if (isTerminal(state)) alive = false;
@@ -146,7 +150,7 @@ async function resolveModelArg(model, cwd) {
 function validateStart(args) {
   const v = validateRunArgs(args);
   if (!v.ok) return invalid(v.error);
-  const { resume, mode } = v.value;
+  const { resume } = v.value;
   if (resume && resume.startsWith('run_')) {
     return { ok: false, error: `'${resume}' is a server-generated run-id and is not resumable. Use zcode_sessions to find a real ZCode session id (sess_...).` };
   }
@@ -157,8 +161,8 @@ function validateStart(args) {
     if (typeof args.model !== 'string' || args.model.trim() === '') return invalid('model must be a non-empty string');
     if (resume) return invalid('resume is not supported together with model (protocol mode always starts a fresh session)');
     if (args.target) return invalid('target is not supported together with model');
-    if (mode !== 'yolo') {
-      return invalid('mode is not supported when model is set — protocol mode runs autonomously (yolo semantics); omit mode');
+    if (args.mode !== undefined && args.mode !== 'yolo') {
+      return invalid("mode is not supported when model is set: with model only mode 'yolo' is supported (protocol mode runs autonomously); omit mode or use 'yolo'");
     }
   }
   if (chooseJobPath(args) === 'cli') {
@@ -216,10 +220,14 @@ export async function startJob(args = {}, opts = {}) {
   if (v.isolateWorktree) {
     try {
       await assertGitRepo(cwd);
+    } catch (error) {
+      return { ok: false, error: `isolate_worktree requires a git repository: ${error.message}` };
+    }
+    try {
       const wt = await createWorktree(cwd);
       worktree = { branch: wt.branch, dir: wt.dir, startSha: wt.startSha };
     } catch (error) {
-      return { ok: false, error: `isolate_worktree requires a git repository: ${error.message}` };
+      return { ok: false, error: `Could not create worktree: ${error.message}` };
     }
   }
   const lockCwd = worktree ? worktree.dir : cwd;

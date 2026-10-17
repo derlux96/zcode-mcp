@@ -83,6 +83,8 @@ export function describeEvent(event) {
   return null;
 }
 
+const CANCELLED = { state: 'cancelled', errorKind: 'cancelled', errorMessage: 'Job was cancelled', timeoutKind: 'cancelled' };
+
 // Timeout and cancellation are decided here; only a plain failure is classified.
 function outcome(res, params) {
   if (res.timedOut && res.timeoutKind === 'cancelled') {
@@ -317,6 +319,9 @@ export async function runJob(dir, opts = {}) {
   const warnings = [];
   const warn = (w) => { if (!warnings.includes(w)) warnings.push(w); };
 
+  // The manager may already have ended the job (cancelled during the startup
+  // grace): never rewrite a terminal state.
+  if (TERMINAL_STATES.includes(readStatus(dir)?.state)) return;
   const startedMs = Date.now();
   const job = readJson(join(dir, 'job.json')) || {};
   const params = job.params || {};
@@ -367,6 +372,11 @@ export async function runJob(dir, opts = {}) {
     }
     clearInterval(heartbeat);
     clearInterval(cancelPoll);
+    // A cancel whose ZCode exit was seen before the abort (signal or cancel-file
+    // poll) is still a cancel; a genuinely completed run stays completed.
+    if (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile))) {
+      run = { ...run, ...CANCELLED };
+    }
 
     const { state, errorKind, errorMessage, sessionId } = run;
     const changes = await collectChanges(job, params);

@@ -143,7 +143,8 @@ test('validation messages', async () => {
     [{ prompt: 'x', cwd, model: '' }, /model must be a non-empty string/],
     [{ prompt: 'x', cwd, model: 'small', resume: 'sess_1' }, /resume is not supported together with model/],
     [{ prompt: 'x', cwd, model: 'small', target: 't' }, /target is not supported together with model/],
-    [{ prompt: 'x', cwd, model: 'small', mode: 'plan' }, /mode is not supported when model is set/],
+    [{ prompt: 'x', cwd, model: 'small', mode: 'plan' }, /with model only mode 'yolo' is supported/],
+    [{ prompt: 'x', cwd, model: 'nope', mode: 'yolo' }, /^Model 'nope' not found/], // explicit yolo + model passes validation
     [{ prompt: 'x', cwd, reasoning_level: 'huge' }, /reasoning_level must be one of low\|medium\|high\|xhigh\|max/],
     [{ prompt: 'x', cwd, mode: 'build', idle_timeout_ms: 5000 }, /idle_timeout_ms applies only .*protocol mode/],
     [{ prompt: 'x', cwd, mode: 'build', reasoning_level: 'low' }, /reasoning_level applies only when model is set or no mode\/resume\/target is given/],
@@ -380,7 +381,7 @@ test('cancelJob does nothing to a foreign process with a reused pid', async () =
   assert.equal(alive(foreign), true, 'foreign process untouched');
 });
 
-test('unwritable home returns ok false before spawning', async () => {
+test('unwritable home returns ok false before spawning', { skip: process.getuid?.() === 0 && 'root ignores directory permissions' }, async () => {
   const home = tempCwd();
   chmodSync(home, 0o500);
   process.env.ZCODE_MCP_HOME = join(home, 'state');
@@ -449,4 +450,14 @@ test('listJobs is newest first and getJob of a missing job is null', async () =>
   assert.deepEqual(listJobs().map((v) => v.jobId), [b.jobId, a.jobId]);
   assert.equal(getJob('job_zzzzzz_abcdef'), null);
   assert.equal(readJson(join(jobsRoot(), a.jobId, 'job.json')).jobId, a.jobId);
+});
+
+test('a worktree that cannot be created is reported as such, not as a missing repository', async () => {
+  const repo = gitCwd();
+  const sub = join(repo, 'sub');
+  mkdirSync(sub);
+  const r = await startJob({ prompt: 'x', cwd: sub, mode: 'yolo', isolate_worktree: true });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /^Could not create worktree: /);
+  assert.deepEqual(listJobs(), []);
 });
