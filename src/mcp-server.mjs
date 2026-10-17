@@ -8,7 +8,7 @@ import { runTaskWithModel, resolveModel, getModelCatalog, resolveBin, entryReaso
 import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
   assertGitRepo, createWorktree, worktreeSummary, newRunId,
-  MODES, DEFAULT_TIMEOUT_MS, OUTPUT_CAP,
+  MODES, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, OUTPUT_CAP,
 } from './runner.mjs';
 
 const text = (s) => ({ content: [{ type: 'text', text: s }] });
@@ -48,7 +48,11 @@ const toolSchemas = {
         mode: { type: 'string', enum: MODES, description: 'Permission mode: plan (read-only plan first), build, edit, yolo (autonomous, default).' },
         resume: { type: 'string', description: 'Existing ZCode session id (sess_...) to continue a previous conversation. Server run-ids (run_...) are not resumable.' },
         target: { type: 'string', description: 'Optional session goal passed to ZCode (--target).' },
-        timeout_ms: { type: 'integer', description: `Task timeout in milliseconds (${DEFAULT_TIMEOUT_MS} default, max 3600000).` },
+        timeout_ms: { type: 'integer', description: `Absolute cap for the whole task in milliseconds (${DEFAULT_TIMEOUT_MS} default = 60 min, max 3600000).` },
+        idle_timeout_ms: {
+          type: 'integer',
+          description: `Only with model: abort after this many milliseconds without protocol progress (${DEFAULT_IDLE_TIMEOUT_MS} default = 10 min, max 3600000). Long but active tasks keep running. Without model use timeout_ms. On timeout the result lists the files changed so far.`,
+        },
         isolate_worktree: { type: 'boolean', description: 'Run the task in an isolated git worktree on a new zcode/<slug> branch. The worktree is kept; you must merge or remove it explicitly.' },
         model: {
           type: 'string',
@@ -155,6 +159,23 @@ async function worktreeLines(worktree) {
   return lines;
 }
 
+// Timeout without a worktree: the caller otherwise gets no hint what ZCode
+// already changed. Best-effort snapshot of the working tree; empty when the
+// directory is not a git repository.
+async function partialChangesLines(dir) {
+  let summary = null;
+  try {
+    summary = await worktreeSummary(dir);
+  } catch {
+    return [];
+  }
+  return [
+    '--- changes at timeout (work already on disk, not verified) ---',
+    `changed_files: ${summary.changedFiles.length ? summary.changedFiles.join(', ') : 'none'}`,
+    `diff_stat:\n${summary.diffStat || '(no changes)'}`,
+  ];
+}
+
 function capBody(body) {
   return body.length > OUTPUT_CAP ? body.slice(0, OUTPUT_CAP) + `\n[... output truncated at ${OUTPUT_CAP} chars]` : body;
 }
@@ -166,7 +187,7 @@ function capBody(body) {
  * skill/agent contract stays uniform.
  */
 async function runWithModelMode(store, args, v) {
-  const { prompt, cwd, mode, resume, target, timeoutMs, isolateWorktree } = v;
+  const { prompt, cwd, mode, resume, target, timeoutMs, idleTimeoutMs, isolateWorktree } = v;
   const model = args.model;
   const reasoningLevel = args.reasoning_level === undefined ? 'high' : args.reasoning_level;
   // Everything that can be rejected without a spawn is rejected here, before
@@ -241,7 +262,7 @@ async function runWithModelMode(store, args, v) {
   let protocolError = null;
   try {
     res = await runTaskWithModel({
-      binPath, cwd: effectiveCwd, prompt, providerId, modelId, reasoningLevel, timeoutMs,
+      binPath, cwd: effectiveCwd, prompt, providerId, modelId, reasoningLevel, timeoutMs, idleTimeoutMs,
     });
   } catch (error) {
     protocolError = error;
@@ -279,7 +300,12 @@ async function runWithModelMode(store, args, v) {
       `[notice] reasoning_level ${res.reasoningSubstitution.requested} not offered by ${providerId}/${modelId}; using ${res.reasoningSubstitution.used} instead`,
     );
   }
+  if (status === 'timeout') {
+    const kind = protocolError && /no activity/.test(protocolError.message) ? 'idle' : 'total';
+    lines.push(`timeout: ${kind}`);
+  }
   lines.push(...(await worktreeLines(worktree)));
+  if (status === 'timeout' && !worktree) lines.push(...(await partialChangesLines(effectiveCwd)));
   if (bookkeepingWarning) lines.push(bookkeepingWarning);
   if (res && !res.ok && res.error) {
     lines.push(`error: ${res.error.message}${res.error.code ? ` (code ${res.error.code})` : ''}`);
@@ -296,13 +322,16 @@ function buildRunHandler(store) {
   return async (args) => {
     const v = validateRunArgs(args);
     if (!v.ok) return failText(`Invalid arguments: ${v.error}`);
-    const { prompt, cwd, mode, resume, target, timeoutMs, isolateWorktree } = v.value;
+    const { prompt, cwd, mode, resume, target, timeoutMs, idleTimeoutMs, isolateWorktree } = v.value;
     if (resume && resume.startsWith('run_')) {
       return failText(`'${resume}' is a server-generated run-id and is not resumable. Use zcode_sessions to find a real ZCode session id (sess_...).`);
     }
     if (args.model !== undefined) return runWithModelMode(store, args, v.value);
     if (args.reasoning_level !== undefined) {
       return failText('Invalid arguments: reasoning_level applies only when model is set (protocol mode)');
+    }
+    if (v.value.idleTimeoutMs !== undefined) {
+      return failText('Invalid arguments: idle_timeout_ms applies only when model is set (protocol mode streams progress; the CLI prints its output only at the end, so use timeout_ms instead)');
     }
     let binPath;
     try {
@@ -322,7 +351,7 @@ function buildRunHandler(store) {
     }
 
     const res = await runZCodeTask({
-      binPath, prompt, cwd: worktree ? worktree.dir : cwd, mode, resume, target, timeoutMs,
+      binPath, prompt, cwd: worktree ? worktree.dir : cwd, mode, resume, target, timeoutMs, idleTimeoutMs,
     });
 
     const sessionId = res.sessionId || newRunId();
@@ -346,10 +375,11 @@ function buildRunHandler(store) {
     }
 
     const lines = [
-      `status: ${status} (exit ${res.code}${res.timedOut ? ', timed out' : ''})`,
+      `status: ${status} (exit ${res.code}${res.timedOut ? `, timed out: ${res.timeoutKind}` : ''})`,
       `session_id: ${sessionId}${res.sessionId ? '' : '  (server run-id, not resumable)'}`,
     ];
     lines.push(...(await worktreeLines(worktree)));
+    if (res.timedOut && !worktree) lines.push(...(await partialChangesLines(cwd)));
     if (bookkeepingWarning) lines.push(bookkeepingWarning);
     lines.push('--- zcode output ---', res.stdout);
     if (res.stderr.trim()) lines.push('--- zcode stderr ---', res.stderr);

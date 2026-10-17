@@ -5,7 +5,10 @@ import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 
 export const OUTPUT_CAP = 100000;
-export const DEFAULT_TIMEOUT_MS = 600000;
+// timeout_ms is the absolute cap for a whole task; idle_timeout_ms aborts only
+// when ZCode has been silent that long, so long but active tasks keep running.
+export const DEFAULT_TIMEOUT_MS = 3600000;
+export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 3600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
@@ -44,6 +47,11 @@ export function validateRunArgs(args = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS) {
     return { ok: false, error: `timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
   }
+  // Optional here; the caller decides whether the path supports it (model mode).
+  const idleTimeoutMs = args.idle_timeout_ms;
+  if (idleTimeoutMs !== undefined && (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < MIN_TIMEOUT_MS || idleTimeoutMs > MAX_TIMEOUT_MS)) {
+    return { ok: false, error: `idle_timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
+  }
   if (args.isolate_worktree !== undefined && typeof args.isolate_worktree !== 'boolean') {
     return { ok: false, error: 'isolate_worktree must be a boolean' };
   }
@@ -56,6 +64,7 @@ export function validateRunArgs(args = {}) {
       resume: args.resume,
       target: args.target,
       timeoutMs,
+      idleTimeoutMs,
       isolateWorktree: args.isolate_worktree === true,
     },
   };
@@ -100,7 +109,10 @@ export function buildSpawnEnv(binPath) {
   return env;
 }
 
-export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+// Idle detection only works on a stream that carries progress. The CLI path
+// (`--json`) writes nothing until the task ends, so it has no idle timer and
+// relies on the absolute timeout alone.
+export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs }) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
   const child = isNodeScript
@@ -111,41 +123,57 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let timeoutKind = null; // 'total' | 'idle'
     let killTimer = null;
+    let idleTimer = null;
 
-    const timer = setTimeout(() => {
+    const stop = (kind) => {
+      if (timedOut) return;
       timedOut = true;
+      timeoutKind = kind;
+      clearTimeout(idleTimer);
       child.kill('SIGTERM');
       killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    }, timeoutMs);
+    };
+    // Any output from ZCode counts as activity and restarts the idle timer.
+    const touch = () => {
+      if (!idleTimeoutMs) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => stop('idle'), idleTimeoutMs);
+    };
+    const timer = setTimeout(() => stop('total'), timeoutMs);
+    touch();
 
-    child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => { stderr += d; });
+    child.stdout.on('data', (d) => { stdout += d; touch(); });
+    child.stderr.on('data', (d) => { stderr += d; touch(); });
     child.on('error', (err) => {
       clearTimeout(timer);
+      clearTimeout(idleTimer);
       if (killTimer) clearTimeout(killTimer);
       stderr += `\n[zcode-delegate] failed to spawn: ${err.message}`;
-      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, sessionId: null });
+      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, timeoutKind, sessionId: null });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      clearTimeout(idleTimer);
       if (killTimer) clearTimeout(killTimer);
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
         code,
         timedOut,
+        timeoutKind,
         sessionId: extractSessionId(stdout),
       });
     });
   });
 }
 
-export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs }) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs });
 }
 
 export function newRunId() {

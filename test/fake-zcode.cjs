@@ -32,6 +32,17 @@ if (mode === 'bigoutput') {
 if (mode === 'hang') {
   setInterval(() => {}, 1000); // never exits; used for timeout tests
   process.exitCode = 0;
+} else if (mode === 'chatty') {
+  // Long-running but active: prints every 150 ms for ~1.5 s, then finishes.
+  let n = 0;
+  const t = setInterval(() => {
+    console.log(`progress ${n}`);
+    if (++n === 10) {
+      clearInterval(t);
+      console.log(JSON.stringify({ result: 'chatty done', session: { id: 'sess_chatty1' } }));
+      process.exit(0);
+    }
+  }, 150);
 } else if (mode === 'fail') {
   console.log(JSON.stringify({ session: { id: 'sess_fail000' } }));
   console.error('fake zcode failure');

@@ -19,7 +19,7 @@
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { discoverZCode } from './discover.mjs';
-import { buildSpawnEnv, DEFAULT_TIMEOUT_MS } from './runner.mjs';
+import { buildSpawnEnv, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS } from './runner.mjs';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 export const DEFAULT_TASK_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
@@ -177,6 +177,10 @@ export class AppServerClient {
 
   _onLine(line) {
     this._lastMessageAt = Date.now();
+    // Any protocol traffic is activity for waiters with an idle timer.
+    for (const waiter of this._eventWaiters) {
+      if (waiter.idleMs) this._armIdle(waiter);
+    }
     let msg;
     try {
       msg = JSON.parse(line);
@@ -260,7 +264,7 @@ export class AppServerClient {
    * `type` matches (string or array of strings). Rejects on timeout or when
    * the child is gone.
    */
-  waitForEvent(types, { timeoutMs = this.timeoutMs } = {}) {
+  waitForEvent(types, { timeoutMs = this.timeoutMs, idleTimeoutMs = null } = {}) {
     const wanted = Array.isArray(types) ? types : [types];
     const match = (p) => !!p && typeof p === 'object' && wanted.includes(p.type);
     const buffered = this._events.find(match);
@@ -271,14 +275,35 @@ export class AppServerClient {
       );
     }
     return new Promise((resolve, reject) => {
-      const waiter = { match, resolve, timer: null };
+      const waiter = { match, resolve, reject, timer: null, idleTimer: null, idleMs: idleTimeoutMs, wanted };
+      const give = (fn) => (value) => {
+        this._clearWaiter(waiter);
+        fn(value);
+      };
+      waiter.resolve = give(resolve);
+      waiter.reject = give(reject);
+      // Absolute cap for the whole wait.
       waiter.timer = setTimeout(() => {
-        const idx = this._eventWaiters.indexOf(waiter);
-        if (idx >= 0) this._eventWaiters.splice(idx, 1);
-        reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`));
+        waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`));
       }, timeoutMs);
+      if (waiter.idleMs) this._armIdle(waiter);
       this._eventWaiters.push(waiter);
     });
+  }
+
+  // Idle timer: aborts only when no protocol traffic arrives for idleMs.
+  _armIdle(waiter) {
+    clearTimeout(waiter.idleTimer);
+    waiter.idleTimer = setTimeout(() => {
+      waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`));
+    }, waiter.idleMs);
+  }
+
+  _clearWaiter(waiter) {
+    const idx = this._eventWaiters.indexOf(waiter);
+    if (idx >= 0) this._eventWaiters.splice(idx, 1);
+    clearTimeout(waiter.timer);
+    clearTimeout(waiter.idleTimer);
   }
 
   /**
@@ -291,9 +316,7 @@ export class AppServerClient {
     for (let i = this._eventWaiters.length - 1; i >= 0; i--) {
       const waiter = this._eventWaiters[i];
       if (waiter.match(params)) {
-        this._eventWaiters.splice(i, 1);
-        clearTimeout(waiter.timer);
-        waiter.resolve(params);
+        waiter.resolve(params); // clears the timers and removes the waiter
       }
     }
   }
@@ -304,9 +327,8 @@ export class AppServerClient {
       pending.reject(err);
     }
     this._pending.clear();
-    for (const waiter of this._eventWaiters.splice(0)) {
-      clearTimeout(waiter.timer);
-      waiter.reject(err);
+    for (const waiter of this._eventWaiters.slice()) {
+      waiter.reject(err); // clears the timers and removes the waiter
     }
   }
 
@@ -364,6 +386,7 @@ export async function runTaskWithModel({
   modelId,
   reasoningLevel = 'high',
   timeoutMs = DEFAULT_TASK_TIMEOUT_MS,
+  idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
   spawnFn,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
@@ -396,8 +419,13 @@ export async function runTaskWithModel({
     // No top-level cwd param: the workspace lives in a nested object with
     // BOTH keys required (notes §3). workspaceKey === workspacePath in
     // every observed session.
+    // mode: yolo is the documented autonomous semantics. Without it the
+    // session falls back to 'build', which denies every side-effect tool
+    // (Write, Bash) because nothing can approve the request, so the task
+    // "completes" without changing any file.
     const created = await client.request('session/create', {
       workspace: { workspacePath: cwd, workspaceKey: cwd },
+      mode: 'yolo',
     });
     const sessionId = created && created.session && created.session.sessionId;
     if (!sessionId) throw new AppServerError('session/create response is missing session.sessionId');
@@ -421,7 +449,7 @@ export async function runTaskWithModel({
       modelSelection: { providerId, modelId, options: { reasoningLevel: effectiveReasoningLevel } },
     });
 
-    const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs });
+    const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs, idleTimeoutMs });
     if (event.type === 'turn.failed') {
       const err = (event.payload && event.payload.error) || {};
       return {

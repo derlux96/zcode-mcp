@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
-  OUTPUT_CAP, DEFAULT_TIMEOUT_MS,
+  OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS,
 } from '../src/runner.mjs';
 import { makeTempDir, removeDir, fakeBin } from './helpers.mjs';
 
@@ -74,10 +74,45 @@ test('timeout kills the child and flags timedOut', async () => {
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 400 });
     assert.equal(res.timedOut, true);
+    assert.equal(res.timeoutKind, 'total');
   } finally {
     delete process.env.FAKE_ZCODE_MODE;
     removeDir(cwd);
   }
+});
+
+test('idle timeout aborts a silent child and reports kind idle', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  try {
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 10000, idleTimeoutMs: 300 });
+    assert.equal(res.timedOut, true);
+    assert.equal(res.timeoutKind, 'idle');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
+test('active output keeps a run alive past the idle limit', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  try {
+    // ~1.5 s of runtime with output every 150 ms, idle limit 600 ms.
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 10000, idleTimeoutMs: 600 });
+    assert.equal(res.timedOut, false);
+    assert.equal(res.code, 0);
+    assert.equal(res.sessionId, 'sess_chatty1');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
+test('validateRunArgs leaves idle_timeout_ms unset by default and rejects out-of-range values', () => {
+  assert.equal(validateRunArgs(base).value.idleTimeoutMs, undefined);
+  assert.equal(validateRunArgs({ ...base, idle_timeout_ms: 5 }).ok, false);
+  assert.equal(validateRunArgs({ ...base, idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS }).value.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
 });
 
 test('output is capped at OUTPUT_CAP characters', async () => {
