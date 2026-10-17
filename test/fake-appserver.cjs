@@ -19,6 +19,10 @@
 //             notifications before turn.completed — exceeds the client's
 //             EVENT_BUFFER_CAP (2000) while a waiter is live (regression
 //             for event-buffer saturation blinding live waiters)
+//   rate-limit  like fail, but the error message is "429 rate limit"
+//   auth-fail   like fail, but the error message is "project_token_login_failed"
+//   chatty    acks send, then emits a model.streaming session/event every
+//             150 ms for 1.5 s before turn.completed (idle-timeout tests)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //
@@ -225,6 +229,30 @@ function handleSend(req) {
     }, 25);
     return;
   }
+  if (MODE === 'chatty') {
+    let n = 0;
+    const t = setInterval(() => {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous',
+          sessionId: SESSION_ID,
+          turnId: 'turn_fake1',
+          traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_chatty_${n}`,
+          seq: 100 + n,
+          timestamp: Date.now(),
+          type: 'model.streaming',
+          payload: { assistantMessageId: 'msg_fake0001', delta: 'x', done: false, kind: 'reasoning_delta' },
+        },
+      });
+      if (++n === 10) {
+        clearInterval(t);
+        emitTurn(req);
+      }
+    }, 150);
+    return;
+  }
   // Notes §2: a second prefs request (scope user-execution) arrives at first
   // send, plus the MCP auth-header probe (any answer is fine there).
   sendServerRequest('server-2', 'session/requestRuntimePreferences', { sessionId: SESSION_ID, scope: 'user-execution' }, isPrefsAnswer);
@@ -257,14 +285,16 @@ function emitTurn(req) {
       payload: { assistantMessageId: 'msg_fake0001', delta: 'fake ', done: false, kind: 'reasoning_delta' },
     },
   });
-  const tail = MODE === 'fail'
+  const FAILURES = { fail: 'fake model failure', 'rate-limit': '429 rate limit', 'auth-fail': 'project_token_login_failed' };
+  const failMsg = FAILURES[MODE];
+  const tail = failMsg !== undefined
     ? {
         eventId: 'evt_fake_0003',
         seq: 12,
         timestamp: 1792184703455,
         type: 'turn.failed',
         payload: {
-          error: { type: 'unknown_error', code: 'model_not_found', message: 'fake model failure', detail: 'Model creation failed', underlyingErrorMessage: 'fake model failure', stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
+          error: { type: 'unknown_error', code: 'model_not_found', message: failMsg, detail: 'Model creation failed', underlyingErrorMessage: failMsg, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
           turnPhase: 'model_creation',
           inputId: 'in_fake0001',
         },

@@ -43,6 +43,31 @@ if (mode === 'hang') {
       process.exit(0);
     }
   }, 150);
+} else if (mode === 'silent') {
+  // Alive but mute for 30 s (idle-timeout tests).
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'crash-mid') {
+  setTimeout(() => process.exit(1), 300);
+} else if (mode === 'badutf8') {
+  // Invalid UTF-8 on stdout: decoding must yield U+FFFD, not throw.
+  process.stdout.write(Buffer.from([0xff, 0xfe, 0x0a]));
+  process.exitCode = 0;
+} else if (mode === 'ignore-sigterm') {
+  process.on('SIGTERM', () => {});
+  process.stdout.write('ready\n'); // handler is installed
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'spawn-grandchild') {
+  // Same process group (not detached); PID reported on stderr so tests can
+  // verify/kill it.
+  const { spawn } = require('node:child_process');
+  const gc = spawn('sleep', ['60'], { stdio: 'ignore' });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'slow-start') {
+  setTimeout(() => {
+    console.log(JSON.stringify({ result: 'slow start done', session: { id: 'sess_slow001' } }));
+    process.exit(0);
+  }, 2000);
 } else if (mode === 'fail') {
   console.log(JSON.stringify({ session: { id: 'sess_fail000' } }));
   console.error('fake zcode failure');
