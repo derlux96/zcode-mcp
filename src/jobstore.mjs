@@ -22,6 +22,18 @@ export function jobsRoot() {
   return join(stateHome(), 'jobs');
 }
 
+const JOB_ID_RE = /^job_[0-9a-z]+_[0-9a-f]{6}$/;
+
+export function isJobId(id) {
+  return typeof id === 'string' && JOB_ID_RE.test(id);
+}
+
+// Directory of a job, or null for anything that is not a well-formed job id
+// (never resolves a caller-supplied path such as '../x').
+export function jobDir(id) {
+  return isJobId(id) ? join(jobsRoot(), id) : null;
+}
+
 export function newJobId() {
   return `job_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
 }

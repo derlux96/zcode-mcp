@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   stateHome, jobsRoot, newJobId, createJobDir, writeJsonAtomic, readJson,
   readStatus, patchStatus, readResult, writeResult, listJobDirs, TERMINAL_STATES,
+  isJobId, jobDir,
 } from '../src/jobstore.mjs';
 
 function withHome(fn) {
@@ -104,4 +105,18 @@ test('listJobDirs returns existing job dirs oldest first', withHome(() => {
   mkdirSync(join(jobsRoot(), 'job_100_aaaaaa'));
   const tail = listJobDirs().map((d) => d.split('/').pop());
   assert.ok(tail.indexOf('job_zz_aaaaaa') < tail.indexOf('job_100_aaaaaa'));
+}));
+
+test('isJobId accepts generated ids and rejects traversal and malformed ids', () => {
+  assert.equal(isJobId(newJobId()), true);
+  for (const bad of ['', '../x', 'job_', 'job_abc_12345', 'job_abc_12345g', 'job_ABC_123456', 'job_abc_123456/..', 'x/job_abc_123456', null, 42, undefined]) {
+    assert.equal(isJobId(bad), false, String(bad));
+  }
+});
+
+test('jobDir maps valid ids into the jobs root and returns null otherwise', withHome((home) => {
+  const id = newJobId();
+  assert.equal(jobDir(id), join(home, 'state', 'jobs', id));
+  assert.equal(jobDir('../x'), null);
+  assert.equal(jobDir(''), null);
 }));

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
-  OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS,
+  OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS,
 } from '../src/runner.mjs';
 import { makeTempDir, removeDir, fakeBin } from './helpers.mjs';
 
@@ -365,4 +365,11 @@ test('injects nothing when the binary has no sibling builtin config', async () =
     removeDir(plain);
     removeDir(home);
   }
+});
+
+test('timeout_ms default and maximum are 6 hours', () => {
+  assert.equal(DEFAULT_TIMEOUT_MS, 21600000);
+  assert.equal(MAX_TIMEOUT_MS, 21600000);
+  assert.equal(validateRunArgs({ ...base, timeout_ms: 21600000 }).ok, true);
+  assert.match(validateRunArgs({ ...base, timeout_ms: 21600001 }).error, /timeout_ms/);
 });

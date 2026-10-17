@@ -8,10 +8,10 @@ import { signalGroup } from './procid.mjs';
 export const OUTPUT_CAP = 100000;
 // timeout_ms is the absolute cap for a whole task; idle_timeout_ms aborts only
 // when ZCode has been silent that long, so long but active tasks keep running.
-export const DEFAULT_TIMEOUT_MS = 3600000;
+export const DEFAULT_TIMEOUT_MS = 21600000; // 6 h
 export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
-export const MAX_TIMEOUT_MS = 3600000;
+export const MAX_TIMEOUT_MS = 21600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
 
 const SESSION_RE = /sess_[A-Za-z0-9._-]+/;
@@ -269,6 +269,15 @@ export async function createWorktree(cwd) {
   // staged work (ZCode is expected to commit during tasks) is not missed.
   const startSha = (await run(['rev-parse', 'HEAD'], cwd)).trim();
   return { dir, branch, slug, startSha };
+}
+
+// Undoes createWorktree (a job that never started): removes the worktree and
+// deletes its branch. Tries both steps; rethrows the first failure.
+export async function removeWorktree(cwd, worktree) {
+  let first = null;
+  try { await run(['worktree', 'remove', '--force', worktree.dir], cwd); } catch (err) { first = err; }
+  try { await run(['branch', '-D', worktree.branch], cwd); } catch (err) { first = first || err; }
+  if (first) throw first;
 }
 
 export async function worktreeSummary(dir, startSha) {

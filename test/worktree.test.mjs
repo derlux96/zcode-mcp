@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { assertGitRepo, createWorktree, worktreeSummary, newWorktreeSlug } from '../src/runner.mjs';
+import { assertGitRepo, createWorktree, worktreeSummary, newWorktreeSlug, removeWorktree } from '../src/runner.mjs';
 import { makeTempDir, makeGitRepo, removeDir, run } from './helpers.mjs';
 
 test('assertGitRepo passes in a repo and throws outside', async () => {
@@ -58,5 +58,16 @@ test('worktreeSummary includes committed and staged work, not just the working t
   const summary = await worktreeSummary(dir, startSha);
   assert.match(summary.diffStat, /README\.md/);
   assert.match(summary.diffStat, /staged\.txt/);
+  removeDir(repo);
+});
+
+test('removeWorktree deletes the worktree directory and its branch', async () => {
+  const repo = makeGitRepo();
+  const branchesBefore = run(repo, 'git', ['branch', '--list']);
+  const wt = await createWorktree(repo);
+  await removeWorktree(repo, wt);
+  assert.equal(existsSync(wt.dir), false);
+  assert.equal(run(repo, 'git', ['branch', '--list']), branchesBefore);
+  assert.equal(run(repo, 'git', ['worktree', 'list', '--porcelain']).includes(wt.dir), false);
   removeDir(repo);
 });
