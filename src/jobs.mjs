@@ -36,7 +36,7 @@ export function chooseJobPath(args = {}) {
 }
 
 // Liveness from already-read files (token check per R10, startup grace per R22).
-function aliveFrom(job, status) {
+export function aliveFrom(job, status) {
   if (!job || typeof job.token !== 'string' || job.token === '') return false;
   if (status && isTerminal(status.state)) return false;
   if (!status || !Number.isInteger(status.pid)) {
@@ -53,7 +53,7 @@ export function isJobAlive(dir) {
   return aliveFrom(readJson(join(dir, 'job.json')), readStatus(dir));
 }
 
-function viewOf(jobId, dir) {
+export function viewOf(jobId, dir) {
   const job = readJson(join(dir, 'job.json'));
   if (!job) return null;
   let status = readStatus(dir);
@@ -275,7 +275,7 @@ export async function startJob(args = {}, opts = {}) {
   return { ok: true, jobId: created.jobId };
 }
 
-function groupHasMembers(pgid) {
+export function groupHasMembers(pgid) {
   try {
     process.kill(-pgid, 0);
     return true;
@@ -286,19 +286,22 @@ function groupHasMembers(pgid) {
 
 // R18: the runner's group after its identity check; ZCode's group if the child
 // is alive with its recorded start time, or gone while its group still has members.
-function signalJob(job, dir, sig) {
+// Returns the process groups that were signalled.
+export function signalJob(job, dir, sig) {
+  const signalled = [];
   const s = readStatus(dir) || {};
-  if (isTerminal(s.state)) return;
+  if (isTerminal(s.state)) return signalled;
   if (aliveFrom(job, s) && Number.isInteger(s.pid)) {
-    try { signalGroup(s.pid, sig); } catch { /* invalid or foreign: skip */ }
+    try { if (signalGroup(s.pid, sig)) signalled.push(s.pid); } catch { /* invalid or foreign: skip */ }
   }
   const pgid = s.childPgid;
-  if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return;
+  if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return signalled;
   const id = getProcessIdentity(s.childPid);
   const ok = id ? typeof s.childStart === 'string' && id.start === s.childStart : groupHasMembers(pgid);
   if (ok) {
-    try { signalGroup(pgid, sig); } catch { /* skip */ }
+    try { if (signalGroup(pgid, sig)) signalled.push(pgid); } catch { /* skip */ }
   }
+  return signalled;
 }
 
 // Polls until the runner recorded a terminal state or no longer passes the identity check.
@@ -314,7 +317,7 @@ async function settle(job, dir, ms) {
   }
 }
 
-async function collectChanges(job) {
+export async function collectChanges(job) {
   if (job.worktree) {
     try {
       const { changedFiles, diffStat } = await worktreeSummary(job.worktree.dir, job.worktree.startSha);
