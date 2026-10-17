@@ -9,7 +9,7 @@ import { createJobDir, readStatus, readResult, stateHome, TERMINAL_STATES, patch
 import { captureBaseline } from '../src/changes.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
 import { SessionStore } from '../src/state.mjs';
-import { runJob } from '../src/job-runner.mjs';
+import { runJob, runnerEnvOptions } from '../src/job-runner.mjs';
 import { cancelJob } from '../src/jobs.mjs';
 import { OUTPUT_CAP } from '../src/runner.mjs';
 
@@ -290,7 +290,7 @@ test('token mismatch exits 2 and writes nothing', async () => {
 
 test('cancel via SIGTERM to a separately spawned runner process ends cancelled and leaves no process', async () => {
   const { dir, token } = mkJob({ cwd: tempCwd() });
-  const { child, exited } = spawnRunner(dir, token, { FAKE_ZCODE_MODE: 'silent', ZCODE_MCP_HEARTBEAT_MS: '50' });
+  const { child, exited } = spawnRunner(dir, token, { FAKE_ZCODE_MODE: 'silent', ZCODE_MCP_HEARTBEAT_MS: '50', NODE_ENV: 'test' });
   try {
     const st = await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
     assert.equal(st.pid, child.pid);
@@ -423,7 +423,7 @@ test('a fatal runner error kills ZCode\'s group before releasing the lock', asyn
   assert.equal(acquireCwdLock(cwd, jobId, () => true).ok, true);
   const lockFile = join(stateHome(), 'locks', `${lockKey(cwd)}.lock`);
   const { child, exited } = spawnRunner(dir, token, {
-    FAKE_ZCODE_MODE: 'spawn-grandchild', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500',
+    FAKE_ZCODE_MODE: 'spawn-grandchild', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500', NODE_ENV: 'test',
   });
   let members = [];
   try {
@@ -556,4 +556,17 @@ test('a job ending while another live job shares its repository warns shared_rep
   }
   assert.equal(readStatus(a.dir).state, 'cancelled');
   assert.equal(readResult(a.dir).warnings.includes('shared_repo'), false, 'the other job had already ended');
+});
+
+// M2: test hooks in the runner's environment apply only with NODE_ENV=test.
+test('runnerEnvOptions clamps the heartbeat and ignores the fatal hook outside tests', () => {
+  assert.deepEqual(runnerEnvOptions({}), { heartbeatMs: undefined, fatalAfterMs: 0 });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '50', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500' }), { heartbeatMs: 1000, fatalAfterMs: 0 });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '99999' }), { heartbeatMs: 10000, fatalAfterMs: 0 });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '3000' }), { heartbeatMs: 3000, fatalAfterMs: 0 });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: 'x' }), { heartbeatMs: undefined, fatalAfterMs: 0 });
+  assert.deepEqual(
+    runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_HEARTBEAT_MS: '50', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500' }),
+    { heartbeatMs: 50, fatalAfterMs: 1500 },
+  );
 });

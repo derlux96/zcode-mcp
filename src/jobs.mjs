@@ -19,6 +19,7 @@ export { groupHasMembers };
 import { captureBaseline, changesSince } from './changes.mjs';
 import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktreeSummary } from './runner.mjs';
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
+import { oneLine, cleanName } from './sanitize.mjs';
 
 export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const MAX_RUNNING_JOBS = 3;
@@ -129,7 +130,7 @@ export function formatCatalog(catalog) {
     .map((e) => {
       const levels = entryReasoningLevels(e);
       const base = `${e.ref.providerId}/${e.ref.modelId}`;
-      return levels.length ? `${base} (reasoning: ${levels.join(',')})` : base;
+      return cleanName(levels.length ? `${base} (reasoning: ${levels.join(',')})` : base);
     });
 }
 
@@ -144,7 +145,7 @@ async function resolveModelArg(model, cwd) {
   try {
     catalog = await getModelCatalog({ binPath: resolveBin(), cwd, timeoutMs: MODEL_CATALOG_TIMEOUT_MS });
   } catch (error) {
-    return { error: `Model catalog unavailable, cannot resolve '${spec}': ${error.message}` };
+    return { error: `Model catalog unavailable, cannot resolve '${cleanName(spec)}': ${oneLine(error.message)}` };
   }
   const resolved = resolveModel(catalog, spec);
   if (resolved) return { model: resolved };
@@ -152,7 +153,7 @@ async function resolveModelArg(model, cwd) {
   const listing = rows.length
     ? `Available models:\n${rows.join('\n')}`
     : 'No models are reported as available on this machine (the catalog is empty).';
-  return { error: `Model '${spec}' not found. ${listing}` };
+  return { error: `Model '${cleanName(spec)}' not found. ${listing}` };
 }
 
 function validateStart(args) {
@@ -229,13 +230,13 @@ export async function startJob(args = {}, opts = {}) {
     try {
       await assertGitRepo(cwd);
     } catch (error) {
-      return { ok: false, error: `isolate_worktree requires a git repository: ${error.message}` };
+      return { ok: false, error: `isolate_worktree requires a git repository: ${oneLine(error.message)}` };
     }
     try {
       const wt = await createWorktree(cwd);
       worktree = { branch: wt.branch, dir: wt.dir, startSha: wt.startSha };
     } catch (error) {
-      return { ok: false, error: `Could not create worktree: ${error.message}` };
+      return { ok: false, error: `Could not create worktree: ${oneLine(error.message)}` };
     }
   }
   const lockCwd = worktree ? worktree.dir : cwd;
@@ -265,7 +266,7 @@ export async function startJob(args = {}, opts = {}) {
       await undo();
       return {
         ok: false,
-        error: `Another job is already running in this directory (${lockCwd}): ${lock.blockingJobId}`,
+        error: `Another job is already running in this directory (${cleanName(lockCwd)}): ${lock.blockingJobId}`,
         blockingJobId: lock.blockingJobId,
       };
     }
@@ -278,7 +279,7 @@ export async function startJob(args = {}, opts = {}) {
     child.unref();
   } catch (error) {
     await undo();
-    return { ok: false, error: `Could not start the job: ${error.message}` };
+    return { ok: false, error: `Could not start the job: ${oneLine(error.message)}` };
   }
   return { ok: true, jobId: created.jobId };
 }

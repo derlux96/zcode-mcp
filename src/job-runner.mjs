@@ -488,6 +488,20 @@ export async function runJob(dir, opts = {}) {
   }
 }
 
+const MIN_HEARTBEAT_MS = 1000;
+const MAX_HEARTBEAT_MS = 10000;
+
+// Options from the runner's environment. ZCODE_MCP_HEARTBEAT_MS is clamped to
+// 1000..10000 and ZCODE_MCP_TEST_FATAL_AFTER_SPAWN ignored unless NODE_ENV=test.
+export function runnerEnvOptions(env = process.env) {
+  const testing = env.NODE_ENV === 'test';
+  let heartbeatMs = Number(env.ZCODE_MCP_HEARTBEAT_MS);
+  if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0) heartbeatMs = undefined;
+  else if (!testing) heartbeatMs = Math.min(MAX_HEARTBEAT_MS, Math.max(MIN_HEARTBEAT_MS, heartbeatMs));
+  const fatal = Number(env.ZCODE_MCP_TEST_FATAL_AFTER_SPAWN);
+  return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0 };
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   // Signal handlers first, so an early SIGTERM/SIGINT still ends in a terminal state.
   const early = new AbortController();
@@ -510,14 +524,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   };
   process.on('uncaughtException', onFatal);
   process.on('unhandledRejection', onFatal);
-  const hb = Number(process.env.ZCODE_MCP_HEARTBEAT_MS);
-  // TEST ONLY (never set in production): throw an uncaught error <ms> after ZCode spawned.
-  const fatalAfter = Number(process.env.ZCODE_MCP_TEST_FATAL_AFTER_SPAWN);
+  const { heartbeatMs, fatalAfterMs: fatalAfter } = runnerEnvOptions();
+  // TEST ONLY (NODE_ENV=test): throw an uncaught error <ms> after ZCode spawned.
   const onStatus = fatalAfter > 0
     ? (_s, patch) => {
       if (patch.state === 'running') setTimeout(() => { throw new Error('test fatal after spawn'); }, fatalAfter);
     }
     : undefined;
-  runJob(dir, { heartbeatMs: Number.isFinite(hb) && hb > 0 ? hb : undefined, signal: early.signal, onStatus })
+  runJob(dir, { heartbeatMs, signal: early.signal, onStatus })
     .then(() => process.exit(0), onFatal);
 }
