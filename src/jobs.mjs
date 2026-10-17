@@ -183,6 +183,9 @@ function validateStart(args) {
     if (args.reasoning_level !== undefined) {
       return invalid('reasoning_level applies only when model is set or no mode/resume/target is given');
     }
+    if (v.value.maxTransientRetries !== undefined) {
+      return invalid('max_transient_retries applies only in protocol mode (model set, or no mode/resume/target given): the CLI path cannot continue a session after a provider error; rerun with resume <sess_id> instead');
+    }
   }
   return { ok: true, value: v.value };
 }
@@ -257,6 +260,7 @@ export async function startJob(args = {}, opts = {}) {
         prompt: v.prompt, cwd, mode: v.mode, resume: v.resume, target: v.target,
         model: args.model, reasoning_level: args.reasoning_level,
         timeout_ms: v.timeoutMs, idle_timeout_ms: v.idleTimeoutMs, isolate_worktree: v.isolateWorktree,
+        max_transient_retries: v.maxTransientRetries,
       },
       path,
       model,

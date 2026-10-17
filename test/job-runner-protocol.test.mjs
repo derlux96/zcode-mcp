@@ -186,9 +186,9 @@ test('a cancelled protocol job keeps the real session id (M6)', async () => {
   assert.equal(res.sessionId, 'sess_fakeB1');
 });
 
-test('rate-limit ends failed with errorKind quota', async () => {
+test('rate-limit ends failed with errorKind quota (transient retries disabled)', async () => {
   process.env.FAKE_APPSERVER_MODE = 'rate-limit';
-  const { dir } = mkJob({ cwd: tempCwd() });
+  const { dir } = mkJob({ cwd: tempCwd(), max_transient_retries: 0 });
   await runJob(dir);
   const res = readResult(dir);
   assert.equal(res.state, 'failed');

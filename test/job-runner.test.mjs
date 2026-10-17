@@ -564,14 +564,14 @@ test('a job ending while another live job shares its repository warns shared_rep
 
 // M2: test hooks in the runner's environment apply only with NODE_ENV=test.
 test('runnerEnvOptions clamps the heartbeat and ignores the fatal hook outside tests', () => {
-  assert.deepEqual(runnerEnvOptions({}), { heartbeatMs: undefined, fatalAfterMs: 0 });
-  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '50', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500' }), { heartbeatMs: 1000, fatalAfterMs: 0 });
-  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '99999' }), { heartbeatMs: 10000, fatalAfterMs: 0 });
-  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '3000' }), { heartbeatMs: 3000, fatalAfterMs: 0 });
-  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: 'x' }), { heartbeatMs: undefined, fatalAfterMs: 0 });
+  assert.deepEqual(runnerEnvOptions({}), { heartbeatMs: undefined, fatalAfterMs: 0, retryDelaysMs: undefined });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '50', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500' }), { heartbeatMs: 1000, fatalAfterMs: 0, retryDelaysMs: undefined });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '99999' }), { heartbeatMs: 10000, fatalAfterMs: 0, retryDelaysMs: undefined });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '3000' }), { heartbeatMs: 3000, fatalAfterMs: 0, retryDelaysMs: undefined });
+  assert.deepEqual(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: 'x' }), { heartbeatMs: undefined, fatalAfterMs: 0, retryDelaysMs: undefined });
   assert.deepEqual(
     runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_HEARTBEAT_MS: '50', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500' }),
-    { heartbeatMs: 50, fatalAfterMs: 1500 },
+    { heartbeatMs: 50, fatalAfterMs: 1500, retryDelaysMs: undefined },
   );
 });
 
