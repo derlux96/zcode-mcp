@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
+import { signalGroup } from './procid.mjs';
 
 export const OUTPUT_CAP = 100000;
 // timeout_ms is the absolute cap for a whole task; idle_timeout_ms aborts only
@@ -113,14 +114,39 @@ export function buildSpawnEnv(binPath) {
 // (`--json`) writes nothing until the task ends, so it has no idle timer and
 // relies on the absolute timeout alone.
 // `signal` (AbortSignal) stops the child exactly like a timeout, reported as
-// timeoutKind 'cancelled'; `onSpawn(child)` is called once the child has a pid.
-export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn }) {
+// timeoutKind 'cancelled'; `onSpawn(child)` is called once the child has a pid
+// (if it throws, the child is killed and the call rejects); `onStdout(chunk)`
+// sees every stdout chunk uncapped. `killGroup` runs the child in its own
+// process group (pgid = child.pid) and makes every stop signal the whole group,
+// so grandchildren die with it.
+export async function runZCodeArgs(binPath, cliArgs, {
+  cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn, onStdout, killGroup = false,
+}) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
+  const opts = killGroup ? { cwd, env, detached: true } : { cwd, env };
   const child = isNodeScript
-    ? spawn(process.execPath, [binPath, ...cliArgs], { cwd, env })
-    : spawn(binPath, cliArgs, { cwd, env });
-  if (onSpawn && child.pid !== undefined) onSpawn(child);
+    ? spawn(process.execPath, [binPath, ...cliArgs], opts)
+    : spawn(binPath, cliArgs, opts);
+  const kill = (sig) => {
+    if (killGroup && Number.isInteger(child.pid) && child.pid > 1) {
+      try {
+        signalGroup(child.pid, sig);
+        return;
+      } catch {
+        // fall back to the child alone
+      }
+    }
+    child.kill(sig);
+  };
+  if (onSpawn && child.pid !== undefined) {
+    try {
+      onSpawn(child);
+    } catch (err) {
+      kill('SIGKILL');
+      throw err;
+    }
+  }
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -135,8 +161,8 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
       timedOut = true;
       timeoutKind = kind;
       clearTimeout(idleTimer);
-      child.kill('SIGTERM');
-      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
+      kill('SIGTERM');
+      killTimer = setTimeout(() => kill('SIGKILL'), 5000);
     };
     // Any output from ZCode counts as activity and restarts the idle timer.
     const touch = () => {
@@ -158,7 +184,15 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
       if (signal) signal.removeEventListener('abort', onAbort);
     };
 
-    child.stdout.on('data', (d) => { stdout += d; touch(); });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => {
+      stdout += d;
+      touch();
+      if (onStdout) {
+        try { onStdout(d); } catch { /* observer errors must not break the run */ }
+      }
+    });
     child.stderr.on('data', (d) => { stderr += d; touch(); });
     child.on('error', (err) => {
       cleanup();
@@ -179,11 +213,14 @@ export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_
   });
 }
 
-export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn }) {
+export async function runZCodeTask({
+  binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs,
+  signal, onSpawn, onStdout, killGroup,
+}) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup });
 }
 
 export function newRunId() {

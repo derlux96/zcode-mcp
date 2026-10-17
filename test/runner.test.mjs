@@ -102,6 +102,62 @@ test('abort signal stops the child and reports kind cancelled; onSpawn sees the 
   }
 });
 
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+async function waitDead(pid, ms = 2000) {
+  const end = Date.now() + ms;
+  while (pidAlive(pid) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
+  return !pidAlive(pid);
+}
+
+test('killGroup: a timeout also kills the grandchild', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'spawn-grandchild';
+  let gc;
+  try {
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 600, killGroup: true });
+    assert.equal(res.timeoutKind, 'total');
+    gc = Number(res.stderr.match(/grandchild pid (\d+)/)[1]);
+    assert.equal(await waitDead(gc), true, 'grandchild killed with the group');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    if (gc) try { process.kill(gc, 'SIGKILL'); } catch {}
+    removeDir(cwd);
+  }
+});
+
+test('a throwing onSpawn kills the child and rejects', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  let pid;
+  try {
+    await assert.rejects(
+      runZCodeTask({
+        binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 30000, killGroup: true,
+        onSpawn: (child) => { pid = child.pid; throw new Error('boom'); },
+      }),
+      /boom/,
+    );
+    assert.equal(await waitDead(pid), true);
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
+test('onStdout sees the full, uncapped stdout', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'bigoutput';
+  try {
+    let seen = 0;
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, onStdout: (c) => { seen += c.length; } });
+    assert.ok(seen > OUTPUT_CAP);
+    assert.ok(seen > res.stdout.length);
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
 test('idle timeout aborts a silent child and reports kind idle', async () => {
   const cwd = makeTempDir();
   process.env.FAKE_ZCODE_MODE = 'hang';

@@ -1,6 +1,6 @@
 import { test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,7 @@ import { captureBaseline } from '../src/changes.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
 import { SessionStore } from '../src/state.mjs';
 import { runJob } from '../src/job-runner.mjs';
+import { OUTPUT_CAP } from '../src/runner.mjs';
 
 const runnerPath = fileURLToPath(new URL('../src/job-runner.mjs', import.meta.url));
 const temps = [];
@@ -209,6 +210,7 @@ test('status records pid, pidStart, token, childPid', async () => {
   assert.ok(st.pidStart.length > 0);
   assert.equal(st.token, token);
   assert.ok(Number.isInteger(st.childPid) && st.childPid !== process.pid);
+  assert.equal(st.childPgid, st.childPid);
   assert.equal(typeof st.childStart, 'string');
   assert.equal(typeof st.startedAt, 'string');
   assert.equal(typeof st.lastActivityAt, 'string');
@@ -307,11 +309,89 @@ test('ignore-sigterm child is killed by SIGKILL after the grace period', async (
   const { dir } = mkJob({ cwd: tempCwd() });
   const done = runJob(dir, { heartbeatMs: 50 });
   const st = await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
-  await new Promise((r) => setTimeout(r, 700)); // let the fake install its SIGTERM handler
+  // The fake prints `ready` once its SIGTERM handler is installed; that output bumps lastActivityAt.
+  await waitFor(() => readStatus(dir).lastActivityAt !== st.lastActivityAt, 5000);
   const t0 = Date.now();
   writeFileSync(join(dir, 'cancel'), '');
   await done;
   assert.ok(Date.now() - t0 >= 4500, 'waited for the SIGKILL grace period');
   assert.equal(readResult(dir).state, 'cancelled');
   assert.equal(alive(st.childPid), false);
+});
+
+function grandchildPid(res) {
+  const m = /grandchild pid (\d+)/.exec(res.stderr);
+  assert.ok(m, 'fake reported its grandchild');
+  return Number(m[1]);
+}
+
+async function assertGrandchildGone(res) {
+  const gc = grandchildPid(res);
+  try {
+    await waitFor(() => !alive(gc), 2000);
+  } finally {
+    try { process.kill(gc, 'SIGKILL'); } catch {} // cleanup only after the assertion ran
+  }
+}
+
+test('cancel kills the grandchild in ZCode\'s process group', async () => {
+  process.env.FAKE_ZCODE_MODE = 'spawn-grandchild';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  const st = await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+  // Wait until the grandchild is in the group (pgrep lists group members).
+  await waitFor(() => {
+    try { return execFileSync('pgrep', ['-g', String(st.childPgid)], { encoding: 'utf8' }).trim().split('\n').length >= 2; } catch { return false; }
+  });
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  await assertGrandchildGone(res);
+});
+
+test('timeout kills the grandchild in ZCode\'s process group', async () => {
+  process.env.FAKE_ZCODE_MODE = 'spawn-grandchild';
+  const { dir } = mkJob({ cwd: tempCwd(), timeout_ms: 600 });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'timeout');
+  await assertGrandchildGone(res);
+});
+
+test('a failing heartbeat write does not end the runner', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  let beats = 0;
+  await runJob(dir, {
+    heartbeatMs: 50,
+    onStatus: (_s, patch) => {
+      if (patch.heartbeatAt && !patch.state && ++beats === 1) throw new Error('disk hiccup');
+    },
+  });
+  assert.ok(beats > 1, 'heartbeat continued after the failure');
+  assert.equal(readResult(dir).state, 'completed');
+  assert.equal(readStatus(dir).state, 'completed');
+});
+
+test('a failing running-status write becomes a warning, not a crash', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  await runJob(dir, {
+    onStatus: (_s, patch) => { if (patch.state === 'running') throw new Error('disk hiccup'); },
+  });
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.deepEqual(res.warnings, ['status_write_failed']);
+});
+
+test('output.log holds the full stdout while result.output stays capped', async () => {
+  process.env.FAKE_ZCODE_MODE = 'bigoutput';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  await runJob(dir);
+  const res = readResult(dir);
+  const log = readFileSync(res.outputLogPath, 'utf8');
+  assert.ok(log.length > OUTPUT_CAP);
+  assert.ok(log.length > res.output.length);
+  assert.equal(log, 'x'.repeat(500000) + '\n');
+  assert.equal(statSync(res.outputLogPath).mode & 0o777, 0o600);
 });
