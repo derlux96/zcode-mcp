@@ -141,15 +141,19 @@ if (e2e) {
   assertThat(/"ok": true/.test(check2.result.content[0].text), 'e2e zcode_check against real binary');
 
   // Mode A runs can fail on machines whose default provider model is dead
-  // ("Model is unavailable" — a provider-config problem, not a plugin bug).
-  // On such machines the mode-A sess_-dependent assertions skip with a
-  // reason; any other failure still fails, and the mode-B explicit-model
-  // proof below stays a hard assertion on every machine.
+  // ("Model is unavailable") or whose standalone CLI auth is broken
+  // ("Model creation failed / Select a model before continuing" when no
+  // entitled provider exists, "project_token_login_failed" / "Turn execution
+  // failed" when the OAuth token exchange rejects the login) — all of these
+  // are provider/auth environment problems, not plugin bugs. On such machines
+  // the mode-A sess_-dependent assertions skip with a reason; any other
+  // failure still fails, and the mode-B explicit-model proof below stays a
+  // hard assertion on every machine.
   const assertOrSkipOnDeadDefault = (cond, label, runOutput) => {
     if (cond) {
       console.log(`  ok: ${label}`);
-    } else if (/Model is unavailable/.test(runOutput)) {
-      console.log(`  skipped (default provider model unavailable on this machine): ${label}`);
+    } else if (/Model is unavailable|Model creation failed|Select a model before continuing|project_token_login_failed|Turn execution failed/.test(runOutput)) {
+      console.log(`  skipped (default provider/model auth unavailable on this machine): ${label}`);
     } else {
       failures++;
       console.error(`  FAIL: ${label}`);

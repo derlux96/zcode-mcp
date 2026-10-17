@@ -108,7 +108,12 @@ import { join } from 'node:path';
 
 test('injects the app-bundle builtin provider config on fresh shells', async () => {
   const prev = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  const prevHome = process.env.HOME;
+  const home = makeTempDir('zcode-home-'); // no personal provider config there
+  process.env.HOME = home;
   const app = makeTempDir('zcode-app-');
   const glm = join(app, 'glm');
   const cfg = join(app, 'config', 'provider');
@@ -122,16 +127,86 @@ test('injects the app-bundle builtin provider config on fresh shells', async () 
     const res = await runZCodeArgs(bin, [], { cwd: app, timeoutMs: 5000 });
     const parsed = JSON.parse(res.stdout);
     assert.equal(parsed.builtinConfig, join(app, 'config', 'provider', 'zcode-builtin.json'));
+    assert.equal(parsed.personalConfig, null); // no default personal config file
   } finally {
     delete process.env.FAKE_ZCODE_DUMP_ENV;
     if (prev !== undefined) process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = prev;
+    if (prevPersonal !== undefined) process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = prevPersonal;
+    else delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    if (prevHome !== undefined) process.env.HOME = prevHome; else delete process.env.HOME;
+    removeDir(app);
+    removeDir(home);
+  }
+});
+
+test('completes the pair: injects the personal provider config default alongside the builtin one', async () => {
+  const prev = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  const prevHome = process.env.HOME;
+  const home = makeTempDir('zcode-home-');
+  const personalDir = join(home, '.zcode', 'v2');
+  mkdirSync(personalDir, { recursive: true });
+  writeFileSync(join(personalDir, 'provider_config.json'), '{"schemaVersion":1}');
+  process.env.HOME = home;
+  const app = makeTempDir('zcode-app-');
+  const glm = join(app, 'glm');
+  const cfg = join(app, 'config', 'provider');
+  mkdirSync(glm, { recursive: true });
+  mkdirSync(cfg, { recursive: true });
+  const bin = join(glm, 'fake-zcode.cjs');
+  copyFileSync(fakeBin, bin);
+  writeFileSync(join(cfg, 'zcode-builtin.json'), '{}');
+  try {
+    process.env.FAKE_ZCODE_DUMP_ENV = '1';
+    const res = await runZCodeArgs(bin, [], { cwd: app, timeoutMs: 5000 });
+    const parsed = JSON.parse(res.stdout);
+    assert.equal(parsed.builtinConfig, join(app, 'config', 'provider', 'zcode-builtin.json'));
+    assert.equal(parsed.personalConfig, join(home, '.zcode', 'v2', 'provider_config.json'));
+  } finally {
+    delete process.env.FAKE_ZCODE_DUMP_ENV;
+    if (prev !== undefined) process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = prev;
+    if (prevPersonal !== undefined) process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = prevPersonal;
+    else delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    if (prevHome !== undefined) process.env.HOME = prevHome; else delete process.env.HOME;
+    removeDir(app);
+    removeDir(home);
+  }
+});
+
+test('never overrides an explicitly set ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', async () => {
+  const prev = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = '/custom/personal.json';
+  const app = makeTempDir('zcode-app-');
+  const glm = join(app, 'glm');
+  const cfg = join(app, 'config', 'provider');
+  mkdirSync(glm, { recursive: true });
+  mkdirSync(cfg, { recursive: true });
+  const bin = join(glm, 'fake-zcode.cjs');
+  copyFileSync(fakeBin, bin);
+  writeFileSync(join(cfg, 'zcode-builtin.json'), '{}');
+  try {
+    process.env.FAKE_ZCODE_DUMP_ENV = '1';
+    const res = await runZCodeArgs(bin, [], { cwd: app, timeoutMs: 5000 });
+    const parsed = JSON.parse(res.stdout);
+    assert.equal(parsed.personalConfig, '/custom/personal.json');
+  } finally {
+    delete process.env.FAKE_ZCODE_DUMP_ENV;
+    if (prev !== undefined) process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = prev;
+    if (prevPersonal !== undefined) process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = prevPersonal;
+    else delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
     removeDir(app);
   }
 });
 
 test('never overrides an explicitly set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', async () => {
   const prev = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = '/custom/location.json';
+  delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   const scratch = makeTempDir();
   try {
     process.env.FAKE_ZCODE_DUMP_ENV = '1';
@@ -142,13 +217,23 @@ test('never overrides an explicitly set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', asy
     delete process.env.FAKE_ZCODE_DUMP_ENV;
     if (prev !== undefined) process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = prev;
     else delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+    if (prevPersonal !== undefined) process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = prevPersonal;
+    else delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
     removeDir(scratch);
   }
 });
 
 test('injects nothing when the binary has no sibling builtin config', async () => {
   const prev = process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+  delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  const prevHome = process.env.HOME;
+  const home = makeTempDir('zcode-home-');
+  const personalDir = join(home, '.zcode', 'v2');
+  mkdirSync(personalDir, { recursive: true });
+  writeFileSync(join(personalDir, 'provider_config.json'), '{"schemaVersion":1}');
+  process.env.HOME = home;
   const plain = makeTempDir('zcode-plain-');
   const bin = join(plain, 'fake-zcode.cjs');
   copyFileSync(fakeBin, bin);
@@ -157,9 +242,15 @@ test('injects nothing when the binary has no sibling builtin config', async () =
     const res = await runZCodeArgs(bin, [], { cwd: plain, timeoutMs: 5000 });
     const parsed = JSON.parse(res.stdout);
     assert.equal(parsed.builtinConfig, null);
+    // Both-or-neither: without a builtin config the personal one must not be
+    // injected either, or the app-server registry bootstrap would throw.
+    assert.equal(parsed.personalConfig, null);
   } finally {
     delete process.env.FAKE_ZCODE_DUMP_ENV;
     if (prev !== undefined) process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = prev;
+    if (prevPersonal !== undefined) process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = prevPersonal;
+    if (prevHome !== undefined) process.env.HOME = prevHome; else delete process.env.HOME;
     removeDir(plain);
+    removeDir(home);
   }
 });

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 
@@ -77,11 +78,24 @@ function extractSessionId(text) {
 // clients spawning this server do not, so inject the sibling config here.
 // Exported for reuse by src/appserver.mjs (mode B spawns the same binary as
 // an app-server child): one source of truth for the env handling.
+//
+// The app-server's provider registry bootstrap requires BOTH config paths or
+// NEITHER (a lone ZCODE_BUILTIN_PROVIDER_CONFIG_FILE makes registry creation
+// throw "ZCode Built-in missing", leaving mode B without a model catalog).
+// So whenever a builtin config is in play, complete the pair with the user's
+// personal provider config default.
 export function buildSpawnEnv(binPath) {
   const env = { ...process.env };
   if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
     const candidate = resolve(dirname(binPath), '../config/provider/zcode-builtin.json');
     if (existsSync(candidate)) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = candidate;
+  }
+  if (env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE && !env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE) {
+    // Read HOME from the env (not os.homedir(), which Node caches per process)
+    // so the path follows test-time HOME redirection.
+    const home = env.HOME || homedir();
+    const candidate = join(home, '.zcode', 'v2', 'provider_config.json');
+    if (existsSync(candidate)) env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = candidate;
   }
   return env;
 }

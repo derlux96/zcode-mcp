@@ -74,6 +74,25 @@ npx @modelcontextprotocol/inspector node src/mcp-server.mjs
      `model: <providerId/modelId>` and `reasoning_level` set, result contains
      `status: completed` and `session_id: sess_`.
 
+## Troubleshooting: CLI login broken (manual API-key auth)
+
+If `zcode login` succeeds in the browser but headless tasks still fail with
+`project_token_login_failed`, `Model creation failed`, or `Select a model before
+continuing`, the Z.ai OAuth token exchange is rejecting the login (observed
+server-side on 2026-10-17). The workaround is API-key auth for the CLI:
+
+1. Create an API key at <https://z.ai/manage-apikey/apikey-list> (Z.ai Coding Plan → API keys).
+2. Run `zsh scripts/setup/setup-zcode-cli-auth.zsh` and paste the key when prompted
+   (input is hidden; backups of `credentials.json` and `provider_config.json` are
+   written next to the originals). The script verifies both a headless turn and the
+   app-server model catalog afterwards.
+
+Notes: the app-server provider registry requires the builtin AND the personal
+provider config together (the server injects both when needed); personal provider
+rules need a valid `group` (`standard-personal` for coding-plan keys); the key is
+stored AES-256-GCM-encrypted in `credentials.json` and in cleartext (mode 0600) in
+`provider_config.json`.
+
 ## Security notes
 
 - The server spawns only `node <zcode.cjs>` and `git` (worktree add/diff/status) with

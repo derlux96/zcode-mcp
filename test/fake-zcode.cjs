@@ -15,7 +15,10 @@ if (process.env.FAKE_ZCODE_ECHO_ARGS) {
   process.exit(0);
 }
 if (process.env.FAKE_ZCODE_DUMP_ENV) {
-  console.log(JSON.stringify({ builtinConfig: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || null }));
+  console.log(JSON.stringify({
+    builtinConfig: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || null,
+    personalConfig: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE || null,
+  }));
   process.exit(0);
 }
 if (mode === 'bigoutput') {
