@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 export function makeTempDir(prefix = 'zcode-test-') {
@@ -27,4 +28,4 @@ export function run(cwd, cmd, args) {
   return execFileSync(cmd, args, { cwd, encoding: 'utf8' });
 }
 
-export const fakeBin = new URL('./fake-zcode.cjs', import.meta.url).pathname;
+export const fakeBin = fileURLToPath(new URL('./fake-zcode.cjs', import.meta.url));

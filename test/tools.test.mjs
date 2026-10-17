@@ -2,12 +2,13 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createProtocol } from '../src/protocol.mjs';
 import { buildTools } from '../src/mcp-server.mjs';
 import { SessionStore } from '../src/state.mjs';
 import { makeTempDir, removeDir, fakeBin, makeGitRepo, run } from './helpers.mjs';
 
-const fakeAppserverBin = new URL('./fake-appserver.cjs', import.meta.url).pathname;
+const fakeAppserverBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
 
 /** Point mode B (ZCODE_APPSERVER_BIN) at the fake app-server for one test. */
 async function withAppserver(mode, fn) {

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import {
   AppServerClient,
@@ -17,7 +18,7 @@ import {
 import { DEFAULT_TIMEOUT_MS } from '../src/runner.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
 
-const fakeBin = new URL('./fake-appserver.cjs', import.meta.url).pathname;
+const fakeBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
 
 const createParams = (cwd) => ({ workspace: { workspacePath: cwd, workspaceKey: cwd } });
 
