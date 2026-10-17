@@ -272,6 +272,8 @@ test('balance class (R31): a status-only 1113 payload is retried twice, then fai
   assert.deepEqual(res.warnings, ['transient_retries_exhausted:2']);
   assert.equal(sends().length, 3);
   assert.match(readFileSync(join(dir, 'events.log'), 'utf8'), /retrying in 0s \(attempt 1\/2\): \[1113\]/);
+  assert.match(readFileSync(join(dir, 'events.log'), 'utf8'), /retrying in 0s \(attempt 2\/2\): \[1113\]/);
+  assert.deepEqual(res.retries.map((r) => [r.attempt, r.klass]), [[1, 'balance'], [2, 'balance']]);
 });
 
 test('real layout: localized 429 with the English cause in underlyingErrorMessage recovers', async () => {

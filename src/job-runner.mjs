@@ -292,14 +292,15 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   };
   const retries = [];
   let retryPending = false;
-  const onRetry = ({ attempt, maxRetries, delayMs, reason, at }) => {
+  // attempt k/N is shown within the error's class; the history keeps the global attempt.
+  const onRetry = ({ attempt, classAttempt, classMaxRetries, klass, delayMs, reason, at }) => {
     const why = oneLine(reason, RETRY_REASON_MAX);
-    retries.push({ at, attempt, delayMs, reason: why });
+    retries.push({ at, attempt, delayMs, reason: why, klass });
     retryPending = true;
-    addProgress(`retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}/${maxRetries}): ${why}`, Date.parse(at));
+    addProgress(`retrying in ${Math.round(delayMs / 1000)}s (attempt ${classAttempt}/${classMaxRetries}): ${why}`, Date.parse(at));
     try {
       setStatus({
-        retry: { attempt, maxRetries, nextAt: new Date(Date.parse(at) + delayMs).toISOString(), delayMs, reason: why },
+        retry: { attempt: classAttempt, maxRetries: classMaxRetries, klass, nextAt: new Date(Date.parse(at) + delayMs).toISOString(), delayMs, reason: why },
         progress: progress.slice(),
       });
     } catch { /* best effort */ }

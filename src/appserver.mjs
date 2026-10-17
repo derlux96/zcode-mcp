@@ -537,9 +537,9 @@ function retryOptions(transientRetry) {
  *
  * Transient provider errors (src/transient.mjs): a turn.failed whose error is
  * transient does not end the task while retries remain. After an abortable
- * wait (delaysMs[min(n-1, last)] ± jitter, or a numeric retry-after capped at
- * the largest delay; onRetry({attempt, maxRetries, delayMs, reason, at}) fires
- * before it) continuePrompt is sent into the SAME session with the same
+ * wait (delaysMs[min(k-1, last)] ± jitter with k = the retry count within the
+ * error's class, or a retry-after; onRetry({attempt, maxRetries, classAttempt,
+ * classMaxRetries, klass, delayMs, reason, at}) fires before it) continuePrompt is sent into the SAME session with the same
  * modelSelection. transientRetry: { maxRetries = 6 (0 disables), delaysMs,
  * jitter = 0.1, continuePrompt, classify (-> {transient, klass, maxRetries?};
  * a class cap such as the balance class's 2 retries applies on top of
@@ -676,14 +676,19 @@ export async function runTaskWithModel({
       const ofClass = retries.filter((r) => r.klass === cls.klass).length;
       if (retries.length >= retry.maxRetries || ofClass >= classCap) return failed(retry.maxRetries > 0 ? 'exhausted' : null);
       const attempt = retries.length + 1;
-      const delayMs = retryDelayMs(attempt, { delaysMs: retry.delaysMs, jitter: retry.jitter, retryAfter: retryAfterMs(raw) });
+      // Delays and the k/N display count within the class (balance: 30 s, 60 s even
+      // after earlier rate-limit retries); the history keeps the global attempt.
+      const classAttempt = ofClass + 1;
+      const classMaxRetries = Math.min(retry.maxRetries, classCap);
+      const delayMs = retryDelayMs(classAttempt, { delaysMs: retry.delaysMs, jitter: retry.jitter, retryAfter: retryAfterMs(raw) });
       if (deadline !== null && Date.now() + delayMs >= deadline) return failed('deadline');
       const at = new Date().toISOString();
       const reason = describeTurnError(error);
-      retries.push({ at, attempt, delayMs, reason, klass: cls.klass ?? null });
+      const klass = cls.klass ?? null;
+      retries.push({ at, attempt, delayMs, reason, klass });
       if (retry.onRetry) {
         try {
-          retry.onRetry({ attempt, maxRetries: Math.min(retry.maxRetries, classCap), delayMs, reason, at, klass: cls.klass ?? null });
+          retry.onRetry({ attempt, maxRetries: retry.maxRetries, classAttempt, classMaxRetries, klass, delayMs, reason, at });
         } catch { /* an observer must not end the task */ }
       }
       await backoff(client, retry, delayMs, signal);

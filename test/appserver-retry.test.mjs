@@ -353,3 +353,26 @@ test('an app-server that dies during the backoff ends the wait at once with chil
   );
   assert.ok(Date.now() - t0 < 10000, 'not after the 60 s backoff');
 });
+
+test('class bookkeeping: delays and attempt k/N count within the class; history keeps the global attempt', async () => {
+  const { cwd } = setup('fail-429-always');
+  const s = fakeSleep();
+  const infos = [];
+  const seq = ['rate_limit', 'rate_limit', 'balance', 'balance', 'balance'];
+  let i = 0;
+  const classify = () => {
+    const klass = seq[Math.min(i++, seq.length - 1)];
+    return klass === 'balance' ? { transient: true, klass, maxRetries: 2 } : { transient: true, klass };
+  };
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    transientRetry: { delaysMs: [10, 20, 30, 40], jitter: 0, sleep: s.sleep, classify, onRetry: (x) => infos.push(x) },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.retryStop, 'exhausted');
+  assert.deepEqual(s.waits, [10, 20, 10, 20], 'the first balance wait is the first step, not the third');
+  assert.deepEqual(infos.map((x) => [x.attempt, x.klass, x.classAttempt, x.classMaxRetries]), [
+    [1, 'rate_limit', 1, 6], [2, 'rate_limit', 2, 6], [3, 'balance', 1, 2], [4, 'balance', 2, 2],
+  ]);
+  assert.deepEqual(res.retries.map((r) => [r.attempt, r.klass]), [[1, 'rate_limit'], [2, 'rate_limit'], [3, 'balance'], [4, 'balance']]);
+});
