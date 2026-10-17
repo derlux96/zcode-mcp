@@ -32,9 +32,16 @@
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //   fail-429-then-ok      the first FAKE_APPSERVER_FAIL_TIMES (default 1) turns
-//             fail with Z.ai's 1113/HTTP 429 text, every later turn completes
+//             fail with an HTTP 429 rate-limit text, every later turn completes
 //   fail-network-then-ok  same, with "TypeError: fetch failed"
-//   fail-429-always       every turn fails with the 1113/HTTP 429 text
+//   fail-zh-429-then-ok   same, in the real layout: localized message, the
+//             English cause only in detail/underlyingErrorMessage
+//   fail-429-always       every turn fails with the HTTP 429 rate-limit text
+//   fail-1113-always      every turn fails with Z.ai's 1113/HTTP 429 balance text
+//   fail-status-1113-always  every turn fails with only statusCode 429 +
+//             statusMessage "[1113][Insufficient balance …]" (retryable:false)
+//   fail-zh-model-creation  the real model_not_found payload (localized message,
+//             detail "Model creation failed")
 //   fail-auth             every turn fails with an HTTP 401 invalid api key
 //   fail-model-request-failed  every turn fails with the generic
 //             "Model request failed." (what a wrong baseUrl produces)
@@ -46,6 +53,8 @@
 // FAKE_APPSERVER_RETRY_AFTER: seconds, added as "retry-after" to the turn.failed
 // error payload of the fail-* modes. FAKE_APPSERVER_HANG_AFTER: n; sends after
 // the n-th are acknowledged but their turn never ends (deadline tests).
+// FAKE_APPSERVER_EXIT_AFTER_FAIL=1: exit(1) 100 ms after a failed turn
+// (the app-server dies during the backoff).
 //
 // FAKE_APPSERVER_CREATE_DELAY_MS: delays every session/create response
 // (slow model catalog lookups).
@@ -230,15 +239,22 @@ function handleSubscribe(req) {
 // event buffer into shift-on-push saturation before turn.completed lands.
 const FLOOD_EVENTS = 2005;
 
+const MSG_429 = 'HTTP 429 Too Many Requests: rate limit reached for requests';
 const MSG_1113 = 'HTTP 429: [1113] Insufficient balance or no resource package. Please recharge.';
-// mode -> [message, failures before the turns complete (Infinity = always)]
+const ZH_NOT_FOUND = 'Provider Registry 中不存在 Model: glm-test/small';
+const plain = (message) => ({ type: 'provider_error', code: null, message });
+// mode -> [turn.failed payload.error, failures before the turns complete (null = FAIL_TIMES, Infinity = always)]
 const FAIL_MODES = {
-  'fail-429-then-ok': [MSG_1113, null],
-  'fail-network-then-ok': ['TypeError: fetch failed', null],
-  'fail-429-always': [MSG_1113, Infinity],
-  'fail-auth': ['HTTP 401 Unauthorized: invalid api key', Infinity],
-  'fail-model-request-failed': ['Model request failed.', Infinity],
-  'fail-model-creation': ['Model creation failed', Infinity],
+  'fail-429-then-ok': [plain(MSG_429), null],
+  'fail-network-then-ok': [plain('TypeError: fetch failed'), null],
+  'fail-zh-429-then-ok': [{ type: 'provider_error', code: 'provider_error', message: '模型请求失败', detail: 'Model request failed', underlyingErrorMessage: 'HTTP 429 Too Many Requests' }, null],
+  'fail-429-always': [plain(MSG_429), Infinity],
+  'fail-1113-always': [plain(MSG_1113), Infinity],
+  'fail-status-1113-always': [{ type: 'provider_error', statusCode: 429, statusMessage: '[1113][Insufficient balance or no resource package. Please recharge.][req_fake]', retryable: false }, Infinity],
+  'fail-auth': [plain('HTTP 401 Unauthorized: invalid api key'), Infinity],
+  'fail-model-request-failed': [plain('Model request failed.'), Infinity],
+  'fail-model-creation': [plain('Model creation failed'), Infinity],
+  'fail-zh-model-creation': [{ type: 'unknown_error', code: 'model_not_found', message: ZH_NOT_FOUND, detail: 'Model creation failed', underlyingErrorMessage: ZH_NOT_FOUND, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' }, Infinity],
 };
 
 let memSends = 0;
@@ -258,7 +274,7 @@ function scriptedFailure(n) {
   if (!entry) return null;
   const times = entry[1] === null ? (Number(process.env.FAKE_APPSERVER_FAIL_TIMES) || 1) : entry[1];
   if (n > times) return null;
-  const error = { type: 'provider_error', code: null, message: entry[0] };
+  const error = { ...entry[0] };
   const ra = Number(process.env.FAKE_APPSERVER_RETRY_AFTER);
   if (ra > 0) error['retry-after'] = ra;
   return error;
@@ -278,7 +294,11 @@ function handleSend(req) {
     }
     const hangAfter = Number(process.env.FAKE_APPSERVER_HANG_AFTER);
     if (hangAfter > 0 && n > hangAfter) return;
-    setTimeout(() => emitTurn(req, { n, failure: scriptedFailure(n) }), 25);
+    const failure = scriptedFailure(n);
+    setTimeout(() => {
+      emitTurn(req, { n, failure });
+      if (failure && process.env.FAKE_APPSERVER_EXIT_AFTER_FAIL === '1') setTimeout(() => process.exit(1), 100);
+    }, 25);
     return;
   }
   if (MODE === 'flood') {

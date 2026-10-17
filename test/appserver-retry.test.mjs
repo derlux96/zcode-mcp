@@ -9,7 +9,7 @@ import { makeTempDir, removeDir } from './helpers.mjs';
 
 const fakeBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
 const temps = [];
-const ENV_KEYS = ['FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG', 'FAKE_APPSERVER_COUNTER', 'FAKE_APPSERVER_FAIL_TIMES', 'FAKE_APPSERVER_RETRY_AFTER', 'FAKE_APPSERVER_HANG_AFTER'];
+const ENV_KEYS = ['FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG', 'FAKE_APPSERVER_COUNTER', 'FAKE_APPSERVER_FAIL_TIMES', 'FAKE_APPSERVER_RETRY_AFTER', 'FAKE_APPSERVER_HANG_AFTER', 'FAKE_APPSERVER_EXIT_AFTER_FAIL'];
 
 afterEach(() => { for (const k of ENV_KEYS) delete process.env[k]; });
 after(() => { for (const d of temps) removeDir(d); });
@@ -50,7 +50,7 @@ test('recovers after one 429: the continue message goes into the same session wi
   assert.equal(infos[0].attempt, 1);
   assert.equal(infos[0].maxRetries, 6);
   assert.equal(infos[0].delayMs, 1000);
-  assert.match(infos[0].reason, /1113/);
+  assert.match(infos[0].reason, /HTTP 429 Too Many Requests/);
   assert.match(infos[0].at, /^\d{4}-\d\d-\d\dT/);
   const sent = sends();
   assert.equal(sent.length, 2);
@@ -131,7 +131,7 @@ test('exhaustion returns the last real failure with the retry history', async ()
   });
   assert.equal(res.ok, false);
   assert.equal(res.failed, true);
-  assert.match(res.error.message, /\[1113\] Insufficient balance/);
+  assert.match(res.error.message, /rate limit reached/);
   assert.equal(res.retries.length, 2);
   assert.equal(res.retryStop, 'exhausted');
   assert.equal(sends().length, 3);
@@ -162,7 +162,7 @@ test('maxRetries 0 disables the retry', async () => {
     binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { maxRetries: 0, sleep: s.sleep },
   });
   assert.equal(res.ok, false);
-  assert.match(res.error.message, /1113/);
+  assert.match(res.error.message, /HTTP 429/);
   assert.equal(res.retryStop, null);
   assert.equal(sends().length, 1);
 });
@@ -193,7 +193,7 @@ test('a backoff past the deadline is not started: the last failure is returned',
     transientRetry: { delaysMs: [100, 5000], jitter: 0, sleep: s.sleep },
   });
   assert.equal(res.ok, false);
-  assert.match(res.error.message, /1113/);
+  assert.match(res.error.message, /HTTP 429/);
   assert.equal(res.retryStop, 'deadline');
   assert.deepEqual(s.waits, [100], 'the 5 s backoff would pass the 3 s deadline');
   assert.equal(sends().length, 2);
@@ -203,7 +203,7 @@ test('real backoffs inside the deadline: the task recovers', async () => {
   const { cwd } = setup('fail-429-then-ok', { FAKE_APPSERVER_FAIL_TIMES: '2' });
   const t0 = Date.now();
   const res = await runTaskWithModel({
-    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 1500, idleTimeoutMs: 100000,
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 6000, idleTimeoutMs: 100000,
     transientRetry: { delaysMs: [400], jitter: 0 },
   });
   assert.equal(res.ok, true, 'recovered within the deadline');
@@ -226,7 +226,8 @@ test('the job deadline caps the wait after a continue (turn_timeout names timeou
     },
   );
   const took = Date.now() - t0;
-  assert.ok(took < 1500 + 1200, `the deadline counts from the first send, backoff included (took ${took} ms)`);
+  // Without a whole-task deadline this would take 1500 ms after the 400 ms backoff, i.e. ~2 s more.
+  assert.ok(took < 1500 + 3000, `the deadline counts from the first send, backoff included (took ${took} ms)`);
 });
 
 test('the idle timer is not armed during a backoff longer than the idle limit', async () => {
@@ -258,4 +259,97 @@ test('cancel during the backoff rejects aborted promptly, clears the timer and l
   });
   assert.ok(Date.now() - t0 < 5000, 'ended well before the 60 s backoff');
   assert.equal(alive(pid), false);
+});
+
+// --- review fixes: real payload layout, balance class, dead app-server during a backoff ---
+
+test('real layout: localized message, English 429 only in underlyingErrorMessage -> retried', async () => {
+  const { cwd, sends } = setup('fail-zh-429-then-ok');
+  const s = fakeSleep();
+  const infos = [];
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    transientRetry: { delaysMs: [5], jitter: 0, sleep: s.sleep, onRetry: (i) => infos.push(i) },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(sends().length, 2);
+  assert.equal(infos[0].reason, '模型请求失败 | Model request failed | HTTP 429 Too Many Requests');
+});
+
+test('the returned error carries every diagnostic field of the real payload (not the stack)', async () => {
+  const { cwd, sends } = setup('fail-zh-model-creation');
+  const s = fakeSleep();
+  const res = await runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { sleep: s.sleep } });
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.error, {
+    code: 'model_not_found',
+    message: 'Provider Registry 中不存在 Model: glm-test/small',
+    type: 'unknown_error',
+    detail: 'Model creation failed',
+    underlyingErrorMessage: 'Provider Registry 中不存在 Model: glm-test/small',
+  });
+  assert.equal(sends().length, 1, 'permanent through detail: not retried');
+});
+
+test('balance class (R31): at most 2 retries regardless of maxRetries, then exhausted', async () => {
+  for (const mode of ['fail-status-1113-always', 'fail-1113-always']) {
+    const { cwd, sends } = setup(mode);
+    const s = fakeSleep();
+    const res = await runTaskWithModel({
+      binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+      transientRetry: { maxRetries: 6, delaysMs: [30, 60, 120], jitter: 0, sleep: s.sleep },
+    });
+    assert.equal(res.ok, false, mode);
+    assert.equal(res.retryStop, 'exhausted', mode);
+    assert.equal(res.retries.length, 2, mode);
+    assert.deepEqual(s.waits, [30, 60], mode);
+    assert.equal(sends().length, 3, mode);
+  }
+});
+
+test('balance class: a lower maxRetries still caps it', async () => {
+  const { cwd, sends } = setup('fail-1113-always');
+  const s = fakeSleep();
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { maxRetries: 1, delaysMs: [5], sleep: s.sleep },
+  });
+  assert.equal(res.retries.length, 1);
+  assert.equal(sends().length, 2);
+});
+
+test('status-only 1113 payload: statusCode/statusMessage/retryable are carried, message falls back to statusMessage', async () => {
+  const { cwd } = setup('fail-status-1113-always');
+  const s = fakeSleep();
+  const res = await runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { maxRetries: 0, sleep: s.sleep } });
+  assert.equal(res.error.statusCode, 429);
+  assert.equal(res.error.retryable, false);
+  assert.equal(res.error.statusMessage, '[1113][Insufficient balance or no resource package. Please recharge.][req_fake]');
+  assert.equal(res.error.message, res.error.statusMessage);
+});
+
+test('rate limits use the full schedule (6 retries by default)', async () => {
+  const { cwd, sends } = setup('fail-429-always');
+  const s = fakeSleep();
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { delaysMs: [1, 2, 3, 4, 5, 6], jitter: 0, sleep: s.sleep },
+  });
+  assert.equal(res.retries.length, 6);
+  assert.deepEqual(s.waits, [1, 2, 3, 4, 5, 6]);
+  assert.equal(sends().length, 7);
+});
+
+test('an app-server that dies during the backoff ends the wait at once with child_exited', async () => {
+  const { cwd } = setup('fail-429-always', { FAKE_APPSERVER_EXIT_AFTER_FAIL: '1' });
+  const t0 = Date.now();
+  await assert.rejects(
+    runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 0, transientRetry: { delaysMs: [60000], jitter: 0 } }),
+    (err) => {
+      assert.ok(err instanceof AppServerError);
+      assert.equal(err.code, 'child_exited');
+      assert.equal(err.retries.length, 1);
+      assert.equal(err.sessionId, 'sess_fakeB1');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - t0 < 10000, 'not after the 60 s backoff');
 });

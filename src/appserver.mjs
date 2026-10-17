@@ -21,7 +21,7 @@ import { statSync } from 'node:fs';
 import { discoverZCode } from './discover.mjs';
 import { signalGroup } from './procid.mjs';
 import { buildSpawnEnv, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS } from './runner.mjs';
-import { isTransientProviderError, retryAfterMs, retryDelayMs } from './transient.mjs';
+import { classifyTransient, describeTurnError, retryAfterMs, retryDelayMs } from './transient.mjs';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 export const DEFAULT_TASK_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
@@ -190,6 +190,11 @@ export class AppServerClient {
 
   isRunning() {
     return !this._exited;
+  }
+
+  /** Resolves once the app-server child has exited (or failed to start). */
+  get exited() {
+    return this._exitPromise;
   }
 
   _spawnChild() {
@@ -462,6 +467,39 @@ function abortableSleep(ms, signal) {
   });
 }
 
+// The turn.failed payload.error as returned to callers: code and message (falling
+// back to the other text fields) plus every other diagnostic field that is present;
+// the stack is dropped.
+const TURN_ERROR_FIELDS = ['type', 'detail', 'underlyingErrorMessage', 'statusCode', 'status', 'statusMessage', 'retryable', 'retryAfter', 'retry-after', 'Retry-After'];
+function turnError(raw) {
+  const text = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+  const error = {
+    code: raw.code ?? null,
+    message: text(raw.message) ?? text(raw.statusMessage) ?? text(raw.underlyingErrorMessage) ?? text(raw.detail) ?? 'turn failed without an error payload',
+  };
+  for (const f of TURN_ERROR_FIELDS) {
+    if (raw[f] !== undefined && raw[f] !== null) error[f] = raw[f];
+  }
+  return error;
+}
+
+// The backoff wait: ends early when the caller aborts or the app-server exits
+// (a dead app-server has no session left to continue).
+async function backoff(client, retry, delayMs, signal) {
+  const ctl = new AbortController();
+  const stop = () => ctl.abort();
+  if (signal) {
+    if (signal.aborted) stop();
+    else signal.addEventListener('abort', stop, { once: true });
+  }
+  client.exited.then(stop);
+  try {
+    await retry.sleep(delayMs, ctl.signal);
+  } finally {
+    if (signal) signal.removeEventListener('abort', stop);
+  }
+}
+
 function retryOptions(transientRetry) {
   const o = transientRetry && typeof transientRetry === 'object' ? transientRetry : {};
   const delaysMs = Array.isArray(o.delaysMs) && o.delaysMs.length && o.delaysMs.every((d) => Number.isFinite(d) && d >= 0)
@@ -472,7 +510,7 @@ function retryOptions(transientRetry) {
     delaysMs,
     jitter: Number.isFinite(o.jitter) && o.jitter >= 0 ? o.jitter : 0.1,
     continuePrompt: typeof o.continuePrompt === 'string' && o.continuePrompt.trim() !== '' ? o.continuePrompt : DEFAULT_CONTINUE_PROMPT,
-    isTransient: typeof o.isTransient === 'function' ? o.isTransient : isTransientProviderError,
+    classify: typeof o.classify === 'function' ? o.classify : classifyTransient,
     onRetry: typeof o.onRetry === 'function' ? o.onRetry : null,
     sleep: typeof o.sleep === 'function' ? o.sleep : abortableSleep,
   };
@@ -503,7 +541,12 @@ function retryOptions(transientRetry) {
  * the largest delay; onRetry({attempt, maxRetries, delayMs, reason, at}) fires
  * before it) continuePrompt is sent into the SAME session with the same
  * modelSelection. transientRetry: { maxRetries = 6 (0 disables), delaysMs,
- * jitter = 0.1, continuePrompt, isTransient, onRetry, sleep(ms, signal) }.
+ * jitter = 0.1, continuePrompt, classify (-> {transient, klass, maxRetries?};
+ * a class cap such as the balance class's 2 retries applies on top of
+ * maxRetries), onRetry, sleep(ms, signal) }. The wait also ends at once when the
+ * app-server exits (rejecting with code 'child_exited'). The returned `error`
+ * carries code, message and the payload's other diagnostic fields (type, detail,
+ * underlyingErrorMessage, statusCode, statusMessage, retryable, ...).
  * timeoutMs > 0 is a deadline for the whole task from the first send: every
  * wait gets the remaining time and a backoff that would pass it is not
  * started. The result carries retries [{at, attempt, delayMs, reason}] and
@@ -625,22 +668,29 @@ export async function runTaskWithModel({
         return { ...base, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
       }
       const raw = (event.payload && event.payload.error) || {};
-      const error = { code: raw.code ?? null, message: raw.message ?? 'turn failed without an error payload' };
+      const error = turnError(raw);
       const failed = (retryStop) => ({ ...base, ok: false, response: null, failed: true, error, retryStop });
-      if (!retry.isTransient(error)) return failed(null);
-      if (retries.length >= retry.maxRetries) return failed(retry.maxRetries > 0 ? 'exhausted' : null);
+      const cls = retry.classify(error) || {};
+      if (!cls.transient) return failed(null);
+      const classCap = Number.isInteger(cls.maxRetries) ? cls.maxRetries : Infinity;
+      const ofClass = retries.filter((r) => r.klass === cls.klass).length;
+      if (retries.length >= retry.maxRetries || ofClass >= classCap) return failed(retry.maxRetries > 0 ? 'exhausted' : null);
       const attempt = retries.length + 1;
       const delayMs = retryDelayMs(attempt, { delaysMs: retry.delaysMs, jitter: retry.jitter, retryAfter: retryAfterMs(raw) });
       if (deadline !== null && Date.now() + delayMs >= deadline) return failed('deadline');
       const at = new Date().toISOString();
-      retries.push({ at, attempt, delayMs, reason: error.message });
+      const reason = describeTurnError(error);
+      retries.push({ at, attempt, delayMs, reason, klass: cls.klass ?? null });
       if (retry.onRetry) {
         try {
-          retry.onRetry({ attempt, maxRetries: retry.maxRetries, delayMs, reason: error.message, at });
+          retry.onRetry({ attempt, maxRetries: Math.min(retry.maxRetries, classCap), delayMs, reason, at, klass: cls.klass ?? null });
         } catch { /* an observer must not end the task */ }
       }
-      await retry.sleep(delayMs, signal);
+      await backoff(client, retry, delayMs, signal);
       if (signal && signal.aborted) throw aborted();
+      if (!client.isRunning()) {
+        throw new AppServerError('app-server child exited during the backoff after a transient error', { code: 'child_exited' });
+      }
       content = retry.continuePrompt;
     }
   } catch (err) {
