@@ -22,13 +22,16 @@ export function jobsRoot() {
   return join(stateHome(), 'jobs');
 }
 
-// Creates `dir` (and parents) with mode 0700 and tightens an existing state
-// directory to 0700 when it belongs to this user. Used for the home, jobs and locks.
+// Creates `dir` (and parents) with mode 0700. An existing state directory that
+// belongs to this user only LOSES its group/other bits; owner bits are never
+// added, so a deliberately read-only directory (0500) stays read-only and the
+// caller's writability check still fails as the user intended.
+// Used for the home, jobs and locks.
 export function ensurePrivateDir(dir) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const st = statSync(dir);
   const uid = typeof process.getuid === 'function' ? process.getuid() : null;
-  if (uid !== null && st.uid === uid && (st.mode & 0o777) !== 0o700) chmodSync(dir, 0o700);
+  if (uid !== null && st.uid === uid && (st.mode & 0o077) !== 0) chmodSync(dir, st.mode & 0o700);
 }
 
 const JOB_ID_RE = /^job_[0-9a-z]+_[0-9a-f]{6}$/;

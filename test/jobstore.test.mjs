@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
   stateHome, jobsRoot, newJobId, createJobDir, writeJsonAtomic, readJson,
   readStatus, patchStatus, readResult, writeResult, listJobDirs, TERMINAL_STATES,
-  isJobId, jobDir,
+  isJobId, jobDir, ensurePrivateDir,
 } from '../src/jobstore.mjs';
 
 function withHome(fn) {
@@ -88,6 +88,34 @@ test('createJobDir throws not-writable for a read-only home', {
 }, withHome((home) => {
   chmodSync(home, 0o500);
   assert.throws(() => createJobDir({}), (e) => e.code === 'not-writable');
+}));
+
+test('ensurePrivateDir only removes group/other bits and never adds owner bits', withHome((home) => {
+  const mode = (d) => statSync(d).mode & 0o777;
+  const cases = [[0o755, 0o700], [0o770, 0o700], [0o750, 0o700], [0o555, 0o500], [0o500, 0o500], [0o700, 0o700]];
+  for (const [before, after] of cases) {
+    const d = join(home, `d-${before.toString(8)}`);
+    mkdirSync(d);
+    chmodSync(d, before);
+    ensurePrivateDir(d);
+    assert.equal(mode(d).toString(8), after.toString(8), `${before.toString(8)} -> ${after.toString(8)}`);
+    chmodSync(d, 0o700);
+  }
+  const fresh = join(home, 'new', 'deeper');
+  ensurePrivateDir(fresh);
+  assert.equal(mode(fresh).toString(8), '700');
+}));
+
+test('an existing read-only state home stays read-only: createJobDir throws not-writable and creates nothing', {
+  skip: process.getuid && process.getuid() === 0 ? 'running as root: chmod cannot block writes' : false,
+}, withHome((home) => {
+  const state = join(home, 'state');
+  mkdirSync(state);
+  chmodSync(state, 0o500);
+  assert.throws(() => createJobDir({}), (e) => e.code === 'not-writable');
+  assert.equal((statSync(state).mode & 0o777).toString(8), '500', 'the directory permission was left alone');
+  chmodSync(state, 0o700);
+  assert.deepEqual(readdirSync(state), [], 'nothing was created inside');
 }));
 
 test('listJobDirs returns existing job dirs oldest first', withHome(() => {
