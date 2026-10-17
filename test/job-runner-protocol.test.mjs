@@ -91,7 +91,9 @@ test('protocol job without model uses settings.model.current and completes with 
   assert.equal(st.state, 'completed');
   assert.equal(st.sessionId, 'sess_fakeB1');
   assert.ok(Number.isInteger(st.childPid));
-  assert.equal(st.childPgid, st.childPid);
+  // I4: once the app-server has exited its pgid is cleared and the exit recorded.
+  assert.equal(st.childPgid, null);
+  assert.equal(typeof st.childExitedAt, 'string');
   assert.equal(typeof st.childStart, 'string');
   assert.equal(typeof st.lastActivityAt, 'string');
   const entry = new SessionStore(process.env.ZCODE_MCP_STATE).list().find((e) => e.id === 'sess_fakeB1');

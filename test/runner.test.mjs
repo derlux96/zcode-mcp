@@ -4,7 +4,7 @@ import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
   OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS,
 } from '../src/runner.mjs';
-import { makeTempDir, removeDir, fakeBin } from './helpers.mjs';
+import { makeTempDir, removeDir, fakeBin, safeSignal } from './helpers.mjs';
 
 const base = { prompt: 'do it', cwd: '/tmp' };
 
@@ -121,6 +121,56 @@ test('killGroup: a timeout also kills the grandchild', async () => {
   } finally {
     delete process.env.FAKE_ZCODE_MODE;
     if (gc) try { process.kill(gc, 'SIGKILL'); } catch {}
+    removeDir(cwd);
+  }
+});
+
+// I3: a normal exit leaves no background process of ZCode's group behind.
+async function leaveGrandchild(env, opts = {}) {
+  const cwd = makeTempDir();
+  const saved = { ...process.env };
+  Object.assign(process.env, { FAKE_ZCODE_MODE: 'leave-grandchild' }, env);
+  let gc;
+  try {
+    const t0 = Date.now();
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 30000, killGroup: true, ...opts });
+    gc = Number(res.stderr.match(/grandchild pid (\d+)/)[1]);
+    return { res, gc, dead: await waitDead(gc), ms: Date.now() - t0 };
+  } finally {
+    for (const k of ['FAKE_ZCODE_MODE', 'FAKE_GRANDCHILD_STDIO', 'FAKE_GRANDCHILD_IGNORE_TERM']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+    if (gc) safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode-leftover' }); // only if the assertion failed
+    removeDir(cwd);
+  }
+}
+
+test('killGroup: a normal exit kills the background process ZCode left behind', async () => {
+  const { res, dead } = await leaveGrandchild({});
+  assert.equal(res.code, 0);
+  assert.equal(res.timedOut, false);
+  assert.equal(res.leftoverKilled, true);
+  assert.equal(dead, true, 'grandchild killed after the leader exited');
+});
+
+test('killGroup: a leftover holding the pipes and ignoring SIGTERM is SIGKILLed after the grace', async () => {
+  const { res, dead, ms } = await leaveGrandchild(
+    { FAKE_GRANDCHILD_STDIO: 'inherit', FAKE_GRANDCHILD_IGNORE_TERM: '1' },
+    { leftoverGraceMs: 300 },
+  );
+  assert.equal(res.code, 0);
+  assert.equal(res.leftoverKilled, true);
+  assert.equal(dead, true);
+  assert.ok(ms < 10000, `returned promptly (${ms} ms)`);
+});
+
+test('killGroup: a clean exit reports no leftovers', async () => {
+  const cwd = makeTempDir();
+  try {
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, killGroup: true });
+    assert.equal(res.code, 0);
+    assert.equal(res.leftoverKilled, false);
+  } finally {
     removeDir(cwd);
   }
 });

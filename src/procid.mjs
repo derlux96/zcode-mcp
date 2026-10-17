@@ -69,3 +69,30 @@ export function signalGroup(pgid, signal) {
     throw err;
   }
 }
+
+// True while the process group `pgid` has at least one member (EPERM: a member
+// exists but belongs to someone else).
+export function groupHasMembers(pgid) {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+// System boot time in ms (macOS `sysctl -n kern.boottime`), parsed once; null
+// when unavailable (callers then skip boot-time checks).
+let bootCache;
+export function bootTimeMs({ exec = execFileSync } = {}) {
+  if (bootCache !== undefined && exec === execFileSync) return bootCache;
+  let value = null;
+  try {
+    const out = String(exec('sysctl', ['-n', 'kern.boottime'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    const m = /sec\s*=\s*(\d+)/.exec(out);
+    if (m) value = Number(m[1]) * 1000;
+  } catch { /* unavailable */ }
+  if (exec === execFileSync) bootCache = value;
+  return value;
+}

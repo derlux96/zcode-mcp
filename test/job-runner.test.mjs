@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
+import { makeTempDir, makeGitRepo, removeDir, fakeBin, run, safeSignal } from './helpers.mjs';
 import { createJobDir, readStatus, readResult, stateHome, TERMINAL_STATES } from '../src/jobstore.mjs';
 import { captureBaseline } from '../src/changes.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
@@ -358,6 +358,26 @@ test('timeout kills the grandchild in ZCode\'s process group', async () => {
   const res = readResult(dir);
   assert.equal(res.state, 'timeout');
   await assertGrandchildGone(res);
+});
+
+test('a normal exit sweeps leftovers of ZCode\'s group and records it (I3, I4)', async () => {
+  process.env.FAKE_ZCODE_MODE = 'leave-grandchild';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  await runJob(dir);
+  const res = readResult(dir);
+  let gc;
+  try {
+    gc = grandchildPid({ stderr: res.stderr });
+    await waitFor(() => !alive(gc), 3000);
+  } finally {
+    if (gc) safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode-leftover' });
+  }
+  assert.equal(res.state, 'completed');
+  assert.ok(res.warnings.includes('leftover_processes_killed'), JSON.stringify(res.warnings));
+  const st = readStatus(dir);
+  assert.equal(typeof st.childExitedAt, 'string');
+  assert.equal(st.childPgid, null);
+  assert.ok(Number.isInteger(st.childPid), 'childPid stays for the record');
 });
 
 test('a failing heartbeat write does not end the runner', async () => {

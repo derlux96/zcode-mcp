@@ -11,7 +11,11 @@ import {
   patchStatus, writeResult, listJobDirs, isJobId, jobDir,
 } from './jobstore.mjs';
 import { acquireCwdLock, releaseCwdLock } from './locks.mjs';
-import { getProcessIdentity, matchesIdentity, identityAlive, signalGroup } from './procid.mjs';
+import {
+  getProcessIdentity, matchesIdentity, identityAlive, signalGroup, groupHasMembers, bootTimeMs,
+} from './procid.mjs';
+
+export { groupHasMembers };
 import { captureBaseline, changesSince } from './changes.mjs';
 import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktreeSummary } from './runner.mjs';
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
@@ -277,22 +281,27 @@ export async function startJob(args = {}, opts = {}) {
   return { ok: true, jobId: created.jobId };
 }
 
-export function groupHasMembers(pgid) {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
-  }
+// A leaderless group is trusted only while the runner has not recorded the child's
+// exit and the job was created after the last boot (a pgid from before a reboot or
+// from a child that ended earlier may belong to an unrelated group by now).
+function leaderlessGroupTrusted(job, s, bootMs) {
+  if (s.childExitedAt) return false;
+  const created = Date.parse(job && job.createdAt);
+  if (!Number.isFinite(created)) return false;
+  return !Number.isFinite(bootMs) || created > bootMs;
 }
 
 // R18: the runner's group after its identity check; ZCode's group if the child
-// is alive with its recorded start time, or gone while its group still has members.
+// is alive with its recorded start time, or gone while its group still has members
+// (only while trusted, see leaderlessGroupTrusted).
 // Returns the process groups that were signalled. runnerGroup: false never signals the
 // runner (the reaper). Groups that passed the checks but could not be signalled (EPERM)
 // are pushed to `failed` when given. `signal` replaces signalGroup in tests only.
-// `exec`: test hook for the ps calls. An unknown identity sample never leads to a signal.
-export function signalJob(job, dir, sig, { runnerGroup = true, failed, signal = signalGroup, exec } = {}) {
+// `exec` / `bootMs`: test hooks for the ps calls and the boot time. An unknown identity
+// sample never leads to a signal.
+export function signalJob(job, dir, sig, {
+  runnerGroup = true, failed, signal = signalGroup, exec, bootMs = bootTimeMs(),
+} = {}) {
   const signalled = [];
   const s = readStatus(dir) || {};
   if (isTerminal(s.state)) return signalled;
@@ -304,7 +313,9 @@ export function signalJob(job, dir, sig, { runnerGroup = true, failed, signal = 
   if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return signalled;
   const id = getProcessIdentity(s.childPid, idOpts);
   if (id && id.unknown) return signalled;
-  const ok = id ? typeof s.childStart === 'string' && id.start === s.childStart : groupHasMembers(pgid);
+  const ok = id
+    ? typeof s.childStart === 'string' && id.start === s.childStart
+    : leaderlessGroupTrusted(job, s, bootMs) && groupHasMembers(pgid);
   if (ok) {
     try { if (signal(pgid, sig)) signalled.push(pgid); } catch { if (failed) failed.push(pgid); }
   }

@@ -63,6 +63,18 @@ if (mode === 'hang') {
   const gc = spawn('sleep', ['60'], { stdio: 'ignore' });
   process.stderr.write(`grandchild pid ${gc.pid}\n`);
   setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'leave-grandchild') {
+  // Finishes normally (exit 0) but leaves a background process in its group,
+  // like `npm run dev &`. FAKE_GRANDCHILD_STDIO=inherit makes it hold the
+  // stdout/stderr pipes; FAKE_GRANDCHILD_IGNORE_TERM=1 makes it ignore SIGTERM.
+  const { spawn } = require('node:child_process');
+  const code = "if (process.env.FAKE_GRANDCHILD_IGNORE_TERM) process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+  const gc = spawn(process.execPath, ['-e', code, 'fake-zcode-leftover'], {
+    stdio: process.env.FAKE_GRANDCHILD_STDIO === 'inherit' ? 'inherit' : 'ignore',
+  });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  console.log(JSON.stringify({ result: 'done, background process left', session: { id: 'sess_leave01' } }));
+  setTimeout(() => process.exit(0), 300); // the grandchild has installed its handler
 } else if (mode === 'write-hang') {
   // Leaves a partial change in cwd, then works forever (cancel tests).
   require('node:fs').writeFileSync('partial.txt', 'partial\n');

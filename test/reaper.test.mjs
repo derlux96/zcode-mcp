@@ -9,7 +9,7 @@ import { makeTempDir, removeDir } from './helpers.mjs';
 import { reap, removeJobDir } from '../src/reaper.mjs';
 import { createJobDir, patchStatus, readJson, readResult, readStatus, stateHome, jobsRoot, writeResult } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
-import { getProcessIdentity, matchesIdentity, identityAlive } from '../src/procid.mjs';
+import { getProcessIdentity, matchesIdentity, identityAlive, bootTimeMs } from '../src/procid.mjs';
 import { signalJob } from '../src/jobs.mjs';
 import { listJobDirs } from '../src/jobstore.mjs';
 
@@ -416,4 +416,49 @@ test('signalJob never signals a child whose identity sample is unknown', async (
   assert.deepEqual(out, []);
   assert.deepEqual(sent, []);
   assert.equal(alive(child), true);
+});
+
+// I4: a stale pgid is never trusted.
+async function leaderlessGroup() {
+  const { pid: leader, line } = await spawnNode(`${GRANDCHILD}c.unref();process.stdout.write(c.pid+'\\n',()=>process.exit(0));`);
+  const member = Number(line);
+  extraPids.push(member);
+  await waitFor(() => getProcessIdentity(leader) === null);
+  assert.equal(alive(member), true);
+  return { leader, member };
+}
+
+test('a leaderless group is not signalled once the runner recorded the child exit', async () => {
+  const { leader, member } = await leaderlessGroup();
+  const j = handJob({ status: deadRunner({ childPid: leader, childPgid: leader, childStart: WRONG_START, childExitedAt: new Date().toISOString() }) });
+  const r = await reap(GRACE);
+  assert.deepEqual(r.lost, [j.jobId]);
+  assert.deepEqual(r.killed, []);
+  assert.equal(alive(member), true, 'unrelated group survives');
+});
+
+test('a leaderless group of a job created before the last boot is not signalled', async () => {
+  const { leader, member } = await leaderlessGroup();
+  const j = handJob({ status: deadRunner({ childPid: leader, childPgid: leader, childStart: WRONG_START }) });
+  const job = readJson(join(j.dir, 'job.json'));
+  const sent = [];
+  const signal = (p, s) => { sent.push([p, s]); return true; };
+  const created = Date.parse(job.createdAt);
+  assert.deepEqual(signalJob(job, j.dir, 'SIGTERM', { runnerGroup: false, signal, bootMs: created + 1000 }), []);
+  assert.deepEqual(sent, []);
+  // Created after boot (or boot time unknown): the group is trusted.
+  assert.deepEqual(signalJob(job, j.dir, 'SIGTERM', { runnerGroup: false, signal, bootMs: created - 1000 }), [leader]);
+  assert.deepEqual(signalJob(job, j.dir, 'SIGTERM', { runnerGroup: false, signal, bootMs: null }), [leader]);
+  assert.equal(alive(member), true);
+});
+
+test('bootTimeMs parses kern.boottime and falls back to null', () => {
+  const sample = () => '{ sec = 1792000000, usec = 123456 } Thu Oct 15 10:00:00 2026\n';
+  assert.equal(bootTimeMs({ exec: sample }), 1792000000 * 1000);
+  assert.equal(bootTimeMs({ exec: () => { throw new Error('no sysctl'); } }), null);
+  assert.equal(bootTimeMs({ exec: () => 'garbage' }), null);
+  if (process.platform === 'darwin') {
+    const real = bootTimeMs();
+    assert.ok(real > 0 && real < Date.now());
+  }
 });

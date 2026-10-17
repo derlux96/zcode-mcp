@@ -104,8 +104,15 @@ All writes are atomic (temp file + rename), so several MCP servers can share one
 runner vanished without a terminal state is recorded as `lost` (warning `runner_lost`,
 `error_kind: crash`) after its verified leftover ZCode processes are killed and its lock is
 freed; finished job directories older than 7 days or beyond the newest 50 are deleted. It never
-touches running jobs, worktrees, or anything outside `jobs/`. Processes are only signalled after
-an identity check (pid + start time + token), never by name.
+touches running jobs, worktrees, or anything outside `jobs/`. Processes are never signalled by
+name. The job runner is signalled only when its pid, start time and job token match. ZCode's
+process group is signalled only when ZCode's pid and start time match, or, once ZCode itself is
+gone, while its group still has live members, the runner has not recorded the child's exit
+(`childExitedAt`) and the job was created after the last system boot. Start times are compared
+in UTC (status files of jobs from earlier builds used local time and simply read as "not
+matching"). When ZCode exits normally, background processes it left in its group (for example a
+dev server started with `&`) are stopped (SIGTERM, SIGKILL after 2 s) and the result carries the
+warning `leftover_processes_killed`.
 
 ## Local testing
 

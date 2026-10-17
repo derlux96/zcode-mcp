@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
-import { signalGroup } from './procid.mjs';
+import { signalGroup, groupHasMembers } from './procid.mjs';
 
 export const OUTPUT_CAP = 100000;
 // timeout_ms is the absolute cap for a whole task; idle_timeout_ms aborts only
@@ -13,6 +13,7 @@ export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 21600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
+export const LEFTOVER_GRACE_MS = 2000;
 
 const SESSION_RE = /sess_[A-Za-z0-9._-]+/;
 const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
@@ -118,9 +119,13 @@ export function buildSpawnEnv(binPath) {
 // (if it throws, the child is killed and the call rejects); `onStdout(chunk)`
 // sees every stdout chunk uncapped. `killGroup` runs the child in its own
 // process group (pgid = child.pid) and makes every stop signal the whole group,
-// so grandchildren die with it.
+// so grandchildren die with it. With killGroup, members of that group still
+// alive when ZCode itself exits (background processes such as `npm run dev &`)
+// get SIGTERM, then SIGKILL after `leftoverGraceMs`; the result then carries
+// leftoverKilled: true. The group id cannot be reused while it has members.
 export async function runZCodeArgs(binPath, cliArgs, {
   cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn, onStdout, killGroup = false,
+  leftoverGraceMs = LEFTOVER_GRACE_MS,
 }) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
@@ -197,30 +202,53 @@ export async function runZCodeArgs(binPath, cliArgs, {
     child.on('error', (err) => {
       cleanup();
       stderr += `\n[zcode-delegate] failed to spawn: ${err.message}`;
-      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, timeoutKind, sessionId: null });
+      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, timeoutKind, sessionId: null, leftoverKilled: false });
     });
-    child.on('close', (code) => {
+    // On 'exit' (not 'close'): a leftover that inherited stdout/stderr keeps the
+    // pipes open, so 'close' would only come once the sweep has ended it.
+    let exitCode = null;
+    let sweep = Promise.resolve(false);
+    child.on('exit', (code) => {
+      exitCode = code;
+      if (killGroup) sweep = sweepGroup(child.pid, leftoverGraceMs);
+    });
+    child.on('close', async (code) => {
+      const leftoverKilled = await sweep;
       cleanup();
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
-        code,
+        code: code ?? exitCode,
         timedOut,
         timeoutKind,
         sessionId: extractSessionId(stdout),
+        leftoverKilled,
       });
     });
   });
 }
 
+// Ends what is left of the group `pgid` after its leader exited: SIGTERM, then
+// SIGKILL after graceMs. -> true when members were found.
+async function sweepGroup(pgid, graceMs) {
+  if (!Number.isInteger(pgid) || pgid <= 1 || !groupHasMembers(pgid)) return false;
+  try { signalGroup(pgid, 'SIGTERM'); } catch { /* EPERM: try SIGKILL below */ }
+  const end = Date.now() + graceMs;
+  while (groupHasMembers(pgid) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  if (groupHasMembers(pgid)) {
+    try { signalGroup(pgid, 'SIGKILL'); } catch { /* nothing more to do */ }
+  }
+  return true;
+}
+
 export async function runZCodeTask({
   binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs,
-  signal, onSpawn, onStdout, killGroup,
+  signal, onSpawn, onStdout, killGroup, leftoverGraceMs,
 }) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup, leftoverGraceMs });
 }
 
 export function newRunId() {

@@ -160,6 +160,7 @@ function childRecorder(setStatus, warn) {
         childPid: child.pid,
         childPgid: child.pid,
         childStart: id && !id.unknown ? id.start : null,
+        childExitedAt: null,
         heartbeatAt: t,
         lastActivityAt: t,
       });
@@ -167,6 +168,13 @@ function childRecorder(setStatus, warn) {
       warn('status_write_failed');
     }
   };
+}
+
+// The child (and, with I3's sweep, its whole group) has ended: record it so the
+// manager/reaper never trusts its now stale pgid again.
+function childExited(setStatus) {
+  activeChildPgid = null;
+  try { setStatus({ childExitedAt: now(), childPgid: null }); } catch { /* best effort */ }
 }
 
 // CLI path. `idle`: pass idle_timeout_ms on (false for the protocol fallback:
@@ -195,7 +203,8 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
       }
     },
   });
-  activeChildPgid = null;
+  childExited(setStatus);
+  if (res.leftoverKilled) warn('leftover_processes_killed');
   const { state, errorKind, errorMessage } = outcome(res, params);
   return {
     state, errorKind, errorMessage,
@@ -280,7 +289,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
       // A failed start (spawn, settle, session/create) is retried once; after
       // session/send the task may be running and is never repeated.
       if (!err || !err.startup || signal.aborted) throw err;
-      activeChildPgid = null;
+      childExited(setStatus);
       res = await call();
     }
   } catch (err) {
@@ -288,7 +297,8 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   } finally {
     clearTimeout(flushTimer);
     flushTimer = null;
-    activeChildPgid = null;
+    // runTaskWithModel closed the client: the app-server and its group are gone.
+    childExited(setStatus);
   }
   if (error && error.code === 'no-model') return null;
 
