@@ -1,7 +1,7 @@
 import { test, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
@@ -138,7 +138,7 @@ test('validation messages', async () => {
   const cases = [
     [{ cwd }, /^Invalid arguments: prompt must be a non-empty string/],
     [{ prompt: 'x', cwd: 'rel' }, /cwd must be an absolute path/],
-    [{ prompt: 'x', cwd, timeout_ms: 21600001 }, /timeout_ms must be an integer between 1000 and 21600000/],
+    [{ prompt: 'x', cwd, timeout_ms: 21600001 }, /timeout_ms must be 0 \(no cap\) or an integer between 1000 and 21600000/],
     [{ prompt: 'x', cwd, mode: 'yolo', resume: 'run_abc' }, /server-generated run-id and is not resumable/],
     [{ prompt: 'x', cwd, model: '' }, /model must be a non-empty string/],
     [{ prompt: 'x', cwd, model: 'small', resume: 'sess_1' }, /resume is not supported together with model/],
@@ -393,6 +393,23 @@ test('unwritable home returns ok false before spawning', { skip: process.getuid?
   assert.equal(existsSync(join(home, 'state')), false);
   assert.equal(existsSync(join(cwd, '.zcode-worktrees')), false);
   assert.equal(run(cwd, 'git', ['branch', '--list']), branches);
+});
+
+test('an EXISTING read-only state home: startJob fails before spawning anything (real faults-run regression)', { skip: process.getuid?.() === 0 && 'root ignores directory permissions' }, async () => {
+  const home = makeTempDir('zcode-ro-home-');
+  temps.push(home);
+  chmodSync(home, 0o500);
+  process.env.ZCODE_MCP_HOME = home;
+  const cwd = gitCwd();
+  try {
+    const r = await startJob({ prompt: 'x', cwd, mode: 'yolo' });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /not writable/);
+    assert.equal((statSync(home).mode & 0o777).toString(8), '500', 'permission left alone');
+  } finally {
+    chmodSync(home, 0o700);
+  }
+  assert.deepEqual(readdirSync(home), [], 'no jobs/locks directories were created');
 });
 
 test('unknown model creates no worktree and no job', async () => {
