@@ -32,6 +32,9 @@
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //
+// FAKE_APPSERVER_CREATE_DELAY_MS: delays every session/create response
+// (slow model catalog lookups).
+//
 // FAKE_APPSERVER_LOG: path; every received message is appended as one JSON
 // line (lets tests assert exact wire params the client sent).
 //
@@ -145,7 +148,9 @@ function answerArrived(msg) {
   if (pendingCreate) {
     const req = pendingCreate;
     pendingCreate = null;
-    sendCreateResponse(req);
+    const delay = Number(process.env.FAKE_APPSERVER_CREATE_DELAY_MS) || 0;
+    if (delay > 0) setTimeout(() => sendCreateResponse(req), delay);
+    else sendCreateResponse(req);
   }
   return true;
 }

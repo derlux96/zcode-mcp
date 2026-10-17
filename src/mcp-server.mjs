@@ -19,7 +19,9 @@ const failText = (s) => ({ isError: true, content: [{ type: 'text', text: s }] }
 // Budget for the throwaway catalog session (create only, no turn) in the
 // zcode_check models section.
 const MODEL_CATALOG_TIMEOUT_MS = 15000;
-const DEFAULT_WAIT_MS = 60000;
+// Below the 60 s default request timeout of common MCP clients (TypeScript SDK):
+// a client that times out drops the reply carrying the only job_id.
+const DEFAULT_WAIT_MS = 30000;
 const MAX_WAIT_MS = 300000;
 const MAX_STATUS_WAIT_MS = 120000;
 const REAP_THROTTLE_MS = 30000;
@@ -66,7 +68,7 @@ const toolSchemas = {
           type: 'integer',
           description: `Protocol path only (no mode/resume/target): abort after this many milliseconds without protocol progress (${DEFAULT_IDLE_TIMEOUT_MS} default = 10 min, max ${MAX_TIMEOUT_MS}). Long but active tasks keep running. On the CLI path use timeout_ms. On timeout the result lists the files changed so far.`,
         },
-        wait_ms: { type: 'integer', description: `How long this call waits for the job in milliseconds. 0 returns the job_id immediately; default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}.` },
+        wait_ms: { type: 'integer', description: `How long this call may take in milliseconds, counted from the request (job start-up included). 0 returns the job_id as soon as the job is started; default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}. Keep it below your client's request timeout. After a timed-out or cancelled call, zcode_status without job_id lists the job.` },
         isolate_worktree: { type: 'boolean', description: 'Run the task in an isolated git worktree on a new zcode/<slug> branch. The worktree is kept; you must merge or remove it explicitly.' },
         model: {
           type: 'string',
@@ -430,6 +432,7 @@ function renderJob(view) {
 
 function buildRunHandler() {
   return async (args = {}, ctx = {}) => {
+    const received = Date.now();
     const waitMs = args.wait_ms === undefined ? DEFAULT_WAIT_MS : args.wait_ms;
     if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_WAIT_MS) {
       return failText(`Invalid arguments: wait_ms must be an integer between 0 and ${MAX_WAIT_MS}`);
@@ -438,8 +441,11 @@ function buildRunHandler() {
     if (!started.ok) {
       return failText(started.blockingJobId ? `${started.error}\nblocking_job_id: ${started.blockingJobId}` : started.error);
     }
-    // Aborting ctx.signal (notifications/cancelled) ends only the wait.
-    const view = await waitJob(started.jobId, { waitMs, signal: ctx.signal, until: 'terminal' });
+    // The deadline counts from the request: start-up (catalog, worktree, baseline)
+    // is part of the caller's wait. Aborting ctx.signal (notifications/cancelled)
+    // ends only the wait.
+    const left = Math.max(0, waitMs - (Date.now() - received));
+    const view = await waitJob(started.jobId, { waitMs: left, signal: ctx.signal, until: 'terminal' });
     if (!view) return failText(`job ${started.jobId} disappeared from the job store`);
     return renderJob(view);
   };

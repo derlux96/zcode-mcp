@@ -22,8 +22,8 @@ as background jobs, through its app-server protocol or its official headless CLI
 | Tool | Purpose |
 |---|---|
 | `zcode_check` | Binary path, version (warning for versions outside the verified list), `zcode doctor`, job directory (`jobs.dir`, `writable`, `running`, `total`), reaper statistics; `include_models: true` adds the model catalog. |
-| `zcode_run` | Starts one task as a background **job** and waits up to `wait_ms` (default 60000, max 300000, `0` = return the `job_id` at once). Finished in time: the full result text with `job_id`; otherwise `status: running` + `job_id` (not an error). |
-| `zcode_status` | With `job_id` (+ optional `wait_ms`, max 120000, waits for a change): state, elapsed time, last activity, warnings, files changed so far, progress lines; a finished job shows its full result. Without `job_id`: all jobs (newest first) and the open worktrees. |
+| `zcode_run` | Starts one task as a background **job** and answers within `wait_ms` of the request (default 30000, max 300000, `0` = return the `job_id` as soon as the job is started; job start-up counts towards it). Finished in time: the full result text with `job_id`; otherwise `status: running` + `job_id` (not an error). |
+| `zcode_status` | With `job_id` (+ optional `wait_ms`, max 120000, waits for a change of state; heartbeats and progress do not end the wait): state, elapsed time, last activity, warnings, files changed so far, progress lines; a finished job shows its full result. Without `job_id`: all jobs (newest first) and the open worktrees. |
 | `zcode_result` | The result of a job, repeatable; for a running job its current status. |
 | `zcode_cancel` | Stops a running job (ZCode and its children, SIGTERM then SIGKILL) and returns its final state with the changes so far (not rolled back). A finished job is returned unchanged with `already finished`. |
 | `zcode_sessions` | ZCode sessions that ran through this server (`sess_…` ids are resumable). |
@@ -56,7 +56,7 @@ create no job.
 
 | Limit | Default | Applies to |
 |---|---|---|
-| `wait_ms` | 60 s (max 300 s) | how long `zcode_run` waits for the job; not a job limit |
+| `wait_ms` | 30 s (max 300 s) | how long a `zcode_run` call may take, counted from the request (start-up included); not a job limit. Keep it below your MCP client's request timeout (60 s in many clients) |
 | `timeout_ms` | 6 h (also the max) | CLI path: hard total cap of the job. Protocol path: bounds the wait for the turn to finish; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few minutes of overrun are possible |
 | `idle_timeout_ms` | 10 min | protocol path only: no protocol event for that long aborts the job |
 
@@ -193,6 +193,10 @@ stored AES-256-GCM-encrypted in `credentials.json` and in cleartext (mode 0600) 
 
 ## Troubleshooting jobs
 
+- **A `zcode_run` call timed out or was cancelled before it answered**: the job usually runs on
+  (and holds its directory lock). Run `zcode_status` without `job_id` to find it (newest first,
+  with cwd and prompt preview), then follow, fetch or cancel it by its `job_id`. Keep `wait_ms`
+  below your client's request timeout to avoid this.
 - **`status: lost`** (warning `runner_lost`): the detached job runner died without recording a
   result (machine sleep/reboot, the runner was killed). The reaper killed verified leftovers and
   freed the directory lock; the result still lists the changes made so far and `output_log:`.

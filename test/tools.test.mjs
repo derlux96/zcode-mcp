@@ -99,6 +99,7 @@ test('exposes exactly the six spec tools with object schemas', async () => {
   assert.deepEqual(zrun.inputSchema.required, ['prompt', 'cwd']);
   assert.equal(zrun.inputSchema.additionalProperties, false);
   assert.equal(zrun.inputSchema.properties.wait_ms.type, 'integer');
+  assert.match(zrun.inputSchema.properties.wait_ms.description, /default 30000, max 300000/); // I5
   assert.match(zrun.inputSchema.properties.timeout_ms.description, /21600000/);
   assert.match(zrun.description, /status: running/);
   assert.match(zrun.description, /zcode_status/);
@@ -294,6 +295,21 @@ test('a job whose runner dies renders as status lost', async () => {
 });
 
 // --- zcode_run: argument validation ---
+
+test('the wait_ms deadline counts from the request, including the time startJob took (I5)', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  process.env.FAKE_APPSERVER_CREATE_DELAY_MS = '2000'; // the bare model id needs a catalog lookup
+  try {
+    const t0 = Date.now();
+    const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), model: 'small', wait_ms: 2000 });
+    const took = Date.now() - t0;
+    assert.match(textOf(reply), /^status: running$/m);
+    assert.ok(took >= 2000, `the catalog lookup was slow (${took} ms)`);
+    assert.ok(took < 3500, `no full wait_ms on top of startJob (${took} ms)`);
+  } finally {
+    delete process.env.FAKE_APPSERVER_CREATE_DELAY_MS;
+  }
+});
 
 test('wait_ms out of range is rejected', async () => {
   const cwd = tempCwd();
@@ -631,7 +647,8 @@ test('zcode_status with wait_ms returns on a state change and respects the max',
   const t0 = Date.now();
   let text = textOf(await call('zcode_status', { job_id: id, wait_ms: 120000 }));
   assert.ok(Date.now() - t0 < 20000, 'returned on a change, not after wait_ms');
-  for (let i = 0; i < 20 && !/^status: completed/m.test(text); i++) {
+  // Only state changes end the wait (I1): starting -> running -> completed is at most two more calls.
+  for (let i = 0; i < 2 && !/^status: completed/m.test(text); i++) {
     text = textOf(await call('zcode_status', { job_id: id, wait_ms: 120000 }));
   }
   assert.match(text, /^status: completed \(exit 0\)$/m);
@@ -640,6 +657,32 @@ test('zcode_status with wait_ms returns on a state change and respects the max',
     const reply = await call('zcode_status', { job_id: id, wait_ms });
     assert.equal(reply.result.isError, true);
     assert.equal(textOf(reply), 'Invalid arguments: wait_ms must be an integer between 0 and 120000');
+  }
+});
+
+test('zcode_status wait_ms is not ended by heartbeat or activity writes (I1)', async () => {
+  const saved = { hb: process.env.ZCODE_MCP_HEARTBEAT_MS, env: process.env.NODE_ENV };
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  process.env.ZCODE_MCP_HEARTBEAT_MS = '100'; // status.json updatedAt changes ~10x per second
+  process.env.NODE_ENV = 'test';
+  try {
+    const id = jobIdOf(textOf(await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', wait_ms: 0 })));
+    await waitFor(() => readStatus(getJob(id).dir)?.state === 'running');
+    const t0 = Date.now();
+    const text = textOf(await call('zcode_status', { job_id: id, wait_ms: 1500 }));
+    const waited = Date.now() - t0;
+    assert.ok(waited >= 1450, `waited the full wait_ms, not until the next heartbeat (${waited} ms)`);
+    assert.match(text, /^status: running$/m);
+    // A real state change ends the wait at once.
+    setTimeout(() => writeFileSync(join(getJob(id).dir, 'cancel'), ''), 300);
+    const t1 = Date.now();
+    const after = textOf(await call('zcode_status', { job_id: id, wait_ms: 60000 }));
+    assert.ok(Date.now() - t1 < 10000, 'returned on the state change');
+    assert.match(after, /^status: cancelled/m);
+  } finally {
+    for (const [k, v] of [['ZCODE_MCP_HEARTBEAT_MS', saved.hb], ['NODE_ENV', saved.env]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
   }
 });
 

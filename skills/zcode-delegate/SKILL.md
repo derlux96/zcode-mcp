@@ -21,21 +21,26 @@ Also read its other fields:
 
 ## 2. Jobs: the workflow
 
-Every `zcode_run` starts a background **job** (`job_…` id) and then waits up to `wait_ms`
-(default 60000, max 300000; `0` returns at once):
+Every `zcode_run` starts a background **job** (`job_…` id) and answers within `wait_ms` of the
+request (default 30000, max 300000; `0` returns as soon as the job is started). Keep `wait_ms`
+below your client's request timeout (60 s in many MCP clients):
 
 1. Finished within `wait_ms` → the full result text (`status: completed|failed|timeout|cancelled`,
    `job_id`, `session_id`, …).
 2. Still working → `status: running` with `job_id`, elapsed time and progress. This is **not an
    error**. Then:
-   - `zcode_status {job_id, wait_ms}` — waits up to `wait_ms` (max 120000) for a change and shows
-     state, last activity, warnings, the files changed so far and progress lines. Never busy-loop:
-     always pass a `wait_ms` (e.g. 60000) instead of calling it back to back.
+   - `zcode_status {job_id, wait_ms}` — waits up to `wait_ms` (max 120000) for a state change
+     (heartbeats and progress do not end the wait) and shows state, last activity, warnings, the
+     files changed so far and progress lines. Never busy-loop: always pass a `wait_ms` (e.g.
+     30000, below your client's request timeout) instead of calling it back to back.
    - `zcode_result {job_id}` — the final text once the job is finished (repeatable).
    - `zcode_cancel {job_id}` — stops ZCode and its children; changes made so far stay on disk.
    - `zcode_status` without `job_id` lists all jobs and the open worktrees.
 3. Cancelling your own tool call only ends the wait; the job keeps running. Jobs also survive a
    restart of the MCP server — fetch them again by `job_id`.
+4. Recover a lost `job_id`: if a `zcode_run` call timed out or was cancelled before you saw its
+   answer, the job may still be running (and holding its directory). Call `zcode_status` without
+   `job_id`: it lists every job (newest first) with state, cwd and prompt preview.
 
 ## 3. Paths: protocol (default) vs CLI
 

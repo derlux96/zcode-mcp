@@ -18,8 +18,9 @@ Workflow:
    outside the cwd).
 3. If the answer is `status: running`, note its `job_id` (`job_…`; these are job ids, not the
    old `run_…` ids, and they are never resumable). Follow it with
-   `zcode_status {job_id, wait_ms: 60000}` (or up to 120000) — never call it in a tight loop
-   without `wait_ms`. When the state is terminal, fetch the text with `zcode_result {job_id}`.
+   `zcode_status {job_id, wait_ms: 30000}` (up to 120000 if your client allows calls that long)
+   — never call it in a tight loop without `wait_ms`. If a `zcode_run` call timed out or was
+   cancelled before it answered, find the job with `zcode_status` (no `job_id`). When the state is terminal, fetch the text with `zcode_result {job_id}`.
    Stop a job that is clearly going wrong with `zcode_cancel {job_id}`.
 4. Verify: read the `status:` line, `error_kind:`, `warnings:` (`no_changes` = ZCode did
    nothing), the changed files / diff stat, and check the files and tests yourself. Treat
