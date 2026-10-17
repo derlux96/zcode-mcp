@@ -22,7 +22,7 @@ function lockPath(cwd) {
 }
 
 const suffix = () => `${process.pid}.${randomBytes(4).toString('hex')}`;
-const CLAIM_STALE_MS = 30_000;
+const CLAIM_MAX_AGE_MS = 120_000; // fallback for pid reuse; see isClaimAbandoned
 
 function tryUnlink(path) {
   try { unlinkSync(path); } catch {}
@@ -70,28 +70,72 @@ function readLock(path) {
 
 const isStale = (held, isAlive) => (held.corrupt ? held.ageMs > CORRUPT_GRACE_MS : !isAlive(held.jobId));
 
-// Takeover of a stale lock is serialised by a claim file. Returns 'busy' when another process
-// holds the claim, else the result of fn() (claim always removed afterwards).
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // exists, owned by someone else; ESRCH means gone
+  }
+}
+
+function readClaim(path) {
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    if (data && typeof data === 'object') return data;
+  } catch {}
+  return null;
+}
+
+// A claim is abandoned if its holder process is gone, or (pid reuse fallback) it is older than 120 s.
+export function isClaimAbandoned(data, alive = pidAlive, now = Date.now()) {
+  if (!alive(data.pid)) return true;
+  return now - Date.parse(data.createdAt) > CLAIM_MAX_AGE_MS;
+}
+
+// Removes the claim at `claim` only if it still is the one judged abandoned (same nonce).
+// Renames it away first (one remover wins), then verifies the nonce of what was moved. If it
+// differs, a live claim was moved: do NOT restore it (its holder notices the missing/foreign
+// claim via its own nonce check and backs off); the caller just re-evaluates from the top.
+export function stealClaim(claim, judged) {
+  const dead = `${claim}.dead.${suffix()}`;
+  try { renameSync(claim, dead); } catch { return 'busy'; }
+  const moved = readClaim(dead);
+  tryUnlink(dead);
+  return moved && moved.nonce === judged.nonce ? 'stolen' : 'busy';
+}
+
+// Takeover of a stale lock is serialised by a claim file `<lock>.claim` holding a random nonce.
+// Returns 'busy' when another process holds the claim, else the result of fn(owns) where
+// owns() re-verifies that the claim still carries our nonce (call it before unlinking the lock).
+// Residual, accepted: a holder that stays alive but stalls for more than 120 s inside this
+// microsecond-wide critical section could have its claim stolen; this needs a pid-alive stall
+// (e.g. suspended process) at exactly the wrong moment, and the nonce checks limit the damage.
 function withClaim(path, fn) {
   const claim = `${path}.claim`;
-  if (!createExclusive(claim, { pid: process.pid, createdAt: new Date().toISOString() })) {
+  const nonce = randomBytes(8).toString('hex');
+  if (!createExclusive(claim, { pid: process.pid, createdAt: new Date().toISOString(), nonce })) {
+    const data = readClaim(claim);
     let abandoned = false;
-    try {
-      const data = JSON.parse(readFileSync(claim, 'utf8'));
-      abandoned = Date.now() - Date.parse(data.createdAt) > CLAIM_STALE_MS;
-    } catch {
-      try { abandoned = Date.now() - statSync(claim).mtimeMs > CLAIM_STALE_MS; } catch {}
+    let judged = { nonce: undefined };
+    if (data) {
+      judged = data;
+      abandoned = isClaimAbandoned(data);
+    } else {
+      try { abandoned = Date.now() - statSync(claim).mtimeMs > CLAIM_MAX_AGE_MS; } catch {}
     }
-    if (abandoned) {
-      const dead = `${claim}.dead.${suffix()}`;
-      try { renameSync(claim, dead); tryUnlink(dead); } catch {}
-    }
+    if (abandoned) stealClaim(claim, judged);
     return 'busy';
   }
+  const owns = () => {
+    const cur = readClaim(claim);
+    return !!cur && cur.nonce === nonce;
+  };
   try {
-    return fn();
+    return fn(owns);
   } finally {
-    tryUnlink(claim);
+    if (owns()) tryUnlink(claim);
   }
 }
 
@@ -103,11 +147,12 @@ export function acquireCwdLock(cwd, jobId, isAlive) {
     const held = readLock(path);
     if (held === null) continue; // vanished meanwhile: try again
     if (!isStale(held, isAlive)) return { ok: false, blockingJobId: held.corrupt ? 'unknown' : held.jobId };
-    const result = withClaim(path, () => {
+    const result = withClaim(path, (owns) => {
       // Re-check under the claim; only claim holders and the owner ever unlink the lock.
       const cur = readLock(path);
       if (cur !== null) {
         if (!isStale(cur, isAlive)) return { ok: false, blockingJobId: cur.corrupt ? 'unknown' : cur.jobId };
+        if (!owns()) return { ok: false, blockingJobId: 'unknown' };
         tryUnlink(path);
       }
       if (createExclusive(path, lockContent(jobId))) return { ok: true };
@@ -128,9 +173,10 @@ export function removeStaleLock(cwd, isAlive) {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const held = readLock(path);
     if (held === null || !isStale(held, isAlive)) return false;
-    const result = withClaim(path, () => {
+    const result = withClaim(path, (owns) => {
       const cur = readLock(path);
       if (cur === null || !isStale(cur, isAlive)) return false;
+      if (!owns()) return false;
       tryUnlink(path);
       return true;
     });
@@ -140,6 +186,8 @@ export function removeStaleLock(cwd, isAlive) {
   return false;
 }
 
+// Callers must release the lock BEFORE marking the job dead/terminal: isAlive(jobId) has to stay
+// true until this returns, otherwise a claim holder may treat the lock as stale while we release.
 export function releaseCwdLock(cwd, jobId) {
   const path = lockPath(cwd);
   const held = readLock(path);

@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readdirSync, readFileSync, writeFileSync, utimesSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readdirSync, readFileSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { acquireCwdLock, releaseCwdLock, removeStaleLock, lockKey } from '../src/locks.mjs';
+import { acquireCwdLock, releaseCwdLock, removeStaleLock, lockKey, isClaimAbandoned, stealClaim } from '../src/locks.mjs';
 import { stateHome } from '../src/jobstore.mjs';
 
 const LOCKS_MODULE = new URL('../src/locks.mjs', import.meta.url).href;
@@ -136,12 +136,12 @@ test('race on a stale lock, 20 rounds: exactly one winner each time, nothing lef
   assert.deepEqual(readdirSync(locksDir()), []);
 }));
 
-test('abandoned claim (older than 30 s) does not block takeover', withEnv(async (root) => {
+test('abandoned claim (older than 120 s) does not block takeover', withEnv(async (root) => {
   const dir = join(root, 'proj');
   mkdirSync(dir);
   acquireCwdLock(dir, 'job_dead', always);
   const claim = join(locksDir(), `${lockKey(dir)}.lock.claim`);
-  writeFileSync(claim, JSON.stringify({ pid: 1, createdAt: new Date(Date.now() - 60_000).toISOString() }));
+  writeFileSync(claim, JSON.stringify({ pid: process.pid, createdAt: new Date(Date.now() - 130_000).toISOString(), nonce: 'old' }));
   assert.deepEqual(acquireCwdLock(dir, 'job_new', (id) => id !== 'job_dead'), { ok: true });
   assert.deepEqual(readdirSync(locksDir()), [`${lockKey(dir)}.lock`]);
 }));
@@ -165,4 +165,48 @@ test('takeover and removal leave no temp or claim files behind', withEnv((root) 
   acquireCwdLock(dir, 'job_new', never);
   removeStaleLock(dir, never);
   assert.deepEqual(readdirSync(locksDir()), []);
+}));
+
+test('isClaimAbandoned: dead pid, alive+fresh, alive+130 s old, EPERM-like alive', () => {
+  const fresh = new Date().toISOString();
+  const old = new Date(Date.now() - 130_000).toISOString();
+  assert.equal(isClaimAbandoned({ pid: 1, createdAt: fresh }, () => false), true);
+  assert.equal(isClaimAbandoned({ pid: 1, createdAt: fresh }, () => true), false);
+  assert.equal(isClaimAbandoned({ pid: 1, createdAt: old }, () => true), true);
+  assert.equal(isClaimAbandoned({ pid: 1, createdAt: new Date(Date.now() - 60_000).toISOString() }, () => true), false);
+  // real liveness check: this very process is alive, so a fresh claim of ours is not abandoned
+  assert.equal(isClaimAbandoned({ pid: process.pid, createdAt: fresh }), false);
+});
+
+test('stealClaim backs off when the claim was replaced after it was judged abandoned', withEnv(() => {
+  mkdirSync(locksDir(), { recursive: true });
+  const claim = join(locksDir(), 'x.lock.claim');
+  writeFileSync(claim, JSON.stringify({ pid: 1, createdAt: new Date().toISOString(), nonce: 'fresh' }));
+  assert.equal(stealClaim(claim, { nonce: 'old' }), 'busy'); // moved someone else's live claim
+  writeFileSync(claim, JSON.stringify({ pid: 1, createdAt: new Date().toISOString(), nonce: 'old' }));
+  assert.equal(stealClaim(claim, { nonce: 'old' }), 'stolen');
+  assert.equal(stealClaim(claim, { nonce: 'old' }), 'busy'); // already gone
+  assert.deepEqual(readdirSync(locksDir()), []);
+}));
+
+test('a claim holder whose claim was replaced does not remove the lock', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  const lock = join(locksDir(), `${lockKey(dir)}.lock`);
+  const claim = `${lock}.claim`;
+  // isAlive runs while the claim is held: swap in a foreign claim at that moment.
+  let swapped = false;
+  const isAlive = (id) => {
+    if (id === 'job_dead' && existsSync(claim) && !swapped) {
+      swapped = true;
+      writeFileSync(claim, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), nonce: 'other' }));
+    }
+    return id !== 'job_dead';
+  };
+  assert.deepEqual(acquireCwdLock(dir, 'job_new', isAlive), { ok: false, blockingJobId: 'unknown' });
+  assert.equal(JSON.parse(readFileSync(lock, 'utf8')).jobId, 'job_dead');
+  assert.equal(JSON.parse(readFileSync(claim, 'utf8')).nonce, 'other'); // foreign claim left alone
+  rmSync(claim);
+  assert.equal(removeStaleLock(dir, never), true);
 }));
