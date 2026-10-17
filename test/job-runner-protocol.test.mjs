@@ -127,9 +127,14 @@ test('idle timeout ends a silent protocol job with state timeout and timeoutKind
   assert.equal(res.state, 'timeout');
   assert.equal(res.timeoutKind, 'idle');
   assert.equal(res.errorKind, 'timeout_idle');
-  assert.equal(res.sessionId, null);
+  // M6: the session existed (session/create succeeded): its real id is kept and resumable.
+  assert.equal(res.sessionId, 'sess_fakeB1');
   assert.equal(readStatus(dir).state, 'timeout');
   assert.equal(alive(readStatus(dir).childPid), false);
+  const entry = new SessionStore(process.env.ZCODE_MCP_STATE).list().at(-1);
+  assert.equal(entry.id, 'sess_fakeB1');
+  assert.equal(entry.kind, 'session');
+  assert.equal(entry.status, 'timeout');
 });
 
 test('a chatty job survives an idle limit shorter than its runtime', async () => {
@@ -151,6 +156,32 @@ test('total timeout_ms ends the job with timeoutKind total', async () => {
   assert.equal(res.state, 'timeout');
   assert.equal(res.timeoutKind, 'total');
   assert.equal(res.errorKind, 'timeout_total');
+});
+
+test('an unanswered session/send is a failed request, not the total timeout (I2)', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'nosendack';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  await runJob(dir, { requestTimeoutMs: 300 });
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'unknown');
+  assert.equal(res.errorMessage, 'session/send timed out after 300 ms without a response');
+  assert.equal(res.timeoutKind, null);
+  assert.equal(res.sessionId, 'sess_fakeB1');
+  assert.equal(readStatus(dir).state, 'failed');
+});
+
+test('a cancelled protocol job keeps the real session id (M6)', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+  await new Promise((r) => setTimeout(r, 500)); // past session/create
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.sessionId, 'sess_fakeB1');
 });
 
 test('rate-limit ends failed with errorKind quota', async () => {
@@ -314,6 +345,28 @@ test('runTaskWithModel: aborting the signal rejects with code aborted and kills 
   setTimeout(() => ctl.abort(), 400);
   await assert.rejects(p, (err) => err instanceof AppServerError && err.code === 'aborted');
   await waitFor(() => !alive(pid), 2000);
+});
+
+test('runTaskWithModel: error codes name the case, never the message (I2)', async () => {
+  const cases = [
+    ['nosendack', { requestTimeoutMs: 300 }, 'request_timeout', /session\/send timed out after 300 ms/],
+    ['slowhang', { idleTimeoutMs: 300 }, 'idle', /no activity for 300 ms/],
+    ['slowhang', { timeoutMs: 400 }, 'turn_timeout', /timed out after 400 ms/],
+  ];
+  for (const [mode, opts, code, message] of cases) {
+    process.env.FAKE_APPSERVER_MODE = mode;
+    await assert.rejects(
+      runTaskWithModel({ binPath: fakeAppServer, cwd: tempCwd(), prompt: 'x', timeoutMs: 10000, ...opts }),
+      (err) => {
+        assert.ok(err instanceof AppServerError);
+        assert.equal(err.code, code, mode);
+        assert.match(err.message, message);
+        assert.equal(err.startup, undefined, 'after session/send: not a startup error');
+        assert.equal(err.sessionId, 'sess_fakeB1'); // M6
+        return true;
+      },
+    );
+  }
 });
 
 test('runTaskWithModel: only one of providerId/modelId is a TypeError', async () => {

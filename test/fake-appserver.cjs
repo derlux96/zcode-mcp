@@ -27,6 +27,8 @@
 //             (toolName T0..T5, kind 'scheduled') before the ok turn
 //   no-model  like ok, but session/create carries no current model and an
 //             empty catalog (runner falls back to the CLI path)
+//   nosendack answers create + subscribe, but never answers session/send
+//             (request-timeout path after the session exists)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //
@@ -210,6 +212,7 @@ const FLOOD_EVENTS = 2005;
 
 function handleSend(req) {
   if (!created) return notActive(req);
+  if (MODE === 'nosendack') return;
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: 1 } });
   if (MODE === 'slowhang') return;

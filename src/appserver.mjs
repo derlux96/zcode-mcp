@@ -29,6 +29,15 @@ const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
 const EVENT_BUFFER_CAP = 2000;
 const CLOSE_KILL_GRACE_MS = 3000;
 
+// AppServerError.code names the case; callers branch on it, never on the message:
+//   'request_timeout'  a request got no response in time
+//   'idle'             no protocol activity while waiting for the turn
+//   'turn_timeout'     the absolute cap while waiting for the turn
+//   'aborted'          the caller's signal aborted the task
+//   'no-model'         no model to select (runTaskWithModel)
+//   'child_exited'     the app-server child exited or failed to start
+//   'closed'           the client was closed
+//   number             a JSON-RPC error response (its error.code)
 export class AppServerError extends Error {
   constructor(message, { code = null, data = null } = {}) {
     super(message);
@@ -215,7 +224,7 @@ export class AppServerClient {
   _onChildGone(message) {
     if (this._exited) return;
     this._exited = true;
-    this._failAll(new AppServerError(message));
+    this._failAll(new AppServerError(message, { code: 'child_exited' }));
     this._resolveExit();
   }
 
@@ -291,17 +300,17 @@ export class AppServerClient {
 
   request(method, params, { timeoutMs } = {}) {
     if (this._closed) {
-      return Promise.reject(new AppServerError(`client is closed; cannot send ${method}`));
+      return Promise.reject(new AppServerError(`client is closed; cannot send ${method}`, { code: 'closed' }));
     }
     if (this._exited) {
-      return Promise.reject(new AppServerError(`app-server child is not running; cannot send ${method}`));
+      return Promise.reject(new AppServerError(`app-server child is not running; cannot send ${method}`, { code: 'child_exited' }));
     }
     const id = this._nextId++;
     const effectiveTimeout = timeoutMs ?? this.timeoutMs;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(id);
-        reject(new AppServerError(`${method} timed out after ${effectiveTimeout} ms without a response`));
+        reject(new AppServerError(`${method} timed out after ${effectiveTimeout} ms without a response`, { code: 'request_timeout' }));
       }, effectiveTimeout);
       this._pending.set(id, { resolve, reject, timer, method });
       this._send({ id, method, params: params ?? {} });
@@ -320,7 +329,9 @@ export class AppServerClient {
     if (buffered) return Promise.resolve(buffered);
     if (this._exited || this._closed) {
       return Promise.reject(
-        new AppServerError(`app-server is gone; cannot wait for session/event ${wanted.join('|')}`),
+        new AppServerError(`app-server is gone; cannot wait for session/event ${wanted.join('|')}`, {
+          code: this._exited ? 'child_exited' : 'closed',
+        }),
       );
     }
     return new Promise((resolve, reject) => {
@@ -333,7 +344,7 @@ export class AppServerClient {
       waiter.reject = give(reject);
       // Absolute cap for the whole wait.
       waiter.timer = setTimeout(() => {
-        waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`));
+        waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`, { code: 'turn_timeout' }));
       }, timeoutMs);
       if (waiter.idleMs) this._armIdle(waiter);
       this._eventWaiters.push(waiter);
@@ -344,7 +355,7 @@ export class AppServerClient {
   _armIdle(waiter) {
     clearTimeout(waiter.idleTimer);
     waiter.idleTimer = setTimeout(() => {
-      waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`));
+      waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`, { code: 'idle' }));
     }, waiter.idleMs);
   }
 
@@ -409,7 +420,7 @@ export class AppServerClient {
       } else if (this._killGroup) {
         this._kill('SIGKILL'); // leader gone: take down any group members it left behind
       }
-      this._failAll(new AppServerError('app-server client closed'));
+      this._failAll(new AppServerError('app-server client closed', { code: 'closed' }));
     })();
     return this._closePromise;
   }
@@ -428,9 +439,11 @@ export class AppServerClient {
  * session's own settings.model.current is used, else the first catalog
  * entry; with neither, rejects with AppServerError code 'no-model'.
  * Errors before session/send (spawn, settle, session/create, subscribe)
- * carry `startup: true`. Aborting `signal` closes the client and rejects
- * with AppServerError code 'aborted'. killGroup/onSpawn/onEvent are passed
- * to AppServerClient.
+ * carry `startup: true`; once session/create succeeded every error carries
+ * the real `sessionId` (the session is resumable). Aborting `signal` closes
+ * the client and rejects with AppServerError code 'aborted'.
+ * killGroup/onSpawn/onEvent are passed to AppServerClient; requestTimeoutMs
+ * is the per-request response timeout.
  */
 export async function runTaskWithModel({
   binPath,
@@ -441,6 +454,7 @@ export async function runTaskWithModel({
   reasoningLevel = 'high',
   timeoutMs = DEFAULT_TASK_TIMEOUT_MS,
   idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
   killGroup = false,
   onSpawn,
@@ -475,12 +489,13 @@ export async function runTaskWithModel({
   if (signal && signal.aborted) throw aborted();
   let client;
   try {
-    client = new AppServerClient({ binPath, cwd, spawnFn, killGroup, onSpawn, onEvent, signal });
+    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, signal });
   } catch (err) {
     if (err instanceof AppServerError) err.startup = true;
     throw err;
   }
   let startup = true;
+  let sessionId = null;
   try {
     await client.settle();
 
@@ -495,7 +510,7 @@ export async function runTaskWithModel({
       workspace: { workspacePath: cwd, workspaceKey: cwd },
       mode: 'yolo',
     });
-    const sessionId = created && created.session && created.session.sessionId;
+    sessionId = (created && created.session && created.session.sessionId) || null;
     if (!sessionId) throw new AppServerError('session/create response is missing session.sessionId');
     const catalog = (created.settings && created.settings.model && created.settings.model.available) || null;
     if (!explicitModel) {
@@ -553,9 +568,10 @@ export async function runTaskWithModel({
       reasoningSubstitution,
     };
   } catch (err) {
-    if (signal && signal.aborted) throw aborted();
-    if (startup && err instanceof AppServerError && err.code !== 'no-model') err.startup = true;
-    throw err;
+    const out = signal && signal.aborted ? aborted() : err;
+    if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
+    if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
+    throw out;
   } finally {
     await client.close();
   }

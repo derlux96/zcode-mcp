@@ -107,19 +107,19 @@ function outcome(res, params) {
 }
 
 // Protocol outcome: the runner decides timeouts and cancellation from the
-// AppServerError; only a real failure is classified.
+// AppServerError code (never from its message); only a real failure is classified.
+// A request without a response ('request_timeout') is a failure with its true message.
 function protocolOutcome(res, err, params) {
   if (err) {
     const message = String((err && err.message) || err);
     if (err.code === 'aborted') {
       return { state: 'cancelled', errorKind: 'cancelled', errorMessage: 'Job was cancelled', timeoutKind: 'cancelled' };
     }
-    if (message.includes('no activity')) {
+    if (err.code === 'idle') {
       const idle = params.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS;
       return { state: 'timeout', errorKind: 'timeout_idle', errorMessage: `No activity for ${idle} ms`, timeoutKind: 'idle' };
     }
-    // A request timeout during startup is a failed start, not the job's total cap.
-    if (message.includes('timed out after') && !err.startup) {
+    if (err.code === 'turn_timeout') {
       return {
         state: 'timeout', errorKind: 'timeout_total',
         errorMessage: `Timed out after ${params.timeout_ms ?? DEFAULT_TIMEOUT_MS} ms`, timeoutKind: 'total',
@@ -213,7 +213,7 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
 // lastActivityAt and progress reach status.json at most once per
 // ACTIVITY_WRITE_MS (first one at once, a trailing write for the rest),
 // so an event flood costs a handful of writes.
-async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath }) {
+async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs }) {
   const binPath = resolveBin();
   const eventsLog = join(dir, 'events.log');
   const progress = [];
@@ -264,6 +264,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     reasoningLevel: params.reasoning_level ?? 'high',
     timeoutMs: params.timeout_ms ?? DEFAULT_TIMEOUT_MS,
     idleTimeoutMs: params.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
+    ...(requestTimeoutMs ? { requestTimeoutMs } : {}),
     killGroup: true,
     signal,
     onSpawn: childRecorder(setStatus, warn),
@@ -298,7 +299,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   try { writeFileSync(outputLogPath, text); } catch { warn('output_log_failed'); }
   return {
     ...protocolOutcome(res, error, params),
-    sessionId: (res && res.sessionId) || eventSession,
+    sessionId: (res && res.sessionId) || (error && error.sessionId) || eventSession,
     output: text,
     exitCode: null,
     stderr: '',
@@ -307,7 +308,8 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
 }
 
 // opts.heartbeatMs: heartbeat interval; opts.signal: external abort (the CLI's
-// early signal handlers); opts.onStatus(merged, patch): test hook seeing every status write.
+// early signal handlers); opts.onStatus(merged, patch): test hook seeing every status write;
+// opts.requestTimeoutMs: protocol request timeout (test hook; default 30 s).
 export async function runJob(dir, opts = {}) {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const onStatus = opts.onStatus;
@@ -364,7 +366,7 @@ export async function runJob(dir, opts = {}) {
     cancelPoll.unref();
     checkCancel();
 
-    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath };
+    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs };
     let run = job.path === 'protocol' ? await runProtocol(ctx) : await runCli({ ...ctx, idle: true });
     if (run === null) {
       warn('idle_detection_unavailable');
