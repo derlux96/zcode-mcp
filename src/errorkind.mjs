@@ -2,7 +2,7 @@
 // Timeouts and cancellation are decided by the runner, not classified here.
 const RULES = [
   ['auth', /project_token_login_failed|\b401\b|\b403\b|unauthorized|invalid api key|login failed/i],
-  ['quota', /\b429\b|rate limit|quota|insufficient balance|too many requests/i],
+  ['quota', /\b429\b|rate limit|quota|insufficient balance|too many requests|余额不足|请求过多|速率限制|频率/i],
   ['network', /ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|socket hang up|network/i],
   ['model', /model is unavailable|model creation failed|select a model/i],
   ['crash', /app-server child exited|app-server child failed to start|SIGSEGV|SIGKILL|uncaught exception/i],

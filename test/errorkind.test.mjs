@@ -32,6 +32,11 @@ const CASES = [
   ['Turn was cancelled.', 'unknown'],
   ['timed out after 540000 ms waiting for session/event turn.completed|turn.failed', 'unknown'],
   ['', 'unknown'],
+  // Localized (Z.ai) provider texts.
+  ['账户余额不足', 'quota'],
+  ['请求过多，请稍后再试', 'quota'],
+  ['触发速率限制', 'quota'],
+  ['[1113][Insufficient balance or no resource package. Please recharge.][req]', 'quota'],
 ];
 
 for (const [message, expected] of CASES) {
