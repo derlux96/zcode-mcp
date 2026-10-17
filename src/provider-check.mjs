@@ -17,10 +17,12 @@ export function providerConfigPath(env = process.env) {
   return join(env.HOME || homedir(), '.zcode', 'v2', 'provider_config.json');
 }
 
-// Userinfo and query values with a sensitive name are masked; the rest stays verbatim
-// (no URL normalisation, which could hide the very typo being looked for).
+// Userinfo, a fragment and query values with a sensitive name are masked; the rest
+// (path segments included) stays verbatim — no URL normalisation, which could hide
+// the very typo being looked for.
 function redactUrl(raw) {
   return raw
+    .replace(/#.*$/s, '#***')
     .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/?#]*@/i, '$1***@')
     .replace(/([?&])([^=&#]*)=([^&#]*)/g, (m, sep, name) => (SENSITIVE.test(name) ? `${sep}${name}=***` : m));
 }

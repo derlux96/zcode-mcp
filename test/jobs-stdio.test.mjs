@@ -134,7 +134,8 @@ test('four parallel zcode_run calls in different cwds: three run, one is rejecte
 
 test('malformed JSON line and unknown method keep the server alive', async () => {
   const s = fresh();
-  const a = s.client();
+  // zcode_check below reads the personal provider config: never the real ~/.zcode here.
+  const a = s.client({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: join(s.home, 'no-provider-config.json') });
   await a.initialize();
   a.writeRaw('this is not json {');
   a.writeRaw('{"truncated": ');

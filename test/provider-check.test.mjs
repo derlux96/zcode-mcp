@@ -110,3 +110,10 @@ test('provider ids and baseUrls are rendered on one line', () => {
   for (const w of r.warnings) assert.ok(!w.includes('\n'), w);
   assert.ok(!r.providers[0].id.includes('\n'));
 });
+
+test('a URL fragment is masked (it can carry tokens); the path is shown as is', () => {
+  const env = home(cfg(rule('p', { baseUrl: `https://api.example.com/v1#access_token=${SECRET}` })));
+  const r = checkProviderConfig(env);
+  assert.equal(r.providers[0].baseUrl, 'https://api.example.com/v1#***');
+  assert.ok(!JSON.stringify(r).includes(SECRET));
+});
