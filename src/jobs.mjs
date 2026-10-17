@@ -289,20 +289,20 @@ export function groupHasMembers(pgid) {
 // is alive with its recorded start time, or gone while its group still has members.
 // Returns the process groups that were signalled. runnerGroup: false never signals the
 // runner (the reaper). Groups that passed the checks but could not be signalled (EPERM)
-// are pushed to `failed` when given.
-export function signalJob(job, dir, sig, { runnerGroup = true, failed } = {}) {
+// are pushed to `failed` when given. `signal` replaces signalGroup in tests only.
+export function signalJob(job, dir, sig, { runnerGroup = true, failed, signal = signalGroup } = {}) {
   const signalled = [];
   const s = readStatus(dir) || {};
   if (isTerminal(s.state)) return signalled;
   if (runnerGroup && aliveFrom(job, s) && Number.isInteger(s.pid)) {
-    try { if (signalGroup(s.pid, sig)) signalled.push(s.pid); } catch { if (failed) failed.push(s.pid); }
+    try { if (signal(s.pid, sig)) signalled.push(s.pid); } catch { if (failed) failed.push(s.pid); }
   }
   const pgid = s.childPgid;
   if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return signalled;
   const id = getProcessIdentity(s.childPid);
   const ok = id ? typeof s.childStart === 'string' && id.start === s.childStart : groupHasMembers(pgid);
   if (ok) {
-    try { if (signalGroup(pgid, sig)) signalled.push(pgid); } catch { if (failed) failed.push(pgid); }
+    try { if (signal(pgid, sig)) signalled.push(pgid); } catch { if (failed) failed.push(pgid); }
   }
   return signalled;
 }

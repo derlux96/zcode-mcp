@@ -375,25 +375,23 @@ test('removeJobDir refuses a job-dir symlink that points outside the jobs root',
   assert.equal(existsSync(join(outside, 'keep.txt')), true);
 });
 
-// A process group led by a root-owned process: verified, but not signallable (EPERM).
-function rootGroupLeader() {
-  const out = execFileSync('ps', ['-axo', 'pid=,pgid=,uid='], { encoding: 'utf8' });
-  for (const line of out.trim().split('\n')) {
-    const [pid, pgid, uid] = line.trim().split(/\s+/).map(Number);
-    if (uid === 0 && pid === pgid && pid > 1 && getProcessIdentity(pid)) return pid;
+test('a verified group that cannot be signalled is reported as kill_failed', async () => {
+  const child = spawnSleep(); // test-owned group: identity verification runs for real
+  try {
+    const j = handJob({ status: deadRunner({ childPid: child, childPgid: child, childStart: getProcessIdentity(child).start }) });
+    const tried = [];
+    const signalOverride = (pgid, sig) => {
+      tried.push([pgid, sig]);
+      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    };
+    const r = await reap({ ...GRACE, signalOverride });
+    assert.deepEqual(tried, [[child, 'SIGTERM']]);
+    assert.deepEqual(r.lost, [j.jobId]);
+    assert.deepEqual(r.killed, []);
+    assert.equal(readStatus(j.dir).state, 'lost');
+    assert.ok(readResult(j.dir).warnings.includes('kill_failed'));
+    assert.equal(alive(child), true);
+  } finally {
+    try { process.kill(-child, 'SIGKILL'); } catch {}
   }
-  return null;
-}
-
-test('a verified group that cannot be signalled is reported as kill_failed', {
-  skip: process.getuid?.() === 0 ? 'root could signal the group' : false,
-}, async (t) => {
-  const leader = rootGroupLeader();
-  if (!leader) return t.skip('no root-owned group leader found');
-  const j = handJob({ status: deadRunner({ childPid: leader, childPgid: leader, childStart: getProcessIdentity(leader).start }) });
-  const r = await reap(GRACE);
-  assert.deepEqual(r.lost, [j.jobId]);
-  assert.deepEqual(r.killed, []);
-  assert.ok(readResult(j.dir).warnings.includes('kill_failed'));
-  assert.ok(readStatus(j.dir).warnings.includes('kill_failed'));
 });

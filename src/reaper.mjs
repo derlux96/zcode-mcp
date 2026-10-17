@@ -43,7 +43,7 @@ function isLost(job, dir, match) {
 // soon as the runner passes the identity check again.
 async function killLeftovers(job, dir, o, killed, failed) {
   const add = (pgids) => { for (const p of pgids) if (!killed.includes(p)) killed.push(p); };
-  const opts = { runnerGroup: false, failed };
+  const opts = { runnerGroup: false, failed, ...(o.signal ? { signal: o.signal } : {}) };
   if (!isLost(job, dir, o.match)) return false;
   const termed = signalJob(job, dir, 'SIGTERM', opts);
   if (!termed.length) return true;
@@ -159,11 +159,12 @@ function retention(now) {
   return doomed.filter((d) => removeJobDir(d.dir, rootReal)).map((d) => basename(d.dir));
 }
 
-// opts.identityOverride: test hook only (replaces the runner identity check); production never sets it.
+// opts.identityOverride / opts.signalOverride: test hooks only (replace the runner identity check /
+// signalGroup); production never sets them.
 export async function reap({
-  now = Date.now(), killGraceMs = KILL_GRACE_MS, confirmMs = CONFIRM_MS, identityOverride,
+  now = Date.now(), killGraceMs = KILL_GRACE_MS, confirmMs = CONFIRM_MS, identityOverride, signalOverride,
 } = {}) {
-  const o = { killGraceMs, confirmMs, match: identityOverride || matchesIdentity };
+  const o = { killGraceMs, confirmMs, match: identityOverride || matchesIdentity, signal: signalOverride };
   const out = { lost: [], deleted: [], killed: [] };
   for (const dir of listJobDirs()) {
     const jobId = basename(dir);
