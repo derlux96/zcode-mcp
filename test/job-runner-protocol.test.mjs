@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { makeTempDir, makeGitRepo, removeDir, fakeBin } from './helpers.mjs';
+import { makeTempDir, makeGitRepo, removeDir, fakeBin, safeSignal } from './helpers.mjs';
 import { createJobDir, readStatus, readResult } from '../src/jobstore.mjs';
 import { captureBaseline } from '../src/changes.mjs';
 import { SessionStore } from '../src/state.mjs';
@@ -385,7 +385,8 @@ test('a cancel whose app-server exit is seen before the runner aborts still ends
   const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
   await new Promise((r) => setTimeout(r, 500)); // past session/send: no startup retry
   writeFileSync(join(dir, 'cancel'), '');
-  process.kill(-st.childPgid, 'SIGKILL'); // only the app-server group, not the runner
+  // only the app-server group, not the runner
+  assert.equal(safeSignal(st.childPgid, 'SIGKILL', { expectStart: st.childStart, group: true }), true);
   await done;
   const res = readResult(dir);
   assert.equal(res.state, 'cancelled');

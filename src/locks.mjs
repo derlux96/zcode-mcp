@@ -1,10 +1,10 @@
 // Per-directory locks: at most one running job per working directory.
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  linkSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
+  linkSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { stateHome } from './jobstore.mjs';
+import { stateHome, ensurePrivateDir } from './jobstore.mjs';
 
 const MAX_ATTEMPTS = 40;
 const CORRUPT_GRACE_MS = 2000;
@@ -37,7 +37,7 @@ function sleepMs(ms) {
 function createExclusive(path, content) {
   const tmp = `${path}.tmp.${suffix()}`;
   try {
-    writeFileSync(tmp, JSON.stringify(content));
+    writeFileSync(tmp, JSON.stringify(content), { mode: 0o600 });
     linkSync(tmp, path);
     return true;
   } catch (err) {
@@ -141,7 +141,7 @@ function withClaim(path, fn) {
 
 export function acquireCwdLock(cwd, jobId, isAlive) {
   const path = lockPath(cwd);
-  mkdirSync(join(stateHome(), 'locks'), { recursive: true });
+  ensurePrivateDir(join(stateHome(), 'locks'));
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (createExclusive(path, lockContent(jobId))) return { ok: true };
     const held = readLock(path);

@@ -3,12 +3,12 @@
 // restarted server or a second server sees the same jobs. Reads never persist
 // anything: `lost` and `stalled` are derived on every read.
 import { spawn as spawnProcess } from 'node:child_process';
-import { accessSync, constants, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   TERMINAL_STATES, stateHome, jobsRoot, createJobDir, readJson, readStatus, readResult,
-  patchStatus, writeResult, listJobDirs, isJobId, jobDir,
+  patchStatus, writeResult, listJobDirs, isJobId, jobDir, ensurePrivateDir,
 } from './jobstore.mjs';
 import { acquireCwdLock, releaseCwdLock } from './locks.mjs';
 import {
@@ -189,9 +189,10 @@ function storeNotWritable() {
   const root = jobsRoot();
   const locks = join(stateHome(), 'locks');
   try {
-    mkdirSync(root, { recursive: true, mode: 0o700 });
+    ensurePrivateDir(stateHome());
+    ensurePrivateDir(root);
     accessSync(root, constants.W_OK);
-    mkdirSync(locks, { recursive: true, mode: 0o700 });
+    ensurePrivateDir(locks);
     accessSync(locks, constants.W_OK);
     return null;
   } catch (err) {

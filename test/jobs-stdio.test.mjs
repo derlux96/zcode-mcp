@@ -3,8 +3,10 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { getProcessIdentity } from '../src/procid.mjs';
-import { TestScope, fakeAppserverBin, assertNoLeftoverProcesses, safeSignal, waitFor, sleep } from './helpers.mjs';
+import { TestScope, fakeAppserverBin, assertNoLeftoverProcesses, safeSignal, waitFor } from './helpers.mjs';
 
 let scope;
 const fresh = () => { scope = new TestScope(); return scope; };
@@ -66,6 +68,32 @@ test('closing stdin does not kill a running job', async () => {
   await b.initialize();
   const done = await awaitState(b, jobId, 'completed');
   assert.match(done.text, /sess_chatty1/);
+});
+
+test('closing stdin ends in-flight waits at once: the reply still carries the job_id (M4)', async () => {
+  const s = fresh();
+  const a = s.client({ FAKE_ZCODE_MODE: 'hang' });
+  await a.initialize();
+  const { promise } = a.requestWithId('tools/call', {
+    name: 'zcode_run', arguments: { prompt: 'wait', cwd: s.cwd(), mode: 'yolo', wait_ms: 300000 },
+  }, { timeoutMs: 20000 });
+  promise.catch(() => {});
+  // The job exists (zcode_run is waiting) before stdin closes.
+  const [jobId] = await waitFor(() => {
+    try { const ids = readdirSync(join(s.home, 'jobs')); return ids.length === 1 ? ids : null; } catch { return null; }
+  }, { what: 'job dir' });
+  s.track(jobId);
+  const t0 = Date.now();
+  a.closeStdin();
+  let timer;
+  const exit = await Promise.race([a.exited, new Promise((r) => { timer = setTimeout(() => r(null), 5000); })]);
+  clearTimeout(timer);
+  assert.ok(exit, 'server did not exit promptly after stdin closed');
+  assert.ok(Date.now() - t0 < 5000);
+  const reply = await promise;
+  const text = reply.content.map((c) => c.text).join('\n');
+  assert.match(text, /^status: running$/m);
+  assert.equal(jobIdOf(text), jobId);
 });
 
 test('two servers starting a job in the same cwd: exactly one wins', async () => {

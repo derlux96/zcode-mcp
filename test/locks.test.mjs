@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readdirSync, readFileSync, writeFileSync, utimesSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, realpathSync, readdirSync, readFileSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -209,4 +209,16 @@ test('a claim holder whose claim was replaced does not remove the lock', withEnv
   assert.equal(JSON.parse(readFileSync(claim, 'utf8')).nonce, 'other'); // foreign claim left alone
   rmSync(claim);
   assert.equal(removeStaleLock(dir, never), true);
+}));
+
+// M5: lock files are 0600, an existing locks dir is tightened to 0700.
+test('lock files are created 0600 in a 0700 locks dir', withEnv((root) => {
+  mkdirSync(locksDir(), { recursive: true, mode: 0o755 });
+  chmodSync(locksDir(), 0o755);
+  const cwd = mkdtempSync(join(root, 'cwd-'));
+  assert.equal(acquireCwdLock(cwd, 'job_a', never).ok, true);
+  assert.equal(statSync(locksDir()).mode & 0o777, 0o700);
+  const lock = join(locksDir(), `${lockKey(cwd)}.lock`);
+  assert.equal(statSync(lock).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(locksDir()), [`${lockKey(cwd)}.lock`], 'no temp files left');
 }));

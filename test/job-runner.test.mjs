@@ -458,7 +458,8 @@ test('a cancel whose ZCode exit is seen before the runner aborts still ends canc
   const done = runJob(dir, { heartbeatMs: 50 });
   const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
   writeFileSync(join(dir, 'cancel'), '');
-  process.kill(-st.childPgid, 'SIGKILL'); // only ZCode's group, not the runner
+  // only ZCode's group, not the runner
+  assert.equal(safeSignal(st.childPgid, 'SIGKILL', { expectStart: st.childStart, group: true }), true);
   await done;
   const res = readResult(dir);
   assert.equal(res.state, 'cancelled');
@@ -472,7 +473,7 @@ test('ZCode killed without a cancel request still ends failed with errorKind cra
   const { dir } = mkJob({ cwd: tempCwd() });
   const done = runJob(dir, { heartbeatMs: 50 });
   const st = await waitFor(() => (readStatus(dir)?.childPgid ? readStatus(dir) : null));
-  process.kill(-st.childPgid, 'SIGKILL');
+  assert.equal(safeSignal(st.childPgid, 'SIGKILL', { expectStart: st.childStart, group: true }), true);
   await done;
   const res = readResult(dir);
   assert.equal(res.state, 'failed');

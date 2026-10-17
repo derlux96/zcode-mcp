@@ -120,3 +120,12 @@ test('jobDir maps valid ids into the jobs root and returns null otherwise', with
   assert.equal(jobDir('../x'), null);
   assert.equal(jobDir(''), null);
 }));
+
+// M5: an existing state home and jobs/locks dirs owned by the user are tightened to 0700.
+test('createJobDir tightens existing home and jobs dirs to 0700', withHome(() => {
+  mkdirSync(jobsRoot(), { recursive: true, mode: 0o755 });
+  chmodSync(stateHome(), 0o755);
+  chmodSync(jobsRoot(), 0o755);
+  const { dir } = createJobDir({});
+  for (const d of [stateHome(), jobsRoot(), dir]) assert.equal(statSync(d).mode & 0o777, 0o700, d);
+}));

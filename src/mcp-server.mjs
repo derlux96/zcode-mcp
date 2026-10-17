@@ -613,6 +613,7 @@ export function main() {
   });
   rl.on('close', () => {
     closing = true;
+    protocol.abortAll(); // waits end now; jobs keep running
     exitWhenSafe();
   });
 }

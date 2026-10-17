@@ -2,6 +2,8 @@
 // 1. Jobs whose runner vanished without a terminal state: kill verified leftovers (R18),
 //    free the lock via the claim protocol (R13), then record them as `lost` (R14).
 // 2. Retention: delete finished job dirs older than 7 days or beyond the newest 50.
+//    isolate_worktree jobs whose worktree still exists are exempt (they are listed as
+//    open worktrees); their dirs go only once the worktree dir is gone.
 // Only atomic file operations, so two servers may reap concurrently. Never throws for a
 // single bad job; never deletes running jobs, worktrees or anything outside jobsRoot().
 import { existsSync, lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs';
@@ -147,7 +149,11 @@ function retention(now) {
   listJobDirs().forEach((dir, order) => { // order: ascending by job id (creation)
     try {
       const status = readStatus(dir);
-      if (status && isTerminal(status.state)) finished.push({ dir, order, mtime: newestMtime(dir) });
+      if (status && isTerminal(status.state)) {
+        const job = readJson(join(dir, 'job.json'));
+        if (job && job.worktree && typeof job.worktree.dir === 'string' && existsSync(job.worktree.dir)) return;
+        finished.push({ dir, order, mtime: newestMtime(dir) });
+      }
       else if (!status && isHusk(dir)) husks.push({ dir, mtime: newestMtime(dir) });
     } catch { /* vanished or unreadable: skip */ }
   });

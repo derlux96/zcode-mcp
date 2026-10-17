@@ -251,9 +251,31 @@ test('never deletes a worktree directory', async () => {
   assert.deepEqual(readResult(lostJob.dir).worktree, worktree);
   assert.equal(readResult(lostJob.dir).changesAvailable, false);
   age(lostJob.dir, 8 * DAY);
+  // M7: the job dir of a worktree job stays while its worktree exists (open worktrees list).
   const r2 = await reap(GRACE);
-  assert.deepEqual(r2.deleted, [lostJob.jobId]);
+  assert.deepEqual(r2.deleted, []);
+  assert.equal(existsSync(lostJob.dir), true);
   assert.equal(readFileSync(join(wt, 'work.txt'), 'utf8'), 'w');
+  removeDir(wt); // the user removed the worktree
+  const r3 = await reap(GRACE);
+  assert.deepEqual(r3.deleted, [lostJob.jobId]);
+});
+
+test('a worktree job does not count towards the newest 50 while its worktree exists', async () => {
+  const wt = tempDir('zcode-wt-');
+  const worktree = { branch: 'zcode/y', dir: realpathSync(wt), startSha: 'abc' };
+  const wj = handJob({ cwd: wt, worktree, status: deadRunner({ state: 'completed', finishedAt: new Date().toISOString() }) });
+  writeResult(wj.dir, { state: 'completed', output: 'done', warnings: [] });
+  age(wj.dir, 120 * 60000); // the oldest finished job
+  const jobs = [];
+  for (let i = 0; i < 51; i++) {
+    const j = finishedJob('completed');
+    age(j.dir, (60 - i) * 60000);
+    jobs.push(j);
+  }
+  const r = await reap(GRACE);
+  assert.deepEqual(r.deleted, [jobs[0].jobId]);
+  assert.equal(existsSync(wj.dir), true);
 });
 
 test('second reap changes nothing', async () => {

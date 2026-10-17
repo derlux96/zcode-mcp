@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   mkdirSync, accessSync, constants, writeFileSync, renameSync, readFileSync,
-  readdirSync, rmSync,
+  readdirSync, rmSync, statSync, chmodSync,
 } from 'node:fs';
 
 export const TERMINAL_STATES = ['completed', 'failed', 'timeout', 'cancelled', 'lost'];
@@ -20,6 +20,15 @@ export function stateHome() {
 
 export function jobsRoot() {
   return join(stateHome(), 'jobs');
+}
+
+// Creates `dir` (and parents) with mode 0700 and tightens an existing state
+// directory to 0700 when it belongs to this user. Used for the home, jobs and locks.
+export function ensurePrivateDir(dir) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = statSync(dir);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (uid !== null && st.uid === uid && (st.mode & 0o777) !== 0o700) chmodSync(dir, 0o700);
 }
 
 const JOB_ID_RE = /^job_[0-9a-z]+_[0-9a-f]{6}$/;
@@ -69,7 +78,8 @@ export function createJobDir(spec = {}) {
   const dir = join(root, jobId);
   const token = randomBytes(16).toString('hex');
   try {
-    mkdirSync(root, { recursive: true, mode: 0o700 });
+    ensurePrivateDir(stateHome());
+    ensurePrivateDir(root);
     accessSync(root, constants.W_OK);
     mkdirSync(dir, { mode: 0o700 });
     writeJsonAtomic(join(dir, 'job.json'), {

@@ -244,6 +244,7 @@ export class TestScope {
   watchChild(jobId) {
     const st = this.jobStatus(jobId);
     assert(st && Number.isInteger(st.childPid), `job ${jobId} recorded no child pid`);
+    assert(typeof st.childStart === 'string', `job ${jobId} recorded no child start time`);
     this.watched.push({ pid: st.childPid, start: st.childStart });
   }
 

@@ -110,7 +110,8 @@ All writes are atomic (temp file + rename), so several MCP servers can share one
 **reaper** runs at server start and (throttled to once per 30 s) on tool calls: a job whose
 runner vanished without a terminal state is recorded as `lost` (warning `runner_lost`,
 `error_kind: crash`) after its verified leftover ZCode processes are killed and its lock is
-freed; finished job directories older than 7 days or beyond the newest 50 are deleted. It never
+freed; finished job directories older than 7 days or beyond the newest 50 are deleted, except
+those of `isolate_worktree` jobs whose worktree still exists (removed once it is gone). It never
 touches running jobs, worktrees, or anything outside `jobs/`. Processes are never signalled by
 name. The job runner is signalled only when its pid, start time and job token match. ZCode's
 process group is signalled only when ZCode's pid and start time match, or, once ZCode itself is
@@ -224,7 +225,7 @@ stored AES-256-GCM-encrypted in `credentials.json` and in cleartext (mode 0600) 
   Do not point jobs at directories you do not trust.
 - The MCP server's own state is isolated (`ZCODE_MCP_HOME`), but ZCode itself always uses the
   user's real `~/.zcode` (login, provider config, its own session data).
-- State files are written with mode 0600 in directories with mode 0700.
+- State files (job files, locks, claims) are written with mode 0600 in directories with mode 0700; an existing state directory you own is tightened to 0700.
 - Task output is capped at 100,000 characters; every job has a total timeout (`timeout_ms`,
   default 6 h; on the protocol path start-up time comes on top) and, on the protocol path, an
   idle timeout (`idle_timeout_ms`, default 10 min).

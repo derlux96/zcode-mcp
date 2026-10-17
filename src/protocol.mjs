@@ -36,7 +36,9 @@ export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } 
     inFlight.set(id, ctl);
     try {
       const result = await tool.handler((params && params.arguments) || {}, { signal: ctl.signal });
-      return ctl.signal.aborted ? null : ok(id, result);
+      // A cancelled request gets no response; one whose wait ended because the
+      // input closed still answers (e.g. `echo ... | server` gets its job_id).
+      return ctl.signal.aborted && !ctl.inputClosed ? null : ok(id, result);
     } catch (error) {
       // MCP: a cancelled request gets no response at all.
       if (ctl.signal.aborted) return null;
@@ -47,6 +49,14 @@ export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } 
   }
 
   return {
+    // The client's input closed: end every in-flight wait now (the replies are
+    // still written), so the server can exit instead of lingering up to wait_ms.
+    abortAll() {
+      for (const ctl of inFlight.values()) {
+        ctl.inputClosed = true;
+        ctl.abort();
+      }
+    },
     async handleMessage(msg) {
       if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
         return msg && msg.id !== undefined ? fail(msg.id, INVALID_REQUEST, 'Invalid Request') : null;
