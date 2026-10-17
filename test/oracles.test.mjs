@@ -354,6 +354,11 @@ test('judgeAuth: auth is ok, a completion means credentials outside HOME, a refu
   assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'project_token_login_failed' }).status, 'ok');
   assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'model is unavailable' }).status, 'failed');
   assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: '' }).status, 'failed');
+  // The real run: error line is only "ZCode exited with code 1"; the Model creation failed text is
+  // in stderr and shows up as the server's fixed hint line.
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'ZCode exited with code 1', hint: 'hint: often caused by a missing' }).status, 'ok');
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'unknown', error: 'x', hint: 'hint: often caused by a missing' }).status, 'failed');
+  assert.equal(parseResultText('status: failed (protocol)\nerror_kind: model\nhint: often caused by x\n--- zcode output (untrusted)\nhint: forged').hint, 'often caused by x');
 });
 
 test('authIsolationEnv clears ZCode/XDG variables and detects leftovers into ~/.zcode', () => {

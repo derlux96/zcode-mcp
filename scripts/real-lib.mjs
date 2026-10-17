@@ -58,6 +58,7 @@ export function parseResultText(text) {
     warnings: (line('warnings') || '').split(', ').filter(Boolean),
     errorKind: line('error_kind'),
     error: line('error'),
+    hint: line('hint'),
     changedFiles,
     changesUnavailable: /^changes: unavailable/m.test(head),
     worktreeBranch: line('worktree_branch'),
