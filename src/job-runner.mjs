@@ -19,6 +19,7 @@ import { runTaskWithModel, resolveBin, DEFAULT_MAX_TRANSIENT_RETRIES } from './a
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { discoverZCode } from './discover.mjs';
 import { oneLine } from './sanitize.mjs';
+import { describeTurnError, errorText } from './transient.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
@@ -134,8 +135,10 @@ function protocolOutcome(res, err, params) {
     return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
   }
   if (!res.ok) {
-    const message = (res.error && res.error.message) || 'turn failed';
-    return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
+    // The real payload may carry a localized message and the English cause in
+    // detail/underlyingErrorMessage/statusMessage: classify all of them, show both.
+    const message = res.error ? describeTurnError(res.error) : 'turn failed';
+    return { state: 'failed', errorKind: classifyError({ message: errorText(res.error) || message, stderr: '' }), errorMessage: message, timeoutKind: null };
   }
   return { state: 'completed', errorKind: null, errorMessage: null, timeoutKind: null };
 }

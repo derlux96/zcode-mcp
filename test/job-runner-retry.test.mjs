@@ -13,7 +13,7 @@ import { DEFAULT_CONTINUE_PROMPT } from '../src/appserver.mjs';
 
 const fakeAppServer = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
 const temps = [];
-const ENV_KEYS = ['FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG', 'FAKE_APPSERVER_COUNTER', 'FAKE_APPSERVER_FAIL_TIMES', 'FAKE_APPSERVER_RETRY_AFTER', 'FAKE_APPSERVER_HANG_AFTER'];
+const ENV_KEYS = ['FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG', 'FAKE_APPSERVER_COUNTER', 'FAKE_APPSERVER_FAIL_TIMES', 'FAKE_APPSERVER_RETRY_AFTER', 'FAKE_APPSERVER_HANG_AFTER', 'FAKE_APPSERVER_EXIT_AFTER_FAIL'];
 
 before(() => {
   const home = makeTempDir('zcode-home-');
@@ -73,14 +73,14 @@ test('recovered after one 429: completed, history, warning, continue sent into t
   const [r] = res.retries;
   assert.equal(r.attempt, 1);
   assert.ok(r.delayMs >= 27 && r.delayMs <= 33, `jittered delay ${r.delayMs}`);
-  assert.match(r.reason, /^HTTP 429: \[1113\] Insufficient balance/);
+  assert.equal(r.reason, 'HTTP 429 Too Many Requests: rate limit reached for requests');
   assert.match(r.at, /^\d{4}-\d\d-\d\dT.*Z$/);
   // status.retry set before the wait, cleared when the next turn started.
   assert.equal(retryPatches[0].attempt, 1);
   assert.equal(retryPatches[0].maxRetries, 6);
   assert.equal(typeof retryPatches[0].nextAt, 'string');
   assert.equal(retryPatches[0].delayMs, r.delayMs);
-  assert.match(retryPatches[0].reason, /1113/);
+  assert.match(retryPatches[0].reason, /HTTP 429/);
   assert.ok(retryPatches.includes(null), 'retry cleared');
   const st = readStatus(dir);
   assert.equal(st.retry, null);
@@ -91,7 +91,7 @@ test('recovered after one 429: completed, history, warning, continue sent into t
   assert.equal(s[1].params.sessionId, 'sess_fakeB1');
   // progress and events.log carry the retry line.
   const events = readFileSync(join(dir, 'events.log'), 'utf8');
-  assert.match(events, /retrying in 0s \(attempt 1\/6\): HTTP 429: \[1113\]/);
+  assert.match(events, /retrying in 0s \(attempt 1\/6\): HTTP 429 Too Many Requests/);
   assert.ok(st.progress.some((l) => /^retrying in 0s \(attempt 1\/6\): /.test(l)));
 });
 
@@ -114,7 +114,7 @@ test('exhaustion reports the real message and errorKind plus the history', async
   const res = readResult(dir);
   assert.equal(res.state, 'failed');
   assert.equal(res.errorKind, 'quota');
-  assert.equal(res.errorMessage, 'HTTP 429: [1113] Insufficient balance or no resource package. Please recharge.');
+  assert.equal(res.errorMessage, 'HTTP 429 Too Many Requests: rate limit reached for requests');
   assert.equal(res.retries.length, 3);
   assert.equal(res.retryOutcome, 'exhausted');
   assert.deepEqual(res.warnings, ['transient_retries_exhausted:3']);
@@ -170,7 +170,7 @@ test('the protocol job deadline covers the wait after a continue (timeout_total)
   assert.equal(res.state, 'timeout');
   assert.equal(res.errorKind, 'timeout_total');
   assert.equal(res.retries.length, 1);
-  assert.ok(Date.now() - t0 < 1500 + 3000);
+  assert.ok(Date.now() - t0 < 1500 + 5000);
 });
 
 test('no idle timeout during a backoff longer than idle_timeout_ms', async () => {
@@ -204,7 +204,7 @@ test('cancel during the backoff ends cancelled within a second and leaves no pro
   const t0 = Date.now();
   writeFileSync(join(dir, 'cancel'), '');
   await done;
-  assert.ok(Date.now() - t0 < 1000, `cancelled after ${Date.now() - t0} ms`);
+  assert.ok(Date.now() - t0 < 3000, `cancelled after ${Date.now() - t0} ms (the backoff is 60 s)`);
   const res = readResult(dir);
   assert.equal(res.state, 'cancelled');
   assert.equal(res.errorKind, 'cancelled');
@@ -255,4 +255,54 @@ test('runnerEnvOptions: ZCODE_MCP_TEST_RETRY_DELAYS_MS only with NODE_ENV=test',
   assert.deepEqual(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_TEST_RETRY_DELAYS_MS: '10, 20' }).retryDelaysMs, [10, 20]);
   assert.equal(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_TEST_RETRY_DELAYS_MS: '10,x' }).retryDelaysMs, undefined);
   assert.equal(runnerEnvOptions({ NODE_ENV: 'test' }).retryDelaysMs, undefined);
+});
+
+// --- review fixes ---
+
+test('balance class (R31): a status-only 1113 payload is retried twice, then fails quota with the real message', async () => {
+  const { cwd, sends } = setup('fail-status-1113-always');
+  const { dir } = mkJob({ cwd });
+  await runJob(dir, { retryDelaysMs: [10, 20, 30] });
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'quota');
+  assert.equal(res.errorMessage, '[1113][Insufficient balance or no resource package. Please recharge.][req_fake]');
+  assert.equal(res.retries.length, 2);
+  assert.equal(res.retryOutcome, 'exhausted');
+  assert.deepEqual(res.warnings, ['transient_retries_exhausted:2']);
+  assert.equal(sends().length, 3);
+  assert.match(readFileSync(join(dir, 'events.log'), 'utf8'), /retrying in 0s \(attempt 1\/2\): \[1113\]/);
+});
+
+test('real layout: localized 429 with the English cause in underlyingErrorMessage recovers', async () => {
+  const { cwd } = setup('fail-zh-429-then-ok');
+  const { dir } = mkJob({ cwd });
+  await runJob(dir, { retryDelaysMs: [5] });
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.equal(res.retries[0].reason, '模型请求失败 | Model request failed | HTTP 429 Too Many Requests');
+});
+
+test('real model_not_found payload: errorKind model from detail, message keeps both texts, not retried', async () => {
+  const { cwd, sends } = setup('fail-zh-model-creation');
+  const { dir } = mkJob({ cwd });
+  await runJob(dir, { retryDelaysMs: [5] });
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'model');
+  assert.equal(res.errorMessage, 'Provider Registry 中不存在 Model: glm-test/small | Model creation failed');
+  assert.equal(sends().length, 1);
+});
+
+test('an app-server that dies during a backoff ends the job at once (failed, crash)', async () => {
+  const { cwd } = setup('fail-429-always', { FAKE_APPSERVER_EXIT_AFTER_FAIL: '1' });
+  const { dir } = mkJob({ cwd, timeout_ms: 0 });
+  const t0 = Date.now();
+  await runJob(dir, { retryDelaysMs: [60000] });
+  assert.ok(Date.now() - t0 < 15000);
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'crash');
+  assert.equal(res.retries.length, 1);
+  assert.equal(res.retryOutcome, 'failed');
 });

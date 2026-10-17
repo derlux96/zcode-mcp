@@ -193,7 +193,8 @@ test('rate-limit ends failed with errorKind quota (transient retries disabled)',
   const res = readResult(dir);
   assert.equal(res.state, 'failed');
   assert.equal(res.errorKind, 'quota');
-  assert.equal(res.errorMessage, '429 rate limit');
+  // The fake's payload carries detail 'Model creation failed' next to the message.
+  assert.equal(res.errorMessage, '429 rate limit | Model creation failed');
   assert.equal(res.sessionId, 'sess_fakeB1');
   assert.equal(res.timeoutKind, null);
 });

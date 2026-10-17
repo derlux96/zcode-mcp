@@ -501,7 +501,8 @@ test('zcode_run model mode maps turn.failed to isError with the failure message'
   const text = textOf(reply);
   assert.match(text, /^status: failed \(model glm-test\/small\)$/m);
   assert.match(text, /session_id: sess_fakeB1\n/);
-  assert.match(text, /^error: fake model failure$/m);
+  // The payload's detail is shown next to the message (real layout: localized message, English detail).
+  assert.match(text, /^error: fake model failure \| Model creation failed$/m);
   const entries = store.list();
   assert.equal(entries[0].kind, 'session');
   assert.equal(entries[0].status, 'failed');
@@ -512,7 +513,7 @@ test('zcode_run model mode failure carries its error_kind', async () => {
   const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd('zcode-runb-'), model: 'glm-test/small' });
   assert.equal(reply.result.isError, true);
   assert.match(textOf(reply), /^error_kind: auth$/m);
-  assert.match(textOf(reply), /^error: project_token_login_failed$/m);
+  assert.match(textOf(reply), /^error: project_token_login_failed \| Model creation failed$/m);
 });
 
 test('zcode_run model mode timeout: status timeout, isError, run-id state entry', async () => {

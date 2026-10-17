@@ -154,7 +154,7 @@ test('end to end: a detached job waits in a backoff (status.retry visible), then
   const end = Date.now() + 15000;
   while (Date.now() < end) {
     const { text } = await call('zcode_status', { job_id: id });
-    if (/^retrying: attempt 1\/6 in \ds \(HTTP 429: \[1113\]/m.test(text)) { seen = text; break; }
+    if (/^retrying: attempt 1\/6 in \ds \(HTTP 429 Too Many Requests/m.test(text)) { seen = text; break; }
     if (/^status: (completed|failed)/m.test(text)) break;
     await new Promise((r) => setTimeout(r, 50));
   }
