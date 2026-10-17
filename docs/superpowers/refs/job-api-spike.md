@@ -46,8 +46,28 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 
 - Denied tool calls are not reported (`deniedTools` unverified: no deny event observed, see (a)).
 - The CLI path has no progress and no idle detection (output only at the end); only `timeout_ms` applies.
-- `yolo` and the protocol path can write outside `cwd`; only `isolate_worktree` gives isolation, and
-  worktrees are never removed automatically.
+- `yolo` and the protocol path can write outside `cwd`; nothing prevents it. `isolate_worktree` only
+  keeps the job's in-repo edits off the user's working tree (separate branch/worktree), it does not
+  stop writes outside the cwd; worktrees are never removed automatically.
+- `timeout_ms` is a hard total cap only on the CLI path. On the protocol path it bounds the wait for
+  the turn; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few
+  minutes of overrun are possible.
+- The `sess_` id is lost when a protocol job times out or is cancelled silently after
+  `session/create` (no event carried it yet): such a result is not resumable.
+- A `session/send` acknowledgement timeout is booked as `timeout_total` with a misleading message.
+- Grandchildren of ZCode are only killed on stop signals (cancel, timeout, runner fatal); a normal
+  ZCode exit does not sweep leftover grandchildren.
+- Reaper residual: during a persistent `ps` outage (>= 3 failed samples) the reaper can signal the
+  ZCode child group of a job that is actually alive (the runner itself is never signalled).
+- `zcode_cancel` never sets `isError`, even when the cancelled job ends `cancelled`.
+- U+2028/U+2029 and C1 control characters are not escaped in rendered file names; only C0 and DEL
+  are. "Output cannot forge a header line" holds only for clients that split lines on `\n`.
+- Cancelled and timed-out jobs report the changes as of that moment (ZCode may still have been
+  writing; nothing is rolled back).
+- Smoke oracles: the read-only task only checks that the output contains the answer (7341; the
+  prompt does not contain it, but echoing the file would also pass), and the impossible task checks
+  the effect (nothing invented, tree clean, `no_changes`) but not that the final text says the
+  file does not exist. Stricter text checks were left out to keep real runs from turning flaky.
 - Non-git directories: no changed-file report (`changes: unavailable`) and no `no_changes` check.
 - `lost`/`stalled` detection relies on `ps -o lstart=,command=`; verified on macOS only.
 - The latency baseline above is a single run of 18 tiny tasks; the soak (stage 5) and the real

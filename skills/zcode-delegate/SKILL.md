@@ -51,7 +51,9 @@ Every `zcode_run` starts a background **job** (`job_…` id) and then waits up t
 | Small, precisely located fix | `mode: "edit"` |
 | Continue an earlier ZCode conversation | `resume: "sess_…"` (CLI) |
 
-**Timeouts.** `timeout_ms` is the total cap of the job (default and max 6 h). On the protocol
+**Timeouts.** `timeout_ms` (default and max 6 h) is the hard total cap on the CLI path. On the
+protocol path it bounds the wait for the turn to finish; start-up (up to ~30 s per request,
+retried once) comes on top, so expect a few minutes of overrun at most. On the protocol
 path `idle_timeout_ms` (default 10 min) aborts a job that shows no protocol progress — long but
 active tasks keep running. The CLI path prints nothing until the end, so it has no idle timeout;
 use `timeout_ms` there. A result with `timeout: idle` or `timeout: total` lists the files changed
@@ -103,8 +105,10 @@ Good: "In src/auth/login.ts the session cookie is not refreshed on rotation. Fix
 ## 8. Safety and worktree isolation
 
 `yolo` (and the protocol path, which runs with yolo semantics) lets ZCode run commands and write
-files **outside the `cwd`** as well. For risky work, unknown repos, or when the working tree has
-uncommitted changes, use `isolate_worktree: true`:
+files **outside the `cwd`** as well — nothing prevents that, `isolate_worktree` included. Do not
+delegate into directories you do not trust. For risky work or when the working tree has
+uncommitted changes, use `isolate_worktree: true`: it keeps the job's in-repo edits on their own
+branch, off your working tree (it does NOT stop writes outside the cwd):
 - ZCode works on a new `zcode/<slug>` branch in `.zcode-worktrees/<slug>/` (reported as
   `worktree_branch:` / `worktree_dir:`).
 - The worktree is NEVER cleaned up by the server. After verifying the diff, either merge it
