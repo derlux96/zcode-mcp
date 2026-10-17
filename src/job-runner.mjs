@@ -422,6 +422,12 @@ export async function runJob(dir, opts = {}) {
       if (changes.available && sharesRepoWithLiveJob(job, dir)) warn('shared_repo');
     } catch { /* best effort */ }
 
+    // R29: a terminal state set by the manager (`cancelled`) stands; the reaper's
+    // `lost` is an inference and gives way to the runner's own result.
+    const recorded = readStatus(dir);
+    const managerFinal = !!recorded && TERMINAL_STATES.includes(recorded.state) && recorded.state !== 'lost';
+    if (recorded && recorded.state === 'lost') warn('recovered_from_lost');
+
     try {
       new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()).append({
         id: sessionId || jobId,
@@ -430,22 +436,16 @@ export async function runJob(dir, opts = {}) {
         mode: params.mode || 'yolo',
         promptPreview: String(params.prompt || '').slice(0, 80),
         startedAt: new Date(startedMs).toISOString(),
-        status: state,
+        status: managerFinal ? recorded.state : state,
       });
     } catch {
       warn('session_store_failed');
     }
 
-    // R29: a terminal state set by the manager (`cancelled`) stands; the reaper's
-    // `lost` is an inference and gives way to the runner's own result.
-    const recorded = readStatus(dir);
-    if (recorded && TERMINAL_STATES.includes(recorded.state)) {
-      if (recorded.state !== 'lost') {
-        if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId); // only if still ours
-        finished = true;
-        return;
-      }
-      warn('recovered_from_lost');
+    if (managerFinal) {
+      if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId); // only if still ours
+      finished = true;
+      return;
     }
     // Lock release precedes the terminal status so the job counts as alive until the lock is gone.
     if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId);

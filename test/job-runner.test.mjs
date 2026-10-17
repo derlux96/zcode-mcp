@@ -509,6 +509,9 @@ test('a manager-set cancelled state is never overwritten by the runner', async (
   await done;
   assert.deepEqual(readStatus(dir), status);
   assert.deepEqual(readResult(dir), result);
+  const entry = new SessionStore(process.env.ZCODE_MCP_STATE).list().at(-1);
+  assert.equal(entry.id, 'sess_chatty1');
+  assert.equal(entry.status, 'cancelled', 'the session list agrees with the job state');
 });
 
 test('a reaper-set lost state is replaced by the runner result with recovered_from_lost', async () => {
