@@ -100,7 +100,8 @@ function makeDemoRepoCopy() {
 
 // --- default mode: fake binary, no real ZCode needed ---
 const stateFile = join(tempDir(), 'sessions.json');
-const client = new McpClient({ ZCODE_BIN: fakeBin, ZCODE_MCP_STATE: stateFile });
+const jobsHome = tempDir(); // jobs of the fake run never reach ~/.zcode-mcp
+const client = new McpClient({ ZCODE_BIN: fakeBin, ZCODE_MCP_STATE: stateFile, ZCODE_MCP_HOME: jobsHome });
 
 const init = await client.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
 assertThat(init.result && init.result.serverInfo.name === 'zcode-delegate', 'initialize handshake');
@@ -108,7 +109,7 @@ client.notify('notifications/initialized');
 
 const list = await client.request('tools/list', {});
 const names = list.result.tools.map((t) => t.name).sort();
-assertThat(JSON.stringify(names) === JSON.stringify(['zcode_check', 'zcode_run', 'zcode_sessions']), 'exposes exactly 3 tools');
+assertThat(JSON.stringify(names) === JSON.stringify(['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']), 'exposes exactly 6 tools');
 
 const check = await client.request('tools/call', { name: 'zcode_check', arguments: {} });
 assertThat(/"ok": true/.test(check.result.content[0].text), 'zcode_check ok with fake binary');
@@ -116,7 +117,7 @@ assertThat(/"ok": true/.test(check.result.content[0].text), 'zcode_check ok with
 const bad = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'x', cwd: 'relative/path' } });
 assertThat(bad.result.isError === true && /absolute/.test(bad.result.content[0].text), 'relative cwd rejected');
 
-const runOk = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'fixture task', cwd: tempDir() } });
+const runOk = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'fixture task', cwd: tempDir(), mode: 'yolo' } }); // CLI path: ZCODE_BIN is the fake CLI
 assertThat(/status: completed/.test(runOk.result.content[0].text) && /sess_fake123/.test(runOk.result.content[0].text), 'zcode_run happy path via fake binary');
 
 const unknown = await client.request('bogus/method', {});
@@ -128,6 +129,7 @@ const afterGarbage = await client.request('ping', {});
 assertThat(afterGarbage.result && Object.keys(afterGarbage.result).length === 0, 'server survives a non-JSON line');
 
 await client.close();
+rmSync(jobsHome, { recursive: true, force: true });
 
 // --- e2e mode: real ZCode binary, real task ---
 if (e2e) {

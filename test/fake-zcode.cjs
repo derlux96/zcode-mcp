@@ -3,7 +3,7 @@ const args = process.argv.slice(2);
 const mode = process.env.FAKE_ZCODE_MODE || 'ok';
 
 if (args.includes('version')) {
-  console.log('zcode 0.16.9 (fake)');
+  console.log(`zcode ${process.env.FAKE_ZCODE_VERSION || '0.16.9'} (fake)`);
   process.exit(0);
 }
 if (args.includes('doctor')) {
@@ -63,6 +63,10 @@ if (mode === 'hang') {
   const gc = spawn('sleep', ['60'], { stdio: 'ignore' });
   process.stderr.write(`grandchild pid ${gc.pid}\n`);
   setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'write-hang') {
+  // Leaves a partial change in cwd, then works forever (cancel tests).
+  require('node:fs').writeFileSync('partial.txt', 'partial\n');
+  setInterval(() => {}, 1000);
 } else if (mode === 'slow-start') {
   setTimeout(() => {
     console.log(JSON.stringify({ result: 'slow start done', session: { id: 'sess_slow001' } }));

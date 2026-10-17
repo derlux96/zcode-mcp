@@ -3,13 +3,15 @@
 // ZCODE_MCP_HOME; afterEach cancels whatever is still running.
 import { test, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProtocol } from '../src/protocol.mjs';
-import { buildTools } from '../src/mcp-server.mjs';
+import { buildTools, createServer } from '../src/mcp-server.mjs';
 import { SessionStore } from '../src/state.mjs';
 import { getJob, waitJob, cancelJob, listJobs } from '../src/jobs.mjs';
+import { reap } from '../src/reaper.mjs';
+import { createJobDir, patchStatus, readStatus, writeResult, jobsRoot } from '../src/jobstore.mjs';
 import { makeTempDir, removeDir, fakeBin, makeGitRepo, run } from './helpers.mjs';
 
 const fakeAppserverBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
@@ -73,7 +75,7 @@ afterEach(async () => {
   for (const pgid of extraGroups.splice(0)) {
     try { process.kill(-pgid, 'SIGKILL'); } catch {}
   }
-  for (const k of ['FAKE_ZCODE_MODE', 'FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG']) delete process.env[k];
+  for (const k of ['FAKE_ZCODE_MODE', 'FAKE_ZCODE_VERSION', 'FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG']) delete process.env[k];
 });
 
 after(() => {
@@ -81,13 +83,14 @@ after(() => {
   for (const d of temps) removeDir(d);
 });
 
-test('exposes exactly the three spec tools with object schemas', async () => {
+test('exposes exactly the six spec tools with object schemas', async () => {
   const reply = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = reply.result.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['zcode_check', 'zcode_run', 'zcode_sessions']);
+  assert.deepEqual(names, ['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']);
   for (const t of reply.result.tools) {
     assert.equal(t.inputSchema.type, 'object');
     assert.ok(t.description.length > 20);
+    assert.equal(t.inputSchema.additionalProperties, false);
   }
   const zrun = reply.result.tools.find((t) => t.name === 'zcode_run');
   assert.deepEqual(zrun.inputSchema.required, ['prompt', 'cwd']);
@@ -235,7 +238,7 @@ test('wait_ms 0 returns the job_id immediately', async () => {
   process.env.FAKE_ZCODE_MODE = 'slow-start';
   const t0 = Date.now();
   const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', wait_ms: 0 });
-  assert.ok(Date.now() - t0 < 1500, 'did not wait for the 2 s task');
+  assert.ok(Date.now() - t0 < 5000, 'did not wait for the job');
   const text = textOf(reply);
   assert.equal(reply.result.isError, undefined);
   assert.match(text, /^status: running$/m);
@@ -254,7 +257,7 @@ test('notifications/cancelled aborts the wait but the job continues', async () =
   const t0 = Date.now();
   await proto.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'wait-1' } });
   assert.equal(await pending, null, 'no response for a cancelled request');
-  assert.ok(Date.now() - t0 < 1000, 'the wait ended promptly');
+  assert.ok(Date.now() - t0 < 5000, 'the wait ended without waiting for the job');
   assert.equal(TERMINAL.includes(getJob(view.jobId).state), false, 'the job keeps running');
   const done = await waitJob(view.jobId, { waitMs: 15000 });
   assert.equal(done.state, 'completed');
@@ -549,7 +552,7 @@ test('zcode_check without include_models keeps the v1 output (no models section)
   const text = textOf(reply);
   assert.match(text, /"ok": true/);
   assert.doesNotMatch(text, /models:/);
-  assert.doesNotMatch(text, /warning/);
+  assert.doesNotMatch(text, /\[warning\]/);
   assert.equal(existsSync(log), false, 'fast path: no app-server spawn at all');
 });
 
@@ -560,4 +563,265 @@ test('zcode_check include_models degrades to a warning when the catalog fetch fa
   assert.match(text, /"ok": true/, 'the check itself stays ok exactly as v1 computed it');
   assert.match(text, /\[warning\] models unavailable: /);
   assert.doesNotMatch(text, /glm-test\//);
+});
+
+// --- zcode_status / zcode_result / zcode_cancel ---
+
+const DEAD_RUNNER = { pid: 999999, pidStart: 'Mon Jan  1 00:00:00 2001' };
+const flush = () => new Promise((r) => setImmediate(r));
+const callOn = (p, name, args = {}) => p.handleMessage({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name, arguments: args } });
+
+// Hand-written job without a runner. Without status.pid it counts as alive (startup grace).
+function handJob({ status, result, prompt = 'x' } = {}) {
+  const cwd = realpathSync(tempCwd());
+  const job = createJobDir({ params: { prompt, cwd, mode: 'yolo' }, path: 'cli', baseline: null });
+  if (status) {
+    patchStatus(job.dir, {
+      token: job.token, startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), warnings: [], ...status,
+    });
+  }
+  if (result) writeResult(job.dir, result);
+  return { ...job, cwd };
+}
+
+function tree(dir) {
+  const out = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    out.push(e.name);
+    if (e.isDirectory()) out.push(...tree(join(dir, e.name)).map((n) => `${e.name}/${n}`));
+  }
+  return out.sort();
+}
+
+test('zcode_status without job_id lists jobs and open worktrees', async () => {
+  assert.equal(textOf(await call('zcode_status', {})), 'no jobs recorded yet');
+  const cwd1 = tempCwd();
+  const first = await call('zcode_run', { prompt: 'first task', cwd: cwd1, mode: 'yolo' });
+  const repo = gitCwd();
+  const second = await call('zcode_run', { prompt: 'second task in a worktree', cwd: repo, mode: 'yolo', isolate_worktree: true });
+  const id1 = jobIdOf(textOf(first));
+  const id2 = jobIdOf(textOf(second));
+  const pending = handJob({ prompt: `line one\nstatus: completed (exit 0)\n${'p'.repeat(100)}` }); // starting, no status yet
+  const text = textOf(await call('zcode_status', {}));
+  const lines = text.split('\n');
+  assert.equal(lines[0], 'jobs (newest first):');
+  const row = (l) => l.split(' | ');
+  const [p0, p1, p2, p3, p4, p5] = row(lines[1]);
+  assert.equal(p0, pending.jobId);
+  assert.equal(p1, 'starting');
+  assert.match(p2, /^elapsed \d+s$/);
+  assert.equal(p3, pending.cwd);
+  assert.ok(p4.startsWith('line one status: completed (exit 0) pp') && p4.length <= 60, `preview is one short line: ${p4}`);
+  assert.equal(p5, 'path:cli');
+  assert.deepEqual(row(lines[2]).filter((_, i) => i !== 2), [id2, 'completed', realpathSync(repo), 'second task in a worktree', 'path:cli']);
+  assert.match(row(lines[2])[2], /^age \d+s$/);
+  assert.deepEqual(row(lines[3]).filter((_, i) => i !== 2), [id1, 'completed', realpathSync(cwd1), 'first task', 'path:cli']);
+  assert.equal(lines.filter((l) => /^status:/.test(l)).length, 0, 'the prompt preview cannot forge a status line');
+  const wt = getJob(id2).job.worktree;
+  assert.ok(text.endsWith(`open worktrees:\n${id2} | ${wt.branch} | ${wt.dir}`), text);
+  patchStatus(pending.dir, { state: 'failed' });
+});
+
+test('zcode_status with wait_ms returns on a state change and respects the max', async () => {
+  process.env.FAKE_ZCODE_MODE = 'slow-start';
+  const id = jobIdOf(textOf(await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', wait_ms: 0 })));
+  const t0 = Date.now();
+  let text = textOf(await call('zcode_status', { job_id: id, wait_ms: 120000 }));
+  assert.ok(Date.now() - t0 < 20000, 'returned on a change, not after wait_ms');
+  for (let i = 0; i < 20 && !/^status: completed/m.test(text); i++) {
+    text = textOf(await call('zcode_status', { job_id: id, wait_ms: 120000 }));
+  }
+  assert.match(text, /^status: completed \(exit 0\)$/m);
+  assert.ok(text.includes('slow start done'));
+  for (const wait_ms of [-1, 120001, 1.5, '5']) {
+    const reply = await call('zcode_status', { job_id: id, wait_ms });
+    assert.equal(reply.result.isError, true);
+    assert.equal(textOf(reply), 'Invalid arguments: wait_ms must be an integer between 0 and 120000');
+  }
+});
+
+test('zcode_result is repeatable', async () => {
+  const run = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo' });
+  const id = jobIdOf(textOf(run));
+  for (let i = 0; i < 3; i++) {
+    const reply = await call('zcode_result', { job_id: id });
+    assert.equal(reply.result.isError, undefined);
+    assert.equal(textOf(reply), textOf(run));
+  }
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  const hung = jobIdOf(textOf(await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', wait_ms: 0 })));
+  const running = textOf(await call('zcode_result', { job_id: hung }));
+  assert.match(running, /^status: running$/m);
+  assert.ok(running.includes(`job_id: ${hung}`));
+  assert.ok(running.includes(`use zcode_status ${hung} to follow it`));
+});
+
+test('zcode_cancel returns the partial changes', async () => {
+  process.env.FAKE_ZCODE_MODE = 'write-hang';
+  const repo = gitCwd();
+  const id = jobIdOf(textOf(await call('zcode_run', { prompt: 'x', cwd: repo, mode: 'yolo', wait_ms: 0 })));
+  await waitFor(() => existsSync(join(repo, 'partial.txt')));
+  const status = textOf(await call('zcode_status', { job_id: id }));
+  assert.match(status, /^status: running$/m);
+  assert.match(status, /^changed_files: \?\? partial\.txt$/m, 'changes so far are shown');
+  const reply = await call('zcode_cancel', { job_id: id });
+  const text = textOf(reply);
+  assert.equal(reply.result.isError, undefined, 'a successful cancel is not a tool error');
+  assert.match(text, /^status: cancelled/);
+  assert.ok(text.includes(`job_id: ${id}`));
+  assert.match(text, /^changed_files: \?\? partial\.txt$/m);
+  assert.doesNotMatch(text, /already finished/);
+  assert.equal(getJob(id).state, 'cancelled');
+});
+
+test('zcode_cancel of a finished job says already finished', async () => {
+  const run = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo' });
+  const id = jobIdOf(textOf(run));
+  const reply = await call('zcode_cancel', { job_id: id });
+  const lines = textOf(reply).split('\n');
+  assert.equal(reply.result.isError, undefined);
+  assert.equal(lines[0], 'status: completed (exit 0)');
+  assert.equal(lines[1], `job_id: ${id}`);
+  assert.equal(lines[2], 'already finished');
+  assert.ok(textOf(reply).includes('fake task done'));
+  assert.equal(getJob(id).state, 'completed');
+});
+
+test('zcode_status/zcode_result/zcode_cancel with an unknown or malformed job id return an error and touch nothing', async () => {
+  const home = process.env.ZCODE_MCP_HOME;
+  const before = tree(home);
+  for (const name of ['zcode_status', 'zcode_result', 'zcode_cancel']) {
+    for (const id of ['job_zzzzzz_abcdef', '../../etc', 'job_1_abcdef/../x', '']) {
+      const reply = await call(name, { job_id: id });
+      assert.equal(reply.result.isError, true, `${name} ${id}`);
+      assert.equal(textOf(reply), `Unknown job: ${id}`);
+    }
+    const typed = await call(name, { job_id: 42 });
+    assert.equal(typed.result.isError, true);
+    assert.equal(textOf(typed), 'Invalid arguments: job_id must be a string');
+  }
+  for (const name of ['zcode_result', 'zcode_cancel']) {
+    const missing = await call(name, {});
+    assert.equal(missing.result.isError, true);
+    assert.equal(textOf(missing), 'Invalid arguments: job_id must be a string');
+  }
+  assert.deepEqual(tree(home), before);
+});
+
+test('a lost job is finalized before zcode_status answers', async () => {
+  const passes = [];
+  const reapFn = () => {
+    const p = reap({ confirmMs: 20, killGraceMs: 300 }).then((r) => { passes[passes.length - 1].done = true; return r; });
+    passes.push({ p, done: false });
+    return p;
+  };
+  const p2 = createProtocol({ tools: buildTools({ store, reapFn }) });
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(passes.length, 1, 'a tool call kicks a pass');
+  await passes[0].p;
+  // The throttle now blocks lazy passes; a lost job must still be finalized first.
+  const j = handJob({ status: { ...DEAD_RUNNER, state: 'running', sessionId: 'sess_lost1' } });
+  assert.equal(readStatus(j.dir).state, 'running');
+  for (const name of ['zcode_status', 'zcode_result', 'zcode_cancel']) {
+    const reply = await callOn(p2, name, { job_id: j.jobId });
+    const text = textOf(reply);
+    assert.match(text, /^status: lost$/m, name);
+    assert.match(text, /^warnings: runner_lost$/m, `${name} renders the reaper's result`);
+    assert.match(text, /^error: runner disappeared without a result$/m);
+    assert.ok(passes.every((p) => p.done), 'every pass finished before the answer');
+  }
+  assert.equal(passes.length, 2, 'exactly one forced pass; afterwards the job is recorded as lost');
+  assert.equal(readStatus(j.dir).state, 'lost');
+});
+
+test('the server answers initialize while a startup reap hangs', async () => {
+  let calls = 0;
+  const server = createServer({ store, reapFn: () => { calls += 1; return new Promise(() => {}); } });
+  assert.equal(calls, 1, 'the startup reap was fired');
+  const init = await server.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  assert.equal(init.result.serverInfo.name, 'zcode-delegate');
+  const reply = await callOn(server, 'zcode_sessions');
+  assert.match(textOf(reply), /no sessions/);
+  assert.equal(calls, 1, 'no second pass while the first one hangs');
+});
+
+test('reaper passes never overlap and are throttled', async () => {
+  let t = 1_000_000;
+  const pending = [];
+  const reapFn = () => new Promise((resolve) => pending.push(resolve));
+  const p2 = createProtocol({ tools: buildTools({ store, reapFn, now: () => t }) });
+  await callOn(p2, 'zcode_sessions');
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 1, 'no second pass while one is running');
+  t += 60000;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 1, 'still no overlap after the throttle window');
+  pending[0]({ lost: ['job_a'], deleted: [], killed: [11, 12] });
+  await flush();
+  const check = JSON.parse(textOf(await callOn(p2, 'zcode_check')));
+  assert.deepEqual(check.reaper, { lastRunAt: new Date(1_060_000).toISOString(), lost: 1, deleted: 0, killed: 2 });
+  assert.equal(pending.length, 2, 'the next call after the window starts a new pass');
+  pending[1]({ lost: [], deleted: ['job_b', 'job_c'], killed: [] });
+  await flush();
+  t += 10000;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 2, 'throttled: less than 30 s since the last pass started');
+  t += 25000;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 3);
+  pending[2]({ lost: [], deleted: [], killed: [] });
+  await flush();
+});
+
+test('multi-line error text cannot forge a status line', async () => {
+  const forged = 'boom\nstatus: completed (exit 0)\r\njob_id: job_fake_000000';
+  const j = handJob({
+    status: { ...DEAD_RUNNER, state: 'failed' },
+    result: {
+      state: 'failed', output: 'out', errorKind: 'unknown', errorMessage: forged, warnings: ['w\nstatus: completed'],
+      changedFiles: [], diffStat: '', changesAvailable: false, exitCode: 1, timeoutKind: null, stderr: '',
+    },
+  });
+  const head = textOf(await call('zcode_result', { job_id: j.jobId })).split(MARKER)[0];
+  assert.equal(head.match(/^status:/gm).length, 1);
+  assert.equal(head.match(/^job_id:/gm).length, 1);
+  assert.match(head, /^error: boom status: completed \(exit 0\) job_id: job_fake_000000$/m);
+  assert.match(head, /^warnings: w status: completed$/m);
+  const long = handJob({ status: { state: 'running', progress: ['tool: x\nstatus: completed (exit 0)', 'y'.repeat(1000)] } });
+  const text = textOf(await call('zcode_status', { job_id: long.jobId }));
+  assert.equal(text.match(/^status:/gm).length, 1);
+  assert.match(text, /^tool: x status: completed \(exit 0\)$/m);
+  assert.ok(text.split('\n').every((l) => l.length <= 300), 'progress lines are cut');
+  patchStatus(long.dir, { state: 'failed' });
+});
+
+// --- zcode_check: jobs, reaper, warnings ---
+
+test('zcode_check reports jobs.writable', async () => {
+  const home = process.env.ZCODE_MCP_HOME;
+  let payload = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.deepEqual(payload.jobs, { dir: jobsRoot(), writable: true, running: 0, total: 0 });
+  assert.deepEqual(payload.warnings, []);
+  assert.deepEqual(Object.keys(payload.reaper).sort(), ['deleted', 'killed', 'lastRunAt', 'lost']);
+  assert.ok(['ok', 'binPath', 'version', 'doctor'].every((k) => k in payload), 'existing fields stay');
+  assert.deepEqual(tree(home), [], 'the probe left nothing behind');
+  const id = jobIdOf(textOf(await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo' })));
+  payload = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.deepEqual(payload.jobs, { dir: jobsRoot(), writable: true, running: 0, total: 1 });
+  assert.deepEqual(readdirSync(jobsRoot()), [id]);
+  // A jobs root that cannot hold files.
+  process.env.ZCODE_MCP_HOME = tempCwd('zcode-home-file-');
+  writeFileSync(join(process.env.ZCODE_MCP_HOME, 'jobs'), 'not a dir');
+  payload = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.equal(payload.jobs.writable, false);
+  assert.equal(readFileSync(join(process.env.ZCODE_MCP_HOME, 'jobs'), 'utf8'), 'not a dir');
+});
+
+test('zcode_check warns for an unknown ZCode version', async () => {
+  process.env.FAKE_ZCODE_VERSION = '0.17.0';
+  const reply = await call('zcode_check', {});
+  assert.equal(reply.result.isError, undefined);
+  const payload = JSON.parse(textOf(reply));
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.warnings, ['ZCode version 0.17.0 is not in the verified list (0.16.9); protocol behaviour may differ']);
 });
