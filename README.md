@@ -81,7 +81,10 @@ be misled; parse the header by `\n` only.
 file in a git repo: ZCode did nothing), `stalled` (heartbeat late), `runner_lost`,
 `recovered_from_lost` (the reaper had recorded `lost`, then the runner delivered its own
 result, which replaced it), `cancelled_by_manager`, `idle_detection_unavailable`,
-`leftover_processes_killed` (ZCode left background processes; they were stopped).
+`leftover_processes_killed` (ZCode left background processes; they were stopped),
+`shared_repo` (another job was still running in the same git repository when this one ended,
+e.g. in a sibling subdirectory: locks are per directory but changes are reported per repository,
+so the listed changes may include that job's edits).
 A `cancelled` state written by `zcode_cancel` is final: a runner finishing later never
 overwrites it.
 

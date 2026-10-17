@@ -8,11 +8,12 @@
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readJson, readStatus, patchStatus, writeResult, TERMINAL_STATES } from './jobstore.mjs';
+import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES } from './jobstore.mjs';
 import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
 import { classifyError } from './errorkind.mjs';
 import { releaseCwdLock } from './locks.mjs';
+import { isJobAlive } from './jobs.mjs';
 import { runZCodeTask, OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, worktreeSummary } from './runner.mjs';
 import { runTaskWithModel, resolveBin } from './appserver.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
@@ -132,6 +133,18 @@ function protocolOutcome(res, err, params) {
     return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
   }
   return { state: 'completed', errorKind: null, errorMessage: null, timeoutKind: null };
+}
+
+// Locks are per directory, change reporting is per repository: another live job in
+// the same repository (e.g. a sibling subdirectory) may have made some of the changes.
+function sharesRepoWithLiveJob(job, dir) {
+  const root = job.baseline && job.baseline.gitRoot;
+  if (!root) return false;
+  return listJobDirs().some((other) => {
+    if (other === dir) return false;
+    const o = readJson(join(other, 'job.json'));
+    return !!o && o.baseline && o.baseline.gitRoot === root && isJobAlive(other);
+  });
 }
 
 async function collectChanges(job, params) {
@@ -405,6 +418,9 @@ export async function runJob(dir, opts = {}) {
     if (state === 'completed' && changes.available && changes.changedFiles.length === 0 && params.mode !== 'plan') {
       warn('no_changes');
     }
+    try {
+      if (changes.available && sharesRepoWithLiveJob(job, dir)) warn('shared_repo');
+    } catch { /* best effort */ }
 
     try {
       new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()).append({

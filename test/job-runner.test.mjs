@@ -528,3 +528,32 @@ test('a reaper-set lost state is replaced by the runner result with recovered_fr
   assert.equal(st.state, 'completed');
   assert.ok(st.warnings.includes('recovered_from_lost'));
 });
+
+// I7: locks are per cwd, change reporting is per repository.
+test('a job ending while another live job shares its repository warns shared_repo', async () => {
+  const repo = gitCwd();
+  const subA = join(repo, 'a');
+  const subB = join(repo, 'b');
+  for (const d of [subA, subB]) execFileSync('mkdir', ['-p', d]);
+  const a = mkJob({ cwd: subA }, { baseline: captureBaseline(subA), lockCwd: subA });
+  const { exited } = spawnRunner(a.dir, a.token, { FAKE_ZCODE_MODE: 'hang' });
+  try {
+    await waitFor(() => (readStatus(a.dir)?.state === 'running' ? readStatus(a.dir) : null));
+    const b = mkJob({ cwd: subB }, { baseline: captureBaseline(subB), lockCwd: subB });
+    await runJob(b.dir);
+    const res = readResult(b.dir);
+    assert.equal(res.state, 'completed');
+    assert.ok(res.warnings.includes('shared_repo'), JSON.stringify(res.warnings));
+    assert.ok(res.warnings.includes('no_changes'), 'no_changes is computed as before');
+    // A job in another repository is not affected.
+    const other = gitCwd();
+    const c = mkJob({ cwd: other }, { baseline: captureBaseline(other) });
+    await runJob(c.dir);
+    assert.deepEqual(readResult(c.dir).warnings, ['no_changes']);
+  } finally {
+    writeFileSync(join(a.dir, 'cancel'), '');
+    await exited;
+  }
+  assert.equal(readStatus(a.dir).state, 'cancelled');
+  assert.equal(readResult(a.dir).warnings.includes('shared_repo'), false, 'the other job had already ended');
+});
