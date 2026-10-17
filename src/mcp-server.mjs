@@ -8,7 +8,7 @@ import { createProtocol, PARSE_ERROR } from './protocol.mjs';
 import { discoverZCode, ZCodeNotFoundError } from './discover.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { getModelCatalog, resolveBin } from './appserver.mjs';
-import { runZCodeArgs, MODES, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS, OUTPUT_CAP } from './runner.mjs';
+import { runZCodeArgs, MODES, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_TRANSIENT_RETRIES, OUTPUT_CAP } from './runner.mjs';
 import { startJob, waitJob, getJob, cancelJob, listJobs, collectChanges, formatCatalog, REASONING_LEVELS } from './jobs.mjs';
 import { TERMINAL_STATES, jobsRoot } from './jobstore.mjs';
 import { reap } from './reaper.mjs';
@@ -81,6 +81,12 @@ const toolSchemas = {
           type: 'string',
           enum: REASONING_LEVELS,
           description: 'Reasoning effort for the model; protocol path only. Default high. A level the model does not offer is replaced by its catalog default and noted in the result.',
+        },
+        max_transient_retries: {
+          type: 'integer',
+          minimum: 0,
+          maximum: MAX_TRANSIENT_RETRIES,
+          description: `Protocol path only: how often a turn that failed with a temporary provider error (HTTP 429/5xx, overload, rate limit, network) is continued in the same session after a wait (30 s, 60 s, 2, 5, 10, 15 min, ±10 %; a numeric retry-after is honoured). Default 6, max ${MAX_TRANSIENT_RETRIES}, 0 disables it. Auth, model and configuration errors are never retried. Waits count against timeout_ms. Rejected on the CLI path, which cannot continue a session (rerun with resume instead).`,
         },
       },
       required: ['prompt', 'cwd'],
@@ -378,6 +384,20 @@ function noticeLines(warnings, job) {
     .map((m) => `[notice] reasoning_level ${m[1]} not offered by ${by}; using ${m[2]} instead`);
 }
 
+// status.retry (a backoff after a transient provider error) as one line, or null.
+function retryingLine(retry) {
+  if (!retry || typeof retry !== 'object') return null;
+  const next = Date.parse(retry.nextAt);
+  const left = Number.isFinite(next) ? `${seconds(next - Date.now())}s` : '?';
+  return oneLine(`retrying: attempt ${Number(retry.attempt)}/${Number(retry.maxRetries)} in ${left} (${retry.reason ?? ''})`);
+}
+
+// result.retries / retryOutcome as one line, or null when nothing was retried.
+function retriesLine(r) {
+  const n = Array.isArray(r.retries) ? r.retries.length : 0;
+  return n ? oneLine(`retries: ${n} (${r.retryOutcome || 'unknown'})`) : null;
+}
+
 // notes: extra lines after job_id (zcode_cancel's "already finished", the stale-reaper note).
 async function terminalResult(view, { notes = [] } = {}) {
   const { r, logOnly } = await resultOrFallback(view);
@@ -390,6 +410,8 @@ async function terminalResult(view, { notes = [] } = {}) {
   if (r.errorKind) lines.push(`error_kind: ${oneLine(r.errorKind)}`);
   if (r.errorMessage) lines.push(`error: ${oneLine(r.errorMessage)}`);
   lines.push(...loginHint(r));
+  const retries = retriesLine(r);
+  if (retries) lines.push(retries);
   if (view.state === 'timeout' && (r.timeoutKind === 'idle' || r.timeoutKind === 'total')) {
     lines.push(`timeout: ${r.timeoutKind}`);
   }
@@ -413,6 +435,8 @@ function runningResult(view, changes) {
   if (Number.isFinite(started)) lines.push(`elapsed: ${seconds(Date.now() - started)}s`);
   const activity = Date.parse(s.lastActivityAt);
   if (Number.isFinite(activity)) lines.push(`last_activity: ${seconds(Date.now() - activity)}s ago`);
+  const retrying = retryingLine(s.retry);
+  if (retrying) lines.push(retrying);
   if (view.warnings.length) lines.push(`warnings: ${oneLine(view.warnings.join(', '))}`);
   if (changes) lines.push(`changed_files: ${changes.available ? fileList(changes.changedFiles) : '(unavailable)'}`);
   if (Array.isArray(s.progress) && s.progress.length) lines.push('progress:', ...s.progress.map((l) => oneLine(l)));
