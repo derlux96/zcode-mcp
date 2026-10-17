@@ -17,7 +17,12 @@ Also read its other fields:
   before starting), `running` (jobs still in progress; at most 3 run at once).
 - `warnings`: e.g. a ZCode version that is not in the verified list. Not an error, but expect
   protocol differences and verify results more carefully.
+- `providers`: the personal provider config, checked statically; a warning such as
+  `baseUrl "…/v4." ends with "."` is a config typo the user must fix before jobs can work.
 - `include_models: true` adds the model catalog (see 4).
+- `probe_model: true` sends one tiny real model request (costs one request, never retried) and
+  reports `modelProbe`; use it when the first job on a machine matters or a job failed with an
+  unclear `model`/`auth` error. `modelProbe.ok: false` with `errorKind` tells you why.
 
 ## 2. Jobs: the workflow
 
@@ -57,12 +62,20 @@ below your client's request timeout (60 s in many MCP clients):
 | Continue an earlier ZCode conversation | `resume: "sess_…"` (CLI) |
 
 **Timeouts.** `timeout_ms` (default and max 6 h) is the hard total cap on the CLI path. On the
-protocol path it bounds the wait for the turn to finish; start-up (up to ~30 s per request,
-retried once) comes on top, so expect a few minutes of overrun at most. On the protocol
+protocol path it is a deadline for the whole task from the first message; only the app-server
+start-up before it (up to ~30 s per request, retried once) comes on top. On the protocol
 path `idle_timeout_ms` (default 10 min) aborts a job that shows no protocol progress — long but
 active tasks keep running. The CLI path prints nothing until the end, so it has no idle timeout;
 use `timeout_ms` there. A result with `timeout: idle` or `timeout: total` lists the files changed
 so far (unverified work on disk).
+
+**Temporary provider errors** (HTTP 429/5xx, overload, rate limit, network) do not end a protocol
+job: it waits (30 s, 60 s, 2, 5, 10, 15 min) and continues in the same session, up to
+`max_transient_retries` times (default 6, `0` disables; CLI path: not available — continue with
+`resume`). Meanwhile it stays `status: running` with a `retrying: attempt k/N in Ns (…)` line: keep
+following it with `zcode_status`, do not cancel or restart it. The result says
+`retries: N (recovered)` (warning `recovered_after_transient_errors:N`) or `retries: N (exhausted)`
+(then `status: failed` with the real error). Auth, model and configuration errors are never retried.
 
 `timeout_ms: 0` removes the total cap: use it for big tasks that must never be cut off by the clock. The job then ends by itself, by the idle timeout (protocol path) or when you call `zcode_cancel`; on the CLI path nothing detects a hung ZCode in that case, so prefer the protocol path for `0`.
 
@@ -89,8 +102,9 @@ Good: "In src/auth/login.ts the session cookie is not refreshed on rotation. Fix
 1. Read the `status:` line. Only `completed` is success; `failed`, `timeout`, `cancelled` and
    `lost` (the job runner died) are not.
 2. `error_kind:` says why it failed:
-   `auth` (ZCode login/API key — tell the user, do not retry), `quota` (rate limit or balance —
-   wait, do not retry in a loop), `network`, `model` (model unavailable — pick another `model`),
+   `auth` (ZCode login/API key — tell the user, do not retry), `quota` (rate limit or balance;
+   on the protocol path the job already waited and retried — see `retries:` — so do not retry in
+   a loop), `network`, `model` (model unavailable — pick another `model`),
    `timeout_idle` / `timeout_total`, `cancelled`, `crash` (ZCode or the runner died), `unknown`.
 3. `warnings:` — `no_changes` means ZCode completed **without changing any file** (in a git repo):
    for a task that should edit files, treat it as "ZCode did nothing", not as success.

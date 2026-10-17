@@ -49,9 +49,18 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 - `yolo` and the protocol path can write outside `cwd`; nothing prevents it. `isolate_worktree` only
   keeps the job's in-repo edits off the user's working tree (separate branch/worktree), it does not
   stop writes outside the cwd; worktrees are never removed automatically.
-- `timeout_ms` is a hard total cap only on the CLI path. On the protocol path it bounds the wait for
-  the turn; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few
-  minutes of overrun are possible.
+- `timeout_ms` on the protocol path is now a deadline for the whole task from the first
+  `session/send` (transient-error backoffs and continues included; fixed on `feature/transient-retry`).
+  Only the app-server start-up before that first send (up to ~30 s per request, retried once)
+  still comes on top.
+- Temporary provider errors are continued in the same session only on the protocol path; the CLI
+  path has no continue (rerun with `resume` manually), and `max_transient_retries` is rejected there.
+- Z.ai's `[1113] Insufficient balance or no resource package` (HTTP 429) is retried like any 429:
+  for a real balance problem that costs up to the full schedule (~33.5 min of waiting with the defaults, bounded
+  by `timeout_ms`) before the real message is reported.
+- Continuing a session after `turn.failed` is verified against the fake app-server only; whether
+  the real app-server keeps every failed turn's session usable for `session/send` was not run
+  against the real binary on this branch.
 - The `sess_` id is lost when a protocol job times out or is cancelled silently after
   `session/create` (no event carried it yet): such a result is not resumable.
 - A `session/send` acknowledgement timeout is booked as `timeout_total` with a misleading message.
