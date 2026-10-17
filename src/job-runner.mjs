@@ -7,7 +7,7 @@ import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readJson, readStatus, patchStatus, writeResult, TERMINAL_STATES } from './jobstore.mjs';
-import { getProcessIdentity } from './procid.mjs';
+import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
 import { classifyError } from './errorkind.mjs';
 import { releaseCwdLock } from './locks.mjs';
@@ -18,6 +18,21 @@ import { discoverZCode } from './discover.mjs';
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
 const ACTIVITY_WRITE_MS = 1000;
+
+// Process group of the ZCode child while it runs (null before spawn / after exit).
+// A fatal error in the runner kills this group before the lock is released.
+let activeChildPgid = null;
+
+export function killActiveChild() {
+  const pgid = activeChildPgid;
+  activeChildPgid = null;
+  if (!Number.isInteger(pgid) || pgid <= 1) return false; // no child yet: nothing to kill
+  try {
+    return signalGroup(pgid, 'SIGKILL');
+  } catch {
+    return false;
+  }
+}
 
 const now = () => new Date().toISOString();
 
@@ -154,6 +169,7 @@ export async function runJob(dir, opts = {}) {
       signal: ctl.signal,
       killGroup: true,
       onSpawn: (child) => {
+        activeChildPgid = child.pid;
         const id = getProcessIdentity(child.pid);
         const t = now();
         try {
@@ -180,6 +196,7 @@ export async function runJob(dir, opts = {}) {
         }
       },
     });
+    activeChildPgid = null;
     clearInterval(heartbeat);
     clearInterval(cancelPoll);
 
@@ -254,6 +271,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const onFatal = (err) => {
     if (crashing) process.exit(1);
     crashing = true;
+    try { killActiveChild(); } catch { /* proceed to the crash state */ }
     try {
       writeCrashState(dir, job, err, { startedMs: Date.parse(readStatus(dir)?.startedAt) });
     } catch {
@@ -264,6 +282,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   process.on('uncaughtException', onFatal);
   process.on('unhandledRejection', onFatal);
   const hb = Number(process.env.ZCODE_MCP_HEARTBEAT_MS);
-  runJob(dir, { heartbeatMs: Number.isFinite(hb) && hb > 0 ? hb : undefined, signal: early.signal })
+  // TEST ONLY (never set in production): throw an uncaught error <ms> after ZCode spawned.
+  const fatalAfter = Number(process.env.ZCODE_MCP_TEST_FATAL_AFTER_SPAWN);
+  const onStatus = fatalAfter > 0
+    ? (_s, patch) => {
+      if (patch.state === 'running') setTimeout(() => { throw new Error('test fatal after spawn'); }, fatalAfter);
+    }
+    : undefined;
+  runJob(dir, { heartbeatMs: Number.isFinite(hb) && hb > 0 ? hb : undefined, signal: early.signal, onStatus })
     .then(() => process.exit(0), onFatal);
 }

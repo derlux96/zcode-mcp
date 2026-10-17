@@ -395,3 +395,38 @@ test('output.log holds the full stdout while result.output stays capped', async 
   assert.equal(log, 'x'.repeat(500000) + '\n');
   assert.equal(statSync(res.outputLogPath).mode & 0o777, 0o600);
 });
+
+test('a fatal runner error kills ZCode\'s group before releasing the lock', async () => {
+  const cwd = tempCwd();
+  const { dir, token, jobId } = mkJob({ cwd }, { lockCwd: cwd });
+  assert.equal(acquireCwdLock(cwd, jobId, () => true).ok, true);
+  const lockFile = join(stateHome(), 'locks', `${lockKey(cwd)}.lock`);
+  const { child, exited } = spawnRunner(dir, token, {
+    FAKE_ZCODE_MODE: 'spawn-grandchild', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1500',
+  });
+  let members = [];
+  try {
+    const st = await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+    members = await waitFor(() => {
+      try {
+        const pids = execFileSync('pgrep', ['-g', String(st.childPgid)], { encoding: 'utf8' })
+          .trim().split('\n').map(Number);
+        return pids.length >= 2 ? pids : null;
+      } catch { return null; }
+    });
+    assert.equal(readStatus(dir).state, 'running', 'group observed before the fatal error');
+    const { code } = await exited;
+    assert.equal(code, 1);
+    const res = readResult(dir);
+    assert.equal(res.state, 'failed');
+    assert.equal(res.errorKind, 'crash');
+    assert.match(res.errorMessage, /test fatal after spawn/);
+    assert.equal(readStatus(dir).state, 'failed');
+    assert.equal(existsSync(lockFile), false);
+    assert.ok(members.includes(st.childPid));
+    for (const pid of members) await waitFor(() => !alive(pid), 2000);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    for (const pid of members) { try { process.kill(pid, 'SIGKILL'); } catch {} } // after the assertions
+  }
+});
