@@ -3,12 +3,21 @@ import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
+import { signalGroup, groupHasMembers } from './procid.mjs';
 
 export const OUTPUT_CAP = 100000;
-export const DEFAULT_TIMEOUT_MS = 600000;
+// timeout_ms is the absolute cap for a whole task (0 = no cap at all);
+// idle_timeout_ms aborts only when ZCode has been silent that long, so long but
+// active tasks keep running.
+export const DEFAULT_TIMEOUT_MS = 21600000; // 6 h
+export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
-export const MAX_TIMEOUT_MS = 3600000;
+export const MAX_TIMEOUT_MS = 21600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
+export const LEFTOVER_GRACE_MS = 2000;
+// After ZCode exited and the group sweep ended, stdout/stderr may still be held open by a
+// leftover outside the group (setsid/daemonized): wait this long, then destroy the pipes.
+export const STDIO_GRACE_MS = 3000;
 
 const SESSION_RE = /sess_[A-Za-z0-9._-]+/;
 const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
@@ -41,8 +50,15 @@ export function validateRunArgs(args = {}) {
     return { ok: false, error: 'target must be a string' };
   }
   const timeoutMs = args.timeout_ms === undefined ? DEFAULT_TIMEOUT_MS : args.timeout_ms;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS) {
-    return { ok: false, error: `timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
+  // 0 = no total cap (the job ends by itself, by idle_timeout_ms on the protocol
+  // path, or by zcode_cancel).
+  if (!Number.isInteger(timeoutMs) || (timeoutMs !== 0 && (timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS))) {
+    return { ok: false, error: `timeout_ms must be 0 (no cap) or an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
+  }
+  // Optional here; the caller decides whether the path supports it (model mode).
+  const idleTimeoutMs = args.idle_timeout_ms;
+  if (idleTimeoutMs !== undefined && (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < MIN_TIMEOUT_MS || idleTimeoutMs > MAX_TIMEOUT_MS)) {
+    return { ok: false, error: `idle_timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
   }
   if (args.isolate_worktree !== undefined && typeof args.isolate_worktree !== 'boolean') {
     return { ok: false, error: 'isolate_worktree must be a boolean' };
@@ -56,6 +72,7 @@ export function validateRunArgs(args = {}) {
       resume: args.resume,
       target: args.target,
       timeoutMs,
+      idleTimeoutMs,
       isolateWorktree: args.isolate_worktree === true,
     },
   };
@@ -100,52 +117,163 @@ export function buildSpawnEnv(binPath) {
   return env;
 }
 
-export async function runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+// Idle detection only works on a stream that carries progress. The CLI path
+// (`--json`) writes nothing until the task ends, so it has no idle timer and
+// relies on the absolute timeout alone.
+// `signal` (AbortSignal) stops the child exactly like a timeout, reported as
+// timeoutKind 'cancelled'; `onSpawn(child)` is called once the child has a pid
+// (if it throws, the child is killed and the call rejects); `onStdout(chunk)`
+// sees every stdout chunk uncapped. `killGroup` runs the child in its own
+// process group (pgid = child.pid) and makes every stop signal the whole group,
+// so grandchildren die with it. With killGroup, members of that group still
+// alive when ZCode itself exits (background processes such as `npm run dev &`)
+// get SIGTERM, then SIGKILL after `leftoverGraceMs`; the result then carries
+// leftoverKilled: true. The group id cannot be reused while it has members.
+export async function runZCodeArgs(binPath, cliArgs, {
+  cwd, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs, signal, onSpawn, onStdout, killGroup = false,
+  leftoverGraceMs = LEFTOVER_GRACE_MS, stdioGraceMs = STDIO_GRACE_MS,
+}) {
   const isNodeScript = NODE_SCRIPT_RE.test(binPath);
   const env = buildSpawnEnv(binPath);
+  const opts = killGroup ? { cwd, env, detached: true } : { cwd, env };
   const child = isNodeScript
-    ? spawn(process.execPath, [binPath, ...cliArgs], { cwd, env })
-    : spawn(binPath, cliArgs, { cwd, env });
+    ? spawn(process.execPath, [binPath, ...cliArgs], opts)
+    : spawn(binPath, cliArgs, opts);
+  const kill = (sig) => {
+    if (killGroup && Number.isInteger(child.pid) && child.pid > 1) {
+      try {
+        signalGroup(child.pid, sig);
+        return;
+      } catch {
+        // fall back to the child alone
+      }
+    }
+    child.kill(sig);
+  };
+  if (onSpawn && child.pid !== undefined) {
+    try {
+      onSpawn(child);
+    } catch (err) {
+      kill('SIGKILL');
+      throw err;
+    }
+  }
 
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let timeoutKind = null; // 'total' | 'idle'
     let killTimer = null;
+    let idleTimer = null;
+    let exited = false; // ZCode itself is gone: its exit status stands, no stop may rewrite it
 
-    const timer = setTimeout(() => {
+    const stop = (kind) => {
+      if (timedOut || exited) return;
       timedOut = true;
-      child.kill('SIGTERM');
-      killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    }, timeoutMs);
+      timeoutKind = kind;
+      clearTimeout(idleTimer);
+      kill('SIGTERM');
+      killTimer = setTimeout(() => kill('SIGKILL'), 5000);
+    };
+    // Any output from ZCode counts as activity and restarts the idle timer.
+    const touch = () => {
+      if (!idleTimeoutMs || exited) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => stop('idle'), idleTimeoutMs);
+    };
+    // timeoutMs 0 = no total cap: arm nothing (a plain setTimeout(…, 0) would stop the run at once).
+    const timer = timeoutMs > 0 ? setTimeout(() => stop('total'), timeoutMs) : null;
+    touch();
+    const onAbort = () => stop('cancelled');
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    let pipeTimer = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (pipeTimer) clearTimeout(pipeTimer);
+      clearTimeout(idleTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
 
-    child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => { stderr += d; });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      stderr += `\n[zcode-delegate] failed to spawn: ${err.message}`;
-      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, sessionId: null });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => {
+      stdout += d;
+      touch();
+      if (onStdout) {
+        try { onStdout(d); } catch { /* observer errors must not break the run */ }
+      }
     });
-    child.on('close', (code) => {
+    child.stderr.on('data', (d) => { stderr += d; touch(); });
+    child.on('error', (err) => {
+      cleanup();
+      stderr += `\n[zcode-delegate] failed to spawn: ${err.message}`;
+      resolve({ stdout: cap(stdout), stderr: cap(stderr), code: null, timedOut, timeoutKind, sessionId: null, leftoverKilled: false });
+    });
+    // On 'exit' (not 'close'): a leftover that inherited stdout/stderr keeps the
+    // pipes open, so 'close' would only come once the sweep has ended it.
+    let exitCode = null;
+    let sweep = Promise.resolve(false);
+    child.on('exit', (code) => {
+      exitCode = code;
+      exited = true;
+      // The sweep can last a while: a cancel/idle/total timer firing in it must not
+      // report a ZCode that already exited as cancelled/timeout.
       clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
+      clearTimeout(idleTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (killGroup) sweep = sweepGroup(child.pid, leftoverGraceMs);
+      // A leftover that left the group and holds the pipes would delay 'close' until
+      // forever: after the sweep plus a bounded wait, destroy the streams and resolve
+      // with what was read.
+      sweep.then(() => {
+        pipeTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+        }, stdioGraceMs);
+      });
+    });
+    child.on('close', async (code) => {
+      const leftoverKilled = await sweep;
+      cleanup();
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
-        code,
+        code: code ?? exitCode,
         timedOut,
+        timeoutKind,
         sessionId: extractSessionId(stdout),
+        leftoverKilled,
       });
     });
   });
 }
 
-export async function runZCodeTask({ binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+// Ends what is left of the group `pgid` after its leader exited: SIGTERM, then
+// SIGKILL after graceMs. -> true when members were found.
+async function sweepGroup(pgid, graceMs) {
+  if (!Number.isInteger(pgid) || pgid <= 1 || !groupHasMembers(pgid)) return false;
+  try { signalGroup(pgid, 'SIGTERM'); } catch { /* EPERM: try SIGKILL below */ }
+  const end = Date.now() + graceMs;
+  while (groupHasMembers(pgid) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  if (groupHasMembers(pgid)) {
+    try { signalGroup(pgid, 'SIGKILL'); } catch { /* nothing more to do */ }
+  }
+  return true;
+}
+
+export async function runZCodeTask({
+  binPath, prompt, cwd, mode = 'yolo', resume, target, timeoutMs = DEFAULT_TIMEOUT_MS, idleTimeoutMs,
+  signal, onSpawn, onStdout, killGroup, leftoverGraceMs, stdioGraceMs,
+}) {
   const cliArgs = ['-p', prompt, '--cwd', cwd, '--mode', mode, '--json'];
   if (resume) cliArgs.push('--resume', resume);
   if (target) cliArgs.push('--target', target);
-  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs });
+  return runZCodeArgs(binPath, cliArgs, { cwd, timeoutMs, idleTimeoutMs, signal, onSpawn, onStdout, killGroup, leftoverGraceMs, stdioGraceMs });
 }
 
 export function newRunId() {
@@ -194,6 +322,15 @@ export async function createWorktree(cwd) {
   // staged work (ZCode is expected to commit during tasks) is not missed.
   const startSha = (await run(['rev-parse', 'HEAD'], cwd)).trim();
   return { dir, branch, slug, startSha };
+}
+
+// Undoes createWorktree (a job that never started): removes the worktree and
+// deletes its branch. Tries both steps; rethrows the first failure.
+export async function removeWorktree(cwd, worktree) {
+  let first = null;
+  try { await run(['worktree', 'remove', '--force', worktree.dir], cwd); } catch (err) { first = err; }
+  try { await run(['branch', '-D', worktree.branch], cwd); } catch (err) { first = first || err; }
+  if (first) throw first;
 }
 
 export async function worktreeSummary(dir, startSha) {

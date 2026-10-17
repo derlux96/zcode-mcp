@@ -3,7 +3,7 @@ const args = process.argv.slice(2);
 const mode = process.env.FAKE_ZCODE_MODE || 'ok';
 
 if (args.includes('version')) {
-  console.log('zcode 0.16.9 (fake)');
+  console.log(`zcode ${process.env.FAKE_ZCODE_VERSION || '0.16.9'} (fake)`);
   process.exit(0);
 }
 if (args.includes('doctor')) {
@@ -32,9 +32,75 @@ if (mode === 'bigoutput') {
 if (mode === 'hang') {
   setInterval(() => {}, 1000); // never exits; used for timeout tests
   process.exitCode = 0;
+} else if (mode === 'chatty') {
+  // Long-running but active: prints every 150 ms for ~1.5 s, then finishes.
+  let n = 0;
+  const t = setInterval(() => {
+    console.log(`progress ${n}`);
+    if (++n === 10) {
+      clearInterval(t);
+      console.log(JSON.stringify({ result: 'chatty done', session: { id: 'sess_chatty1' } }));
+      process.exit(0);
+    }
+  }, 150);
+} else if (mode === 'silent') {
+  // Alive but mute for 30 s (idle-timeout tests).
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'crash-mid') {
+  setTimeout(() => process.exit(1), 300);
+} else if (mode === 'badutf8') {
+  // Invalid UTF-8 on stdout: decoding must yield U+FFFD, not throw.
+  process.stdout.write(Buffer.from([0xff, 0xfe, 0x0a]));
+  process.exitCode = 0;
+} else if (mode === 'ignore-sigterm') {
+  process.on('SIGTERM', () => {});
+  process.stdout.write('ready\n'); // handler is installed
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'spawn-grandchild') {
+  // Same process group (not detached); PID reported on stderr so tests can
+  // verify/kill it.
+  const { spawn } = require('node:child_process');
+  // node (not sleep) so the command line carries a marker the tests' safeSignal checks.
+  const gc = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', 'fake-zcode-grandchild'], { stdio: 'ignore' });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  setTimeout(() => process.exit(0), 30000);
+} else if (mode === 'leave-grandchild') {
+  // Finishes normally (exit 0) but leaves a background process in its group,
+  // like `npm run dev &`. FAKE_GRANDCHILD_STDIO=inherit makes it hold the
+  // stdout/stderr pipes; FAKE_GRANDCHILD_IGNORE_TERM=1 makes it ignore SIGTERM.
+  const { spawn } = require('node:child_process');
+  const code = "if (process.env.FAKE_GRANDCHILD_IGNORE_TERM) process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+  const gc = spawn(process.execPath, ['-e', code, 'fake-zcode-leftover'], {
+    stdio: process.env.FAKE_GRANDCHILD_STDIO === 'inherit' ? 'inherit' : 'ignore',
+  });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  console.log(JSON.stringify({ result: 'done, background process left', session: { id: 'sess_leave01' } }));
+  setTimeout(() => process.exit(0), 300); // the grandchild has installed its handler
+} else if (mode === 'daemonize-pipe-holder') {
+  // Finishes normally (exit 0) after daemonizing a pipe-holding child into its
+  // own session/process group (setsid-like), so a group sweep cannot reach it.
+  const { spawn } = require('node:child_process');
+  const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);', 'fake-zcode-leftover'], {
+    stdio: 'inherit', detached: true,
+  });
+  process.stderr.write(`grandchild pid ${gc.pid}\n`);
+  console.log(JSON.stringify({ result: 'done, daemon left', session: { id: 'sess_daemon01' } }));
+  setTimeout(() => process.exit(0), 300);
+} else if (mode === 'write-hang') {
+  // Leaves a partial change in cwd, then works forever (cancel tests).
+  require('node:fs').writeFileSync('partial.txt', 'partial\n');
+  setInterval(() => {}, 1000);
+} else if (mode === 'slow-start') {
+  setTimeout(() => {
+    console.log(JSON.stringify({ result: 'slow start done', session: { id: 'sess_slow001' } }));
+    process.exit(0);
+  }, 2000);
 } else if (mode === 'fail') {
   console.log(JSON.stringify({ session: { id: 'sess_fail000' } }));
   console.error('fake zcode failure');
+  process.exit(1);
+} else if (mode === 'model-creation-failed') {
+  console.error('Error: Model creation failed');
   process.exit(1);
 } else if (mode === 'nosession') {
   console.log('done, but no session id anywhere');

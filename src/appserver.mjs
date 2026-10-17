@@ -19,7 +19,8 @@
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { discoverZCode } from './discover.mjs';
-import { buildSpawnEnv, DEFAULT_TIMEOUT_MS } from './runner.mjs';
+import { signalGroup } from './procid.mjs';
+import { buildSpawnEnv, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS } from './runner.mjs';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 export const DEFAULT_TASK_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
@@ -28,6 +29,15 @@ const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
 const EVENT_BUFFER_CAP = 2000;
 const CLOSE_KILL_GRACE_MS = 3000;
 
+// AppServerError.code names the case; callers branch on it, never on the message:
+//   'request_timeout'  a request got no response in time
+//   'idle'             no protocol activity while waiting for the turn
+//   'turn_timeout'     the absolute cap while waiting for the turn
+//   'aborted'          the caller's signal aborted the task
+//   'no-model'         no model to select (runTaskWithModel)
+//   'child_exited'     the app-server child exited or failed to start
+//   'closed'           the client was closed
+//   number             a JSON-RPC error response (its error.code)
 export class AppServerError extends Error {
   constructor(message, { code = null, data = null } = {}) {
     super(message);
@@ -104,8 +114,17 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
   return { level: fallback, substitution: { requested, used: fallback } };
 }
 
+// Client options beyond the basics:
+//   killGroup  spawn the app-server detached (own process group, pgid = pid)
+//              and make every kill signal the whole group
+//   onSpawn    (child) => void, called once the child has a pid; if it
+//              throws, the child is killed and the constructor throws
+//   onEvent    (params) => void, called for every session/event, in order
+//   signal     AbortSignal; aborting closes the client (kills the child)
 export class AppServerClient {
-  constructor({ binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn } = {}) {
+  constructor({
+    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, signal,
+  } = {}) {
     if (typeof binPath !== 'string' || binPath === '') throw new TypeError('binPath is required');
     if (typeof cwd !== 'string' || cwd === '') throw new TypeError('cwd is required');
     this.binPath = binPath;
@@ -120,7 +139,40 @@ export class AppServerClient {
     this._closed = false;
     this._exited = false;
     this._closePromise = null;
+    this._killGroup = killGroup;
+    this._onEvent = onEvent || null;
     this._spawnChild();
+    if (onSpawn && this.child.pid !== undefined) {
+      try {
+        onSpawn(this.child);
+      } catch (err) {
+        this._kill('SIGKILL');
+        this._closed = true;
+        throw err;
+      }
+    }
+    if (signal) {
+      this._signal = signal;
+      this._onAbort = () => { this.close(); };
+      if (signal.aborted) this.close();
+      else signal.addEventListener('abort', this._onAbort, { once: true });
+    }
+  }
+
+  // Signal the child, or its whole process group when killGroup is set.
+  _kill(sig) {
+    const pid = this.child.pid;
+    if (this._killGroup && Number.isInteger(pid) && pid > 1) {
+      try {
+        signalGroup(pid, sig);
+        return;
+      } catch {
+        // fall back to the child alone
+      }
+    }
+    try {
+      this.child.kill(sig);
+    } catch { /* already gone */ }
   }
 
   get events() {
@@ -137,9 +189,10 @@ export class AppServerClient {
     // sibling builtin provider config injected.
     const env = buildSpawnEnv(this.binPath);
     const appArgs = ['app-server', '--stdio'];
+    const opts = this._killGroup ? { cwd: this.cwd, env, detached: true } : { cwd: this.cwd, env };
     this.child = NODE_SCRIPT_RE.test(this.binPath)
-      ? this._spawnFn(process.execPath, [this.binPath, ...appArgs], { cwd: this.cwd, env })
-      : this._spawnFn(this.binPath, appArgs, { cwd: this.cwd, env });
+      ? this._spawnFn(process.execPath, [this.binPath, ...appArgs], opts)
+      : this._spawnFn(this.binPath, appArgs, opts);
 
     this.child.stdin.on('error', () => {}); // EPIPE when the child dies mid-write
     this.child.stderr.on('data', () => {}); // keep draining; never protocol
@@ -171,12 +224,16 @@ export class AppServerClient {
   _onChildGone(message) {
     if (this._exited) return;
     this._exited = true;
-    this._failAll(new AppServerError(message));
+    this._failAll(new AppServerError(message, { code: 'child_exited' }));
     this._resolveExit();
   }
 
   _onLine(line) {
     this._lastMessageAt = Date.now();
+    // Any protocol traffic is activity for waiters with an idle timer.
+    for (const waiter of this._eventWaiters) {
+      if (waiter.idleMs) this._armIdle(waiter);
+    }
     let msg;
     try {
       msg = JSON.parse(line);
@@ -215,6 +272,11 @@ export class AppServerClient {
     if (msg.method !== 'session/event' || !msg.params || typeof msg.params !== 'object') return;
     if (this._events.length >= EVENT_BUFFER_CAP) this._events.shift();
     this._events.push(msg.params);
+    if (this._onEvent) {
+      try {
+        this._onEvent(msg.params);
+      } catch { /* a failing observer must not wedge the protocol */ }
+    }
     this._dispatchEvent(msg.params);
   }
 
@@ -238,17 +300,17 @@ export class AppServerClient {
 
   request(method, params, { timeoutMs } = {}) {
     if (this._closed) {
-      return Promise.reject(new AppServerError(`client is closed; cannot send ${method}`));
+      return Promise.reject(new AppServerError(`client is closed; cannot send ${method}`, { code: 'closed' }));
     }
     if (this._exited) {
-      return Promise.reject(new AppServerError(`app-server child is not running; cannot send ${method}`));
+      return Promise.reject(new AppServerError(`app-server child is not running; cannot send ${method}`, { code: 'child_exited' }));
     }
     const id = this._nextId++;
     const effectiveTimeout = timeoutMs ?? this.timeoutMs;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(id);
-        reject(new AppServerError(`${method} timed out after ${effectiveTimeout} ms without a response`));
+        reject(new AppServerError(`${method} timed out after ${effectiveTimeout} ms without a response`, { code: 'request_timeout' }));
       }, effectiveTimeout);
       this._pending.set(id, { resolve, reject, timer, method });
       this._send({ id, method, params: params ?? {} });
@@ -260,25 +322,50 @@ export class AppServerClient {
    * `type` matches (string or array of strings). Rejects on timeout or when
    * the child is gone.
    */
-  waitForEvent(types, { timeoutMs = this.timeoutMs } = {}) {
+  waitForEvent(types, { timeoutMs = this.timeoutMs, idleTimeoutMs = null } = {}) {
     const wanted = Array.isArray(types) ? types : [types];
     const match = (p) => !!p && typeof p === 'object' && wanted.includes(p.type);
     const buffered = this._events.find(match);
     if (buffered) return Promise.resolve(buffered);
     if (this._exited || this._closed) {
       return Promise.reject(
-        new AppServerError(`app-server is gone; cannot wait for session/event ${wanted.join('|')}`),
+        new AppServerError(`app-server is gone; cannot wait for session/event ${wanted.join('|')}`, {
+          code: this._exited ? 'child_exited' : 'closed',
+        }),
       );
     }
     return new Promise((resolve, reject) => {
-      const waiter = { match, resolve, timer: null };
-      waiter.timer = setTimeout(() => {
-        const idx = this._eventWaiters.indexOf(waiter);
-        if (idx >= 0) this._eventWaiters.splice(idx, 1);
-        reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`));
-      }, timeoutMs);
+      const waiter = { match, resolve, reject, timer: null, idleTimer: null, idleMs: idleTimeoutMs, wanted };
+      const give = (fn) => (value) => {
+        this._clearWaiter(waiter);
+        fn(value);
+      };
+      waiter.resolve = give(resolve);
+      waiter.reject = give(reject);
+      // Absolute cap for the whole wait; timeoutMs 0 = no cap (only the idle timer, if any, guards the wait).
+      if (timeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`, { code: 'turn_timeout' }));
+        }, timeoutMs);
+      }
+      if (waiter.idleMs) this._armIdle(waiter);
       this._eventWaiters.push(waiter);
     });
+  }
+
+  // Idle timer: aborts only when no protocol traffic arrives for idleMs.
+  _armIdle(waiter) {
+    clearTimeout(waiter.idleTimer);
+    waiter.idleTimer = setTimeout(() => {
+      waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`, { code: 'idle' }));
+    }, waiter.idleMs);
+  }
+
+  _clearWaiter(waiter) {
+    const idx = this._eventWaiters.indexOf(waiter);
+    if (idx >= 0) this._eventWaiters.splice(idx, 1);
+    clearTimeout(waiter.timer);
+    clearTimeout(waiter.idleTimer);
   }
 
   /**
@@ -291,9 +378,7 @@ export class AppServerClient {
     for (let i = this._eventWaiters.length - 1; i >= 0; i--) {
       const waiter = this._eventWaiters[i];
       if (waiter.match(params)) {
-        this._eventWaiters.splice(i, 1);
-        clearTimeout(waiter.timer);
-        waiter.resolve(params);
+        waiter.resolve(params); // clears the timers and removes the waiter
       }
     }
   }
@@ -304,9 +389,8 @@ export class AppServerClient {
       pending.reject(err);
     }
     this._pending.clear();
-    for (const waiter of this._eventWaiters.splice(0)) {
-      clearTimeout(waiter.timer);
-      waiter.reject(err);
+    for (const waiter of this._eventWaiters.slice()) {
+      waiter.reject(err); // clears the timers and removes the waiter
     }
   }
 
@@ -328,20 +412,17 @@ export class AppServerClient {
   close() {
     if (this._closePromise) return this._closePromise;
     this._closed = true;
+    if (this._signal) this._signal.removeEventListener('abort', this._onAbort);
     this._closePromise = (async () => {
       if (!this._exited) {
-        try {
-          this.child.kill('SIGTERM');
-        } catch { /* already gone */ }
-        const killTimer = setTimeout(() => {
-          try {
-            this.child.kill('SIGKILL');
-          } catch { /* already gone */ }
-        }, CLOSE_KILL_GRACE_MS);
+        this._kill('SIGTERM');
+        const killTimer = setTimeout(() => this._kill('SIGKILL'), CLOSE_KILL_GRACE_MS);
         await this._exitPromise;
         clearTimeout(killTimer);
+      } else if (this._killGroup) {
+        this._kill('SIGKILL'); // leader gone: take down any group members it left behind
       }
-      this._failAll(new AppServerError('app-server client closed'));
+      this._failAll(new AppServerError('app-server client closed', { code: 'closed' }));
     })();
     return this._closePromise;
   }
@@ -350,11 +431,21 @@ export class AppServerClient {
 /**
  * One-shot mode B task: create a session with an explicit model selection,
  * run the prompt to turn completion, and tear the server down.
- * Returns { ok, sessionId, response, failed, error, catalog,
+ * Returns { ok, sessionId, response, failed, error, catalog, model,
  * reasoningSubstitution } on turn completion — reasoningSubstitution is
  * {requested, used} when the requested reasoningLevel was not offered by
  * the model's catalog entry and its defaultLevel was sent instead, else
  * null. Rejects on timeouts, protocol errors, and child death.
+ *
+ * providerId/modelId are optional as a pair: when both are omitted the
+ * session's own settings.model.current is used, else the first catalog
+ * entry; with neither, rejects with AppServerError code 'no-model'.
+ * Errors before session/send (spawn, settle, session/create, subscribe)
+ * carry `startup: true`; once session/create succeeded every error carries
+ * the real `sessionId` (the session is resumable). Aborting `signal` closes
+ * the client and rejects with AppServerError code 'aborted'.
+ * killGroup/onSpawn/onEvent are passed to AppServerClient; requestTimeoutMs
+ * is the per-request response timeout.
  */
 export async function runTaskWithModel({
   binPath,
@@ -364,15 +455,22 @@ export async function runTaskWithModel({
   modelId,
   reasoningLevel = 'high',
   timeoutMs = DEFAULT_TASK_TIMEOUT_MS,
+  idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
+  killGroup = false,
+  onSpawn,
+  onEvent,
+  signal,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new TypeError('prompt must be a non-empty string');
   }
-  if (typeof providerId !== 'string' || providerId.trim() === '') {
+  const explicitModel = providerId !== undefined || modelId !== undefined;
+  if (explicitModel && (typeof providerId !== 'string' || providerId.trim() === '')) {
     throw new TypeError('providerId must be a non-empty string');
   }
-  if (typeof modelId !== 'string' || modelId.trim() === '') {
+  if (explicitModel && (typeof modelId !== 'string' || modelId.trim() === '')) {
     throw new TypeError('modelId must be a non-empty string');
   }
   if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
@@ -389,19 +487,44 @@ export async function runTaskWithModel({
     throw new TypeError('reasoningLevel must be a non-empty string');
   }
 
-  const client = new AppServerClient({ binPath, cwd, spawnFn });
+  const aborted = () => new AppServerError('app-server task aborted', { code: 'aborted' });
+  if (signal && signal.aborted) throw aborted();
+  let client;
+  try {
+    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, signal });
+  } catch (err) {
+    if (err instanceof AppServerError) err.startup = true;
+    throw err;
+  }
+  let startup = true;
+  let sessionId = null;
   try {
     await client.settle();
 
     // No top-level cwd param: the workspace lives in a nested object with
     // BOTH keys required (notes §3). workspaceKey === workspacePath in
     // every observed session.
+    // mode: yolo is the documented autonomous semantics. Without it the
+    // session falls back to 'build', which denies every side-effect tool
+    // (Write, Bash) because nothing can approve the request, so the task
+    // "completes" without changing any file.
     const created = await client.request('session/create', {
       workspace: { workspacePath: cwd, workspaceKey: cwd },
+      mode: 'yolo',
     });
-    const sessionId = created && created.session && created.session.sessionId;
+    sessionId = (created && created.session && created.session.sessionId) || null;
     if (!sessionId) throw new AppServerError('session/create response is missing session.sessionId');
     const catalog = (created.settings && created.settings.model && created.settings.model.available) || null;
+    if (!explicitModel) {
+      const current = created.settings && created.settings.model && created.settings.model.current;
+      const first = Array.isArray(catalog) && catalog[0] && catalog[0].ref;
+      const pick = current && current.providerId && current.modelId ? current
+        : first && first.providerId && first.modelId ? first
+          : null;
+      if (!pick) throw new AppServerError('no model available: session/create carries no current model and no catalog', { code: 'no-model' });
+      providerId = pick.providerId;
+      modelId = pick.modelId;
+    }
 
     // Catalog-aware reasoning level (Controller Ruling 14): live catalogs
     // offer level sets like ['low','medium','xhigh'] — 'high' (our default)
@@ -415,13 +538,14 @@ export async function runTaskWithModel({
 
     // ACK-only: acceptance says nothing about model validity; the turn
     // outcome arrives as a session/event notification (notes §5/§6).
+    startup = false; // from here on the task may be running: never retry
     await client.request('session/send', {
       sessionId,
       content: prompt,
       modelSelection: { providerId, modelId, options: { reasoningLevel: effectiveReasoningLevel } },
     });
 
-    const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs });
+    const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs, idleTimeoutMs });
     if (event.type === 'turn.failed') {
       const err = (event.payload && event.payload.error) || {};
       return {
@@ -431,6 +555,7 @@ export async function runTaskWithModel({
         failed: true,
         error: { code: err.code ?? null, message: err.message ?? 'turn failed without an error payload' },
         catalog,
+        model: { providerId, modelId },
         reasoningSubstitution,
       };
     }
@@ -441,8 +566,14 @@ export async function runTaskWithModel({
       failed: false,
       error: null,
       catalog,
+      model: { providerId, modelId },
       reasoningSubstitution,
     };
+  } catch (err) {
+    const out = signal && signal.aborted ? aborted() : err;
+    if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
+    if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
+    throw out;
   } finally {
     await client.close();
   }

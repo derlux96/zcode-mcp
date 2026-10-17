@@ -100,7 +100,8 @@ function makeDemoRepoCopy() {
 
 // --- default mode: fake binary, no real ZCode needed ---
 const stateFile = join(tempDir(), 'sessions.json');
-const client = new McpClient({ ZCODE_BIN: fakeBin, ZCODE_MCP_STATE: stateFile });
+const jobsHome = tempDir(); // jobs of the fake run never reach ~/.zcode-mcp
+const client = new McpClient({ ZCODE_BIN: fakeBin, ZCODE_MCP_STATE: stateFile, ZCODE_MCP_HOME: jobsHome });
 
 const init = await client.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
 assertThat(init.result && init.result.serverInfo.name === 'zcode-delegate', 'initialize handshake');
@@ -108,7 +109,7 @@ client.notify('notifications/initialized');
 
 const list = await client.request('tools/list', {});
 const names = list.result.tools.map((t) => t.name).sort();
-assertThat(JSON.stringify(names) === JSON.stringify(['zcode_check', 'zcode_run', 'zcode_sessions']), 'exposes exactly 3 tools');
+assertThat(JSON.stringify(names) === JSON.stringify(['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']), 'exposes exactly 6 tools');
 
 const check = await client.request('tools/call', { name: 'zcode_check', arguments: {} });
 assertThat(/"ok": true/.test(check.result.content[0].text), 'zcode_check ok with fake binary');
@@ -116,8 +117,8 @@ assertThat(/"ok": true/.test(check.result.content[0].text), 'zcode_check ok with
 const bad = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'x', cwd: 'relative/path' } });
 assertThat(bad.result.isError === true && /absolute/.test(bad.result.content[0].text), 'relative cwd rejected');
 
-const runOk = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'fixture task', cwd: tempDir() } });
-assertThat(/status: completed/.test(runOk.result.content[0].text) && /sess_fake123/.test(runOk.result.content[0].text), 'zcode_run happy path via fake binary');
+const runOk = await client.request('tools/call', { name: 'zcode_run', arguments: { prompt: 'fixture task', cwd: tempDir(), mode: 'yolo' } }); // CLI path: ZCODE_BIN is the fake CLI
+assertThat(/status: completed/.test(runOk.result.content[0].text) && /sess_fake123/.test(runOk.result.content[0].text) && /^job_id: job_/m.test(runOk.result.content[0].text), 'zcode_run happy path via fake binary (with job_id)');
 
 const unknown = await client.request('bogus/method', {});
 assertThat(unknown.error && unknown.error.code === -32601, 'unknown method → -32601');
@@ -128,12 +129,35 @@ const afterGarbage = await client.request('ping', {});
 assertThat(afterGarbage.result && Object.keys(afterGarbage.result).length === 0, 'server survives a non-JSON line');
 
 await client.close();
+rmSync(jobsHome, { recursive: true, force: true });
 
 // --- e2e mode: real ZCode binary, real task ---
 if (e2e) {
   delete process.env.ZCODE_BIN; // use discovery
-  const e2eStateFile = join(tempDir(), 'sessions.json');
-  const e2eClient = new McpClient({ ZCODE_MCP_STATE: e2eStateFile });
+  const e2eHome = tempDir(); // jobs of the e2e run never reach ~/.zcode-mcp
+  const e2eStateFile = join(e2eHome, 'sessions.json');
+  const e2eClient = new McpClient({ ZCODE_MCP_STATE: e2eStateFile, ZCODE_MCP_HOME: e2eHome });
+
+  // zcode_run answers `status: running` + job_id for tasks longer than wait_ms;
+  // then follow the job with zcode_status (wait_ms) and fetch zcode_result.
+  const TERMINAL_RE = /^status: (completed|failed|timeout|cancelled|lost)\b/;
+  const call = async (name, args) => (await e2eClient.request('tools/call', { name, arguments: args })).result.content[0].text;
+  const runToEnd = async (args) => {
+    let text = await call('zcode_run', { wait_ms: 300000, ...args });
+    const m = /^job_id: (job_\S+)$/m.exec(text);
+    if (!m) return text;
+    const deadline = Date.now() + 15 * 60 * 1000;
+    while (!TERMINAL_RE.test(text)) {
+      // An error answer (unknown job, bad arguments) has no status line: fail fast with it.
+      if (!/^status: /m.test(text)) return text;
+      if (Date.now() >= deadline) {
+        console.error(`  e2e job ${m[1]} still running after 15 min; cancelling it`);
+        return call('zcode_cancel', { job_id: m[1] });
+      }
+      text = await call('zcode_status', { job_id: m[1], wait_ms: 120000 });
+    }
+    return call('zcode_result', { job_id: m[1] });
+  };
   const repo = makeDemoRepoCopy();
   console.log('e2e repo:', repo);
 
@@ -160,11 +184,8 @@ if (e2e) {
     }
   };
 
-  const run1 = await e2eClient.request('tools/call', {
-    name: 'zcode_run',
-    arguments: { prompt: 'Create a file named hello.txt in the current directory containing exactly the text: zcode-plugin-e2e', cwd: repo, mode: 'edit', timeout_ms: 300000 },
-  });
-  const text1 = run1.result.content[0].text;
+  const text1 = await runToEnd({ prompt: 'Create a file named hello.txt in the current directory containing exactly the text: zcode-plugin-e2e', cwd: repo, mode: 'edit', timeout_ms: 300000 });
+  assertThat(/^job_id: job_/m.test(text1), 'e2e plain run reports its job_id');
   assertOrSkipOnDeadDefault(/session_id: sess_/.test(text1), 'e2e plain run returned a real sess_ session id', text1);
   // The fallback line `session_id: run_... (server run-id, not resumable)`
   // must NOT satisfy this check — the spec expects a real session id.
@@ -175,12 +196,10 @@ if (e2e) {
     text1
   );
 
-  const run2 = await e2eClient.request('tools/call', {
-    name: 'zcode_run',
-    arguments: { prompt: 'Create a file named worktree-marker.txt containing: isolated', cwd: repo, mode: 'edit', timeout_ms: 300000, isolate_worktree: true },
-  });
-  const text2 = run2.result.content[0].text;
-  assertThat(/worktree_branch: zcode\//.test(text2), 'e2e isolated run created zcode/ branch');
+  const text2 = await runToEnd({ prompt: 'Create a file named worktree-marker.txt containing: isolated', cwd: repo, mode: 'edit', timeout_ms: 300000, isolate_worktree: true });
+  assertThat(/^status: completed/m.test(text2), 'e2e isolated run completed');
+  assertThat(/^worktree_branch: zcode\//m.test(text2), 'e2e isolated run created zcode/ branch');
+  assertThat(/^worktree_dir: /m.test(text2) && /^changed_files: .*worktree-marker\.txt/m.test(text2), 'e2e isolated run reports worktree_dir and the new file');
   assertThat(/worktree kept/.test(text2), 'e2e isolated run documents merge responsibility');
 
   // --- mode-B proof: catalog-driven model selection (hard assertions) ---
@@ -210,17 +229,15 @@ if (e2e) {
 
   if (pickedModel) {
     console.log('e2e mode-B model picked from catalog:', pickedModel);
-    const run3 = await e2eClient.request('tools/call', {
-      name: 'zcode_run',
-      arguments: { prompt: 'Create model-proof.txt containing: ok', cwd: repo, model: pickedModel, reasoning_level: 'low', timeout_ms: 300000 },
-    });
-    const text3 = run3.result.content[0].text;
-    assertThat(/status: completed/.test(text3), `e2e explicit-model run completed (model ${pickedModel})`);
+    const text3 = await runToEnd({ prompt: 'Create model-proof.txt containing: ok', cwd: repo, model: pickedModel, reasoning_level: 'low', timeout_ms: 300000 });
+    assertThat(new RegExp(`^status: completed \\(model ${pickedModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`, 'm').test(text3), `e2e explicit-model run completed (model ${pickedModel})`);
+    assertThat(/^job_id: job_/m.test(text3), 'e2e explicit-model run reports its job_id');
     assertThat(/session_id: sess_/.test(text3), `e2e explicit-model run returned a real sess_ session id (model ${pickedModel})`);
   }
 
   await e2eClient.close();
   rmSync(repo, { recursive: true, force: true });
+  rmSync(e2eHome, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? 'TEST-CLIENT PASS' : `TEST-CLIENT FAIL (${failures} failures)`);

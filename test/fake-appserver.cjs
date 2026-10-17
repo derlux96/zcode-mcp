@@ -19,8 +19,21 @@
 //             notifications before turn.completed — exceeds the client's
 //             EVENT_BUFFER_CAP (2000) while a waiter is live (regression
 //             for event-buffer saturation blinding live waiters)
+//   rate-limit  like fail, but the error message is "429 rate limit"
+//   auth-fail   like fail, but the error message is "project_token_login_failed"
+//   chatty    acks send, then emits a model.streaming session/event every
+//             150 ms for 1.5 s before turn.completed (idle-timeout tests)
+//   tools     acks send, then emits six tool.updated session/events
+//             (toolName T0..T5, kind 'scheduled') before the ok turn
+//   no-model  like ok, but session/create carries no current model and an
+//             empty catalog (runner falls back to the CLI path)
+//   nosendack answers create + subscribe, but never answers session/send
+//             (request-timeout path after the session exists)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
+//
+// FAKE_APPSERVER_CREATE_DELAY_MS: delays every session/create response
+// (slow model catalog lookups).
 //
 // FAKE_APPSERVER_LOG: path; every received message is appended as one JSON
 // line (lets tests assert exact wire params the client sent).
@@ -135,7 +148,9 @@ function answerArrived(msg) {
   if (pendingCreate) {
     const req = pendingCreate;
     pendingCreate = null;
-    sendCreateResponse(req);
+    const delay = Number(process.env.FAKE_APPSERVER_CREATE_DELAY_MS) || 0;
+    if (delay > 0) setTimeout(() => sendCreateResponse(req), delay);
+    else sendCreateResponse(req);
   }
   return true;
 }
@@ -172,11 +187,13 @@ function sendCreateResponse(req) {
       },
       settings: {
         mode: { current: 'build' },
-        model: {
-          available: CATALOG,
-          current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
-          lastUsed: { providerId: 'glm-test', modelId: 'small' },
-        },
+        model: MODE === 'no-model'
+          ? { available: [] }
+          : {
+              available: CATALOG,
+              current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
+              lastUsed: { providerId: 'glm-test', modelId: 'small' },
+            },
         permission: { mode: 'build' },
         thoughtLevel: { available: [], current: 'high', enabled: true },
       },
@@ -200,6 +217,7 @@ const FLOOD_EVENTS = 2005;
 
 function handleSend(req) {
   if (!created) return notActive(req);
+  if (MODE === 'nosendack') return;
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: 1 } });
   if (MODE === 'slowhang') return;
@@ -223,6 +241,50 @@ function handleSend(req) {
       }
       emitTurn(req);
     }, 25);
+    return;
+  }
+  if (MODE === 'tools') {
+    for (let i = 0; i < 6; i++) {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous',
+          sessionId: SESSION_ID,
+          turnId: 'turn_fake1',
+          traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_tool_${i}`,
+          seq: 50 + i,
+          timestamp: Date.now(),
+          type: 'tool.updated',
+          payload: { toolName: `T${i}`, toolCallId: `call_${i}`, kind: 'scheduled' },
+        },
+      });
+    }
+    setTimeout(() => emitTurn(req), 25);
+    return;
+  }
+  if (MODE === 'chatty') {
+    let n = 0;
+    const t = setInterval(() => {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous',
+          sessionId: SESSION_ID,
+          turnId: 'turn_fake1',
+          traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_chatty_${n}`,
+          seq: 100 + n,
+          timestamp: Date.now(),
+          type: 'model.streaming',
+          payload: { assistantMessageId: 'msg_fake0001', delta: 'x', done: false, kind: 'reasoning_delta' },
+        },
+      });
+      if (++n === 10) {
+        clearInterval(t);
+        emitTurn(req);
+      }
+    }, 150);
     return;
   }
   // Notes §2: a second prefs request (scope user-execution) arrives at first
@@ -257,14 +319,16 @@ function emitTurn(req) {
       payload: { assistantMessageId: 'msg_fake0001', delta: 'fake ', done: false, kind: 'reasoning_delta' },
     },
   });
-  const tail = MODE === 'fail'
+  const FAILURES = { fail: 'fake model failure', 'rate-limit': '429 rate limit', 'auth-fail': 'project_token_login_failed' };
+  const failMsg = FAILURES[MODE];
+  const tail = failMsg !== undefined
     ? {
         eventId: 'evt_fake_0003',
         seq: 12,
         timestamp: 1792184703455,
         type: 'turn.failed',
         payload: {
-          error: { type: 'unknown_error', code: 'model_not_found', message: 'fake model failure', detail: 'Model creation failed', underlyingErrorMessage: 'fake model failure', stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
+          error: { type: 'unknown_error', code: 'model_not_found', message: failMsg, detail: 'Model creation failed', underlyingErrorMessage: failMsg, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
           turnPhase: 'model_creation',
           inputId: 'in_fake0001',
         },
