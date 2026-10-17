@@ -38,6 +38,7 @@
 //   fail-auth             every turn fails with an HTTP 401 invalid api key
 //   fail-model-request-failed  every turn fails with the generic
 //             "Model request failed." (what a wrong baseUrl produces)
+//   fail-model-creation   every turn fails with "Model creation failed"
 //
 // Turn counting for the fail-* modes: FAKE_APPSERVER_COUNTER names a file that
 // holds the number of session/send requests seen so far (read, incremented and
@@ -237,6 +238,7 @@ const FAIL_MODES = {
   'fail-429-always': [MSG_1113, Infinity],
   'fail-auth': ['HTTP 401 Unauthorized: invalid api key', Infinity],
   'fail-model-request-failed': ['Model request failed.', Infinity],
+  'fail-model-creation': ['Model creation failed', Infinity],
 };
 
 let memSends = 0;

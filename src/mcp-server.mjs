@@ -13,6 +13,8 @@ import { startJob, waitJob, getJob, cancelJob, listJobs, collectChanges, formatC
 import { TERMINAL_STATES, jobsRoot } from './jobstore.mjs';
 import { reap } from './reaper.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
+import { checkProviderConfig } from './provider-check.mjs';
+import { probeModel } from './model-probe.mjs';
 
 export { oneLine, cleanName };
 
@@ -40,7 +42,7 @@ const toolSchemas = {
   zcode_check: {
     name: 'zcode_check',
     description:
-      'Verify that a ZCode installation is reachable: binary path, version, and a best-effort health check. Call this once before the first delegation on a machine.',
+      'Verify that a ZCode installation is reachable: binary path, version, a best-effort health check, and a static check of the personal provider config (providers, baseUrl typos; keys are never shown). Call this once before the first delegation on a machine; add probe_model to also test a real model request.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -48,6 +50,11 @@ const toolSchemas = {
           type: 'boolean',
           description:
             'Append the available model catalog (one "providerId/modelId (reasoning: low,medium,xhigh)" line per model), fetched via a throwaway app-server session. Best-effort: on failure a [warning] line is appended instead and the check result is unaffected.',
+        },
+        probe_model: {
+          type: 'boolean',
+          description:
+            'Also send one tiny model request (costs one tiny model request: "reply OK", no tools, in a throwaway temp dir, up to 60 s, never retried) through the protocol path with ZCode\'s current model, and report modelProbe {ok, durationMs, model, errorKind, error, hint}. Catches a broken login, key or provider baseUrl before the first real job. A failure adds a warning; the top-level ok (binary reachable) is unaffected. Default false.',
         },
       },
       additionalProperties: false,
@@ -234,10 +241,21 @@ function versionWarnings(ok, raw) {
   return [`ZCode version ${v} is not in the verified list (${KNOWN_ZCODE_VERSIONS.join(', ')}); protocol behaviour may differ`];
 }
 
-function buildCheckHandler(reaper) {
+// probe_model result for the payload: the fixed login hint for "Model creation failed".
+function probeSection(probe) {
+  const out = { ...probe };
+  if (out.errorKind === 'model' && /model creation failed/i.test(out.error || '')) out.hint = LOGIN_HINT;
+  return out;
+}
+
+// probe: test hook ({ timeoutMs, idleTimeoutMs, tmpRoot }) for probeModel.
+function buildCheckHandler(reaper, probe = {}) {
   return async (args = {}) => {
     if (args.include_models !== undefined && typeof args.include_models !== 'boolean') {
       return failText('Invalid arguments: include_models must be a boolean');
+    }
+    if (args.probe_model !== undefined && typeof args.probe_model !== 'boolean') {
+      return failText('Invalid arguments: probe_model must be a boolean');
     }
     let binPath;
     try {
@@ -258,6 +276,13 @@ function buildCheckHandler(reaper) {
     }
     const ok = version.code === 0;
     const jobs = listJobs();
+    const providers = checkProviderConfig();
+    const warnings = [...versionWarnings(ok, version.stdout.trim()), ...providers.warnings];
+    let modelProbe;
+    if (args.probe_model === true) {
+      modelProbe = probeSection(await probeModel(probe));
+      if (!modelProbe.ok) warnings.push(oneLine(`model probe failed: ${modelProbe.errorKind}: ${modelProbe.error}`));
+    }
     const payload = JSON.stringify({
       ok,
       binPath,
@@ -265,7 +290,9 @@ function buildCheckHandler(reaper) {
       doctor,
       jobs: { dir: jobsRoot(), writable: jobsDirWritable(), running: jobs.filter((j) => !TERMINAL_STATES.includes(j.state)).length, total: jobs.length },
       reaper: reaper.stats(),
-      warnings: versionWarnings(ok, version.stdout.trim()),
+      providers: providers.providers,
+      ...(modelProbe ? { modelProbe } : {}),
+      warnings,
     }, null, 2);
     if (args.include_models !== true) return text(payload);
     // Best-effort catalog section via a throwaway app-server session: a
@@ -575,16 +602,17 @@ function withReap(tool, reaper) {
   return { ...tool, handler: (args, ctx) => { reaper.soon(); return tool.handler(args, ctx); } };
 }
 
-// reapFn / now / reapWaitMs / reaper: test hooks only; production never passes them.
+// reapFn / now / reapWaitMs / reaper / probe: test hooks only; production never passes them.
 export function buildTools({
   store = new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()),
   reapFn = reap,
   now = Date.now,
   reapWaitMs = REAP_WAIT_MS,
   reaper = createReaper({ reapFn, now, waitMs: reapWaitMs }),
+  probe,
 } = {}) {
   return [
-    { ...toolSchemas.zcode_check, handler: buildCheckHandler(reaper) },
+    { ...toolSchemas.zcode_check, handler: buildCheckHandler(reaper, probe) },
     { ...toolSchemas.zcode_run, handler: buildRunHandler() },
     { ...toolSchemas.zcode_sessions, handler: buildSessionsHandler(store) },
     { ...toolSchemas.zcode_status, handler: buildStatusHandler(reaper) },

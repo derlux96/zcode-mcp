@@ -60,6 +60,8 @@ before(() => {
   process.env.ZCODE_MCP_STATE = join(base, 'sessions.json');
   process.env.ZCODE_BIN = fakeBin;
   process.env.ZCODE_APPSERVER_BIN = fakeAppserverBin;
+  // zcode_check reads the personal provider config: never the real ~/.zcode here.
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(base, 'no-provider-config.json');
 });
 
 beforeEach(() => {
@@ -80,7 +82,7 @@ afterEach(async () => {
 });
 
 after(() => {
-  for (const k of ['ZCODE_MCP_HOME', 'ZCODE_MCP_STATE', 'ZCODE_BIN', 'ZCODE_APPSERVER_BIN']) delete process.env[k];
+  for (const k of ['ZCODE_MCP_HOME', 'ZCODE_MCP_STATE', 'ZCODE_BIN', 'ZCODE_APPSERVER_BIN', 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE']) delete process.env[k];
   for (const d of temps) removeDir(d);
 });
 
