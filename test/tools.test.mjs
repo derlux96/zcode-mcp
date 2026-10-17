@@ -180,6 +180,25 @@ test('zcode_run failed CLI job: exit code, error_kind, error and stderr', async 
   assert.match(text, /--- zcode stderr ---\nfake zcode failure/);
 });
 
+const LOGIN_HINT = 'hint: often caused by a missing, expired or misconfigured ZCode login/provider — check ~/.zcode/v2/provider_config.json (baseUrl, key) or run zcode login';
+
+test('zcode_run: "Model creation failed" gets a fixed login/provider hint outside the untrusted block', async () => {
+  process.env.FAKE_ZCODE_MODE = 'model-creation-failed';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo' });
+  const text = textOf(reply);
+  assert.match(text, /^error_kind: model$/m);
+  const lines = text.split('\n');
+  const at = lines.indexOf(LOGIN_HINT);
+  assert.ok(at >= 0, 'hint line present');
+  assert.ok(at < lines.findIndex((l) => l.startsWith('--- zcode output')), 'hint sits before the untrusted block');
+});
+
+test('zcode_run: other failures carry no login hint', async () => {
+  process.env.FAKE_ZCODE_MODE = 'fail';
+  const text = textOf(await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo' }));
+  assert.ok(!text.includes('hint:'));
+});
+
 test('zcode_run with timeout_ms 0 (no cap) runs a 1.5 s job to completion', async () => {
   process.env.FAKE_ZCODE_MODE = 'chatty';
   const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', timeout_ms: 0 });

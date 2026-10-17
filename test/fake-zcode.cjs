@@ -98,6 +98,9 @@ if (mode === 'hang') {
   console.log(JSON.stringify({ session: { id: 'sess_fail000' } }));
   console.error('fake zcode failure');
   process.exit(1);
+} else if (mode === 'model-creation-failed') {
+  console.error('Error: Model creation failed');
+  process.exit(1);
 } else if (mode === 'nosession') {
   console.log('done, but no session id anywhere');
   process.exit(0);

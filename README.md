@@ -76,11 +76,14 @@ Unicode line/paragraph separators (U+2028/U+2029) in file names, session ids, mo
 prompt previews and error texts are escaped (`\n`, `\x85`, `\u2028`, ...), so neither ZCode's
 output nor a caller-supplied value can add a `status:` line there.
 
-`error_kind`: `auth`, `quota`, `network`, `model`, `timeout_idle`, `timeout_total`,
+`error_kind`: `auth`, `quota`, `network`, `model` (when its error is `Model creation failed`, a fixed
+`hint:` line follows: ZCode's CLI prints that for a missing, expired or misconfigured login/provider
+alike, so check `~/.zcode/v2/provider_config.json` (`baseUrl`, key) or run `zcode login`), `timeout_idle`, `timeout_total`,
 `cancelled`, `crash`, `unknown`. Warnings include `no_changes` (completed without changing any
 file in a git repo: ZCode did nothing), `stalled` (heartbeat late), `runner_lost`,
 `recovered_from_lost` (the reaper had recorded `lost`, then the runner delivered its own
-result, which replaced it), `cancelled_by_manager`, `idle_detection_unavailable`,
+result, which replaced it), `cancelled_by_manager`, `idle_detection_unavailable`, `identity_unrecorded` (`ps` stayed unavailable while the runner recorded its
+process identity; the job is then recognised by its token alone),
 `leftover_processes_killed` (ZCode left background processes; they were stopped),
 `shared_repo` (another job was still running in the same git repository when this one ended,
 e.g. in a sibling subdirectory: locks are per directory but changes are reported per repository,

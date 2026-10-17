@@ -66,7 +66,9 @@ export function judgeAuth({ rejected, state, errorKind, error }) {
   if (rejected) return skipped(`ZCode could not be started with an empty HOME: ${rejected}`);
   if (state === 'completed') return skipped('ZCode authenticated despite an empty HOME (credentials live outside HOME); an invalid key cannot be simulated without touching real credentials');
   if (errorKind === 'auth') return ok(`ended ${state} with error_kind auth`);
-  return failed(`expected error_kind auth, got ${errorKind || 'none'} (state ${state}): ${error || ''}`.trim());
+  // ZCode's CLI prints "Model creation failed" for a missing login/provider (kind model).
+  if (errorKind === 'model' && /model creation failed|login/i.test(error || '')) return ok(`ended ${state} with error_kind model (${error.trim().slice(0, 80)}): no usable login/provider`);
+  return failed(`expected error_kind auth (or model with a Model creation failed/login error), got ${errorKind || 'none'} (state ${state}): ${error || ''}`.trim());
 }
 
 export function judgeNonGit(p, fileOk) {

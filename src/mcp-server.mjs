@@ -134,6 +134,11 @@ const toolSchemas = {
   },
 };
 
+// ZCode's CLI prints "Model creation failed" for a missing/expired login or a broken provider
+// config alike. Fixed text, so it can sit outside the untrusted block.
+const LOGIN_HINT = 'hint: often caused by a missing, expired or misconfigured ZCode login/provider — check ~/.zcode/v2/provider_config.json (baseUrl, key) or run zcode login';
+const loginHint = (r) => (r.errorKind === 'model' && /model creation failed/i.test(`${r.errorMessage || ''}\n${r.stderr || ''}`) ? [LOGIN_HINT] : []);
+
 // R25: text produced by ZCode (or a caller) outside the untrusted output block goes
 // through oneLine/cleanName (src/sanitize.mjs), so it can never forge a line.
 
@@ -384,6 +389,7 @@ async function terminalResult(view, { notes = [] } = {}) {
   lines.push(...noticeLines(warnings, view.job).map((l) => oneLine(l)));
   if (r.errorKind) lines.push(`error_kind: ${oneLine(r.errorKind)}`);
   if (r.errorMessage) lines.push(`error: ${oneLine(r.errorMessage)}`);
+  lines.push(...loginHint(r));
   if (view.state === 'timeout' && (r.timeoutKind === 'idle' || r.timeoutKind === 'total')) {
     lines.push(`timeout: ${r.timeoutKind}`);
   }

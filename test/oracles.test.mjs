@@ -349,6 +349,11 @@ test('judgeAuth: auth is ok, a completion means credentials outside HOME, a refu
   const other = judgeAuth({ state: 'failed', errorKind: 'unknown', error: 'boom' });
   assert.equal(other.status, 'failed');
   assert.match(other.reason, /expected error_kind auth/);
+  // ZCode's CLI cannot tell a missing login from a model failure: "Model creation failed".
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'Error: Model creation failed' }).status, 'ok');
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'project_token_login_failed' }).status, 'ok');
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: 'model is unavailable' }).status, 'failed');
+  assert.equal(judgeAuth({ state: 'failed', errorKind: 'model', error: '' }).status, 'failed');
 });
 
 test('authIsolationEnv clears ZCode/XDG variables and detects leftovers into ~/.zcode', () => {
