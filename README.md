@@ -57,7 +57,7 @@ create no job.
 | Limit | Default | Applies to |
 |---|---|---|
 | `wait_ms` | 30 s (max 300 s) | how long a `zcode_run` call may take, counted from the request (start-up included); not a job limit. Keep it below your MCP client's request timeout (60 s in many clients) |
-| `timeout_ms` | 6 h (also the max) | CLI path: hard total cap of the job. Protocol path: bounds the wait for the turn to finish; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few minutes of overrun are possible |
+| `timeout_ms` | 6 h (also the max); `0` = no cap | CLI path: hard total cap of the job. Protocol path: bounds the wait for the turn to finish; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few minutes of overrun are possible. With `0` no total cap is armed: the job then ends by itself, by `idle_timeout_ms` (protocol path) or by `zcode_cancel`. On the CLI path nothing detects a hung ZCode in that case, so use `0` there only deliberately |
 | `idle_timeout_ms` | 10 min | protocol path only: no protocol event for that long aborts the job |
 
 A timed-out job ends `status: timeout` with `timeout: idle|total`, `error_kind:
@@ -227,7 +227,7 @@ stored AES-256-GCM-encrypted in `credentials.json` and in cleartext (mode 0600) 
   user's real `~/.zcode` (login, provider config, its own session data).
 - State files (job files, locks, claims) are written with mode 0600 in directories with mode 0700; an existing state directory you own is tightened to 0700.
 - Task output is capped at 100,000 characters; every job has a total timeout (`timeout_ms`,
-  default 6 h; on the protocol path start-up time comes on top) and, on the protocol path, an
+  default 6 h, `0` = no cap; on the protocol path start-up time comes on top) and, on the protocol path, an
   idle timeout (`idle_timeout_ms`, default 10 min).
 - Prompt-injection surface: ZCode output (which can include repo file contents, and repos can
   contain attacker-controlled text) is returned after the marker line `--- zcode output

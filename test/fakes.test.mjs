@@ -163,6 +163,17 @@ test('appserver auth-fail: turn.failed with project_token_login_failed', async (
   assert.match(res.error.message, /project_token_login_failed/);
 });
 
+test('appserver: timeoutMs 0 arms no total timer, the idle timer still guards a silent turn', async () => {
+  // chatty runs ~1.5 s: with a naive setTimeout(…, 0) it would be rejected at once.
+  const ok = await runApp('chatty', { timeoutMs: 0, idleTimeoutMs: 1000 });
+  assert.equal(ok.ok, true);
+  // a silent turn is still ended by the idle limit, not by a total cap.
+  await assert.rejects(
+    runApp('slowhang', { timeoutMs: 0, idleTimeoutMs: 400 }),
+    (e) => e.code === 'idle',
+  );
+});
+
 test('appserver chatty: events every 150 ms for ~1.5 s, then turn.completed', async () => {
   const t0 = Date.now();
   // idle timeout shorter than the total run proves events keep it alive.

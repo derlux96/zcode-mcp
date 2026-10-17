@@ -6,8 +6,9 @@ import { dirname, join, resolve } from 'node:path';
 import { signalGroup, groupHasMembers } from './procid.mjs';
 
 export const OUTPUT_CAP = 100000;
-// timeout_ms is the absolute cap for a whole task; idle_timeout_ms aborts only
-// when ZCode has been silent that long, so long but active tasks keep running.
+// timeout_ms is the absolute cap for a whole task (0 = no cap at all);
+// idle_timeout_ms aborts only when ZCode has been silent that long, so long but
+// active tasks keep running.
 export const DEFAULT_TIMEOUT_MS = 21600000; // 6 h
 export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
@@ -46,8 +47,10 @@ export function validateRunArgs(args = {}) {
     return { ok: false, error: 'target must be a string' };
   }
   const timeoutMs = args.timeout_ms === undefined ? DEFAULT_TIMEOUT_MS : args.timeout_ms;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS) {
-    return { ok: false, error: `timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
+  // 0 = no total cap (the job ends by itself, by idle_timeout_ms on the protocol
+  // path, or by zcode_cancel).
+  if (!Number.isInteger(timeoutMs) || (timeoutMs !== 0 && (timeoutMs < MIN_TIMEOUT_MS || timeoutMs > MAX_TIMEOUT_MS))) {
+    return { ok: false, error: `timeout_ms must be 0 (no cap) or an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}` };
   }
   // Optional here; the caller decides whether the path supports it (model mode).
   const idleTimeoutMs = args.idle_timeout_ms;
@@ -175,7 +178,8 @@ export async function runZCodeArgs(binPath, cliArgs, {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => stop('idle'), idleTimeoutMs);
     };
-    const timer = setTimeout(() => stop('total'), timeoutMs);
+    // timeoutMs 0 = no total cap: arm nothing (a plain setTimeout(…, 0) would stop the run at once).
+    const timer = timeoutMs > 0 ? setTimeout(() => stop('total'), timeoutMs) : null;
     touch();
     const onAbort = () => stop('cancelled');
     if (signal) {

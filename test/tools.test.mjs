@@ -180,6 +180,21 @@ test('zcode_run failed CLI job: exit code, error_kind, error and stderr', async 
   assert.match(text, /--- zcode stderr ---\nfake zcode failure/);
 });
 
+test('zcode_run with timeout_ms 0 (no cap) runs a 1.5 s job to completion', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', timeout_ms: 0 });
+  const text = textOf(reply);
+  assert.equal(reply.result.isError, undefined);
+  assert.match(text, /^status: completed \(exit 0\)$/m);
+  assert.doesNotMatch(text, /timeout/i);
+});
+
+test('zcode_run schema documents timeout_ms 0 as no cap', async () => {
+  const listed = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  const run = listed.result.tools.find((t) => t.name === 'zcode_run');
+  assert.match(run.inputSchema.properties.timeout_ms.description, /0 = no cap/i);
+});
+
 test('zcode_run CLI timeout: status timeout with kind, isError', async () => {
   process.env.FAKE_ZCODE_MODE = 'hang';
   const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', timeout_ms: 1000 });
@@ -324,7 +339,7 @@ test('wait_ms out of range is rejected', async () => {
 test('timeout_ms above 21600000 is rejected', async () => {
   const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', timeout_ms: 21600001 });
   assert.equal(reply.result.isError, true);
-  assert.match(textOf(reply), /timeout_ms must be an integer between 1000 and 21600000/);
+  assert.match(textOf(reply), /timeout_ms must be 0 \(no cap\) or an integer between 1000 and 21600000/);
   assert.equal(listJobs().length, 0);
 });
 

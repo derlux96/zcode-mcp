@@ -68,6 +68,45 @@ test('nonzero exit is reported, session id still extracted', async () => {
   }
 });
 
+test('timeout_ms 0 means no total cap: accepted, while 1..999 and negatives stay rejected', () => {
+  const v = validateRunArgs({ ...base, timeout_ms: 0 });
+  assert.equal(v.ok, true);
+  assert.equal(v.value.timeoutMs, 0);
+  for (const bad of [1, 999, -1, 1.5, '0', null]) {
+    assert.equal(validateRunArgs({ ...base, timeout_ms: bad }).ok, false, `timeout_ms ${JSON.stringify(bad)} must be rejected`);
+  }
+  assert.match(validateRunArgs({ ...base, timeout_ms: 10 }).error, /0 \(no cap\)/);
+});
+
+test('timeoutMs 0 arms no total timer: a 1.5 s run completes instead of being killed at once', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  try {
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 0 });
+    assert.equal(res.timedOut, false);
+    assert.equal(res.code, 0);
+    assert.equal(res.sessionId, 'sess_chatty1');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
+test('timeoutMs 0 can still be cancelled through the abort signal (no cap is not no control)', async () => {
+  const cwd = makeTempDir();
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  const ctl = new AbortController();
+  try {
+    setTimeout(() => ctl.abort(), 500);
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 0, signal: ctl.signal });
+    assert.equal(res.timedOut, true);
+    assert.equal(res.timeoutKind, 'cancelled');
+  } finally {
+    delete process.env.FAKE_ZCODE_MODE;
+    removeDir(cwd);
+  }
+});
+
 test('timeout kills the child and flags timedOut', async () => {
   const cwd = makeTempDir();
   process.env.FAKE_ZCODE_MODE = 'hang';

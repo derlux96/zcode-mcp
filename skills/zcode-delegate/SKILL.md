@@ -64,6 +64,8 @@ active tasks keep running. The CLI path prints nothing until the end, so it has 
 use `timeout_ms` there. A result with `timeout: idle` or `timeout: total` lists the files changed
 so far (unverified work on disk).
 
+`timeout_ms: 0` removes the total cap: use it for big tasks that must never be cut off by the clock. The job then ends by itself, by the idle timeout (protocol path) or when you call `zcode_cancel`; on the CLI path nothing detects a hung ZCode in that case, so prefer the protocol path for `0`.
+
 ## 4. Model selection
 
 Without `model` the protocol path uses ZCode's current model. Set `model` when the default is

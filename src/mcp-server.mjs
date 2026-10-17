@@ -65,7 +65,7 @@ const toolSchemas = {
         mode: { type: 'string', enum: MODES, description: 'Permission mode: plan (read-only plan first), build, edit, yolo (autonomous, default). Setting mode selects the CLI path.' },
         resume: { type: 'string', description: 'Existing ZCode session id (sess_...) to continue a previous conversation (CLI path). Server run-ids and job ids are not resumable.' },
         target: { type: 'string', description: 'Optional session goal passed to ZCode (--target, CLI path).' },
-        timeout_ms: { type: 'integer', description: `Absolute cap for the whole task (the job, not the wait) in milliseconds; default and maximum ${MAX_TIMEOUT_MS} (6 h).` },
+        timeout_ms: { type: 'integer', description: `Absolute cap for the whole task (the job, not the wait) in milliseconds; default and maximum ${MAX_TIMEOUT_MS} (6 h). 0 = no cap: the job then ends only by itself, by idle_timeout_ms (protocol path) or by zcode_cancel. On the CLI path nothing detects a hung ZCode then, so use 0 there only deliberately.` },
         idle_timeout_ms: {
           type: 'integer',
           description: `Protocol path only (no mode/resume/target): abort after this many milliseconds without protocol progress (${DEFAULT_IDLE_TIMEOUT_MS} default = 10 min, max ${MAX_TIMEOUT_MS}). Long but active tasks keep running. On the CLI path use timeout_ms. On timeout the result lists the files changed so far.`,

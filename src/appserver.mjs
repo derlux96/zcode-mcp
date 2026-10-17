@@ -342,10 +342,12 @@ export class AppServerClient {
       };
       waiter.resolve = give(resolve);
       waiter.reject = give(reject);
-      // Absolute cap for the whole wait.
-      waiter.timer = setTimeout(() => {
-        waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`, { code: 'turn_timeout' }));
-      }, timeoutMs);
+      // Absolute cap for the whole wait; timeoutMs 0 = no cap (only the idle timer, if any, guards the wait).
+      if (timeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          waiter.reject(new AppServerError(`timed out after ${timeoutMs} ms waiting for session/event ${wanted.join('|')}`, { code: 'turn_timeout' }));
+        }, timeoutMs);
+      }
       if (waiter.idleMs) this._armIdle(waiter);
       this._eventWaiters.push(waiter);
     });
