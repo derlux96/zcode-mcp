@@ -323,7 +323,17 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
 export async function runJob(dir, opts = {}) {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const onStatus = opts.onStatus;
+  // R29: progress writes (heartbeat, activity, child records) never touch a
+  // terminal status, so nothing resurrects a `cancelled` or `lost` job. The re-read
+  // narrows, but cannot close, the race with a concurrent manager/reaper write.
   const setStatus = (patch) => {
+    const cur = readStatus(dir);
+    if (cur && TERMINAL_STATES.includes(cur.state)) return cur;
+    const merged = patchStatus(dir, patch);
+    if (onStatus) onStatus(merged, patch);
+    return merged;
+  };
+  const setFinalStatus = (patch) => {
     const merged = patchStatus(dir, patch);
     if (onStatus) onStatus(merged, patch);
     return merged;
@@ -410,6 +420,17 @@ export async function runJob(dir, opts = {}) {
       warn('session_store_failed');
     }
 
+    // R29: a terminal state set by the manager (`cancelled`) stands; the reaper's
+    // `lost` is an inference and gives way to the runner's own result.
+    const recorded = readStatus(dir);
+    if (recorded && TERMINAL_STATES.includes(recorded.state)) {
+      if (recorded.state !== 'lost') {
+        if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId); // only if still ours
+        finished = true;
+        return;
+      }
+      warn('recovered_from_lost');
+    }
     // Lock release precedes the terminal status so the job counts as alive until the lock is gone.
     if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId);
     writeResult(dir, {
@@ -429,7 +450,7 @@ export async function runJob(dir, opts = {}) {
       stderr: cap(run.stderr),
       durationMs: Date.now() - startedMs,
     });
-    setStatus({
+    setFinalStatus({
       state, sessionId, warnings, errorKind, finishedAt: now(),
       ...(run.progress ? { progress: run.progress } : {}),
     });

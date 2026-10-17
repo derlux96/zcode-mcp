@@ -79,7 +79,11 @@ be misled; parse the header by `\n` only.
 `error_kind`: `auth`, `quota`, `network`, `model`, `timeout_idle`, `timeout_total`,
 `cancelled`, `crash`, `unknown`. Warnings include `no_changes` (completed without changing any
 file in a git repo: ZCode did nothing), `stalled` (heartbeat late), `runner_lost`,
-`cancelled_by_manager`, `idle_detection_unavailable`.
+`recovered_from_lost` (the reaper had recorded `lost`, then the runner delivered its own
+result, which replaced it), `cancelled_by_manager`, `idle_detection_unavailable`,
+`leftover_processes_killed` (ZCode left background processes; they were stopped).
+A `cancelled` state written by `zcode_cancel` is final: a runner finishing later never
+overwrites it.
 
 ### Jobs directory and reaper
 

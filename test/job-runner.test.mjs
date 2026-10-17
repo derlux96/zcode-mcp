@@ -5,7 +5,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run, safeSignal } from './helpers.mjs';
-import { createJobDir, readStatus, readResult, stateHome, TERMINAL_STATES } from '../src/jobstore.mjs';
+import { createJobDir, readStatus, readResult, stateHome, TERMINAL_STATES, patchStatus, writeResult } from '../src/jobstore.mjs';
 import { captureBaseline } from '../src/changes.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
 import { SessionStore } from '../src/state.mjs';
@@ -488,4 +488,43 @@ test('a runner started after the manager already ended the job writes nothing', 
   await runJob(dir);
   assert.deepEqual(readStatus(dir), status);
   assert.deepEqual(readResult(dir), result);
+});
+
+// I6 / R29: the manager's `cancelled` is final; the reaper's `lost` is an inference
+// the runner may replace with its own result; nothing resurrects a terminal state.
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('a manager-set cancelled state is never overwritten by the runner', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+  writeResult(dir, { state: 'cancelled', warnings: ['cancelled_by_manager'], errorKind: 'cancelled' });
+  patchStatus(dir, { state: 'cancelled', warnings: ['cancelled_by_manager'], errorKind: 'cancelled', finishedAt: new Date().toISOString() });
+  const status = readStatus(dir);
+  const result = readResult(dir);
+  await pause(200); // several heartbeats
+  assert.deepEqual(readStatus(dir), status, 'heartbeat did not touch a terminal status');
+  await done;
+  assert.deepEqual(readStatus(dir), status);
+  assert.deepEqual(readResult(dir), result);
+});
+
+test('a reaper-set lost state is replaced by the runner result with recovered_from_lost', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+  writeResult(dir, { state: 'lost', warnings: ['runner_lost'], errorKind: 'crash' });
+  patchStatus(dir, { state: 'lost', warnings: ['runner_lost'], errorKind: 'crash', finishedAt: new Date().toISOString() });
+  await pause(200);
+  assert.equal(readStatus(dir).state, 'lost', 'heartbeat/activity writes do not resurrect it');
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.ok(res.warnings.includes('recovered_from_lost'), JSON.stringify(res.warnings));
+  assert.equal(res.sessionId, 'sess_chatty1');
+  const st = readStatus(dir);
+  assert.equal(st.state, 'completed');
+  assert.ok(st.warnings.includes('recovered_from_lost'));
 });
