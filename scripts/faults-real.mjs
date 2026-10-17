@@ -4,6 +4,7 @@
 // ok / failed / skipped with a reason. Spends real ZCode quota: only with --real.
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { safeSignal, waitFor, sleep } from '../test/helpers.mjs';
@@ -21,6 +22,28 @@ const failed = (reason) => ({ status: 'failed', reason });
 const skipped = (reason) => ({ status: 'skipped', reason });
 
 // --- pure judges -------------------------------------------------------------
+
+// Kept: our own variables (real binary, temp MCP home/state) and the app bundle's
+// read-only builtin provider config.
+const KEEP_ENV = ['ZCODE_BIN', 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', 'ZCODE_MCP_HOME', 'ZCODE_MCP_STATE'];
+const CLEAR_ENV = ['ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'];
+
+/**
+ * Env overrides for invalid-api-key: HOME = an empty temp dir; every other ZCODE_*
+ * variable and the XDG dirs are removed (undefined: Node's spawn drops them).
+ * leaks = variables that would still point into the real ~/.zcode afterwards.
+ */
+export function authIsolationEnv(env, realHome, fakeHome) {
+  const overrides = { HOME: fakeHome };
+  for (const k of CLEAR_ENV) overrides[k] = undefined;
+  for (const k of Object.keys(env)) if (k.startsWith('ZCODE_') && !KEEP_ENV.includes(k)) overrides[k] = undefined;
+  const real = join(realHome, '.zcode');
+  const merged = { ...env, ...overrides };
+  const leaks = Object.entries(merged)
+    .filter(([, v]) => typeof v === 'string' && v.split(':').some((part) => part === real || part.startsWith(`${real}/`)))
+    .map(([k]) => k);
+  return { overrides, leaks };
+}
 
 /** Lines of `ps -axo command` -> is the ZCode desktop app (not our CLI child) running? */
 export function isZCodeAppRunning(lines) {
@@ -168,11 +191,14 @@ export const SCENARIOS = [
     async run(scope) {
       // An empty temp HOME: ZCode finds no login. The real ~/.zcode is never touched.
       const fakeHome = scope.dir('zcode-faults-emptyhome-');
+      const { overrides, leaks } = authIsolationEnv(process.env, process.env.HOME || homedir(), fakeHome);
+      const applied = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [k, v === undefined ? '(removed)' : v]));
+      if (leaks.length) return { ...skipped(`environment still points into the real ~/.zcode after isolation: ${leaks.join(', ')}`), details: { overrides: applied } };
       const repo = initRepo(scope.dir('zcode-faults-repo-'));
-      const c = await scope.server({ HOME: fakeHome });
+      const c = await scope.server(overrides);
       const r = await createJob(scope, c, repo);
-      if (r.rejected) return { ...judgeAuth({ rejected: r.text.slice(0, 300) }), details: { text: r.text.slice(0, 600) } };
-      return { ...judgeAuth(r.parsed), details: { final: r.text.slice(0, 600) } };
+      if (r.rejected) return { ...judgeAuth({ rejected: r.text.slice(0, 300) }), details: { overrides: applied, text: r.text.slice(0, 600) } };
+      return { ...judgeAuth(r.parsed), details: { overrides: applied, final: r.text.slice(0, 600) } };
     },
   },
   {

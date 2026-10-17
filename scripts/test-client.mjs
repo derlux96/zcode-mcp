@@ -147,7 +147,13 @@ if (e2e) {
     const m = /^job_id: (job_\S+)$/m.exec(text);
     if (!m) return text;
     const deadline = Date.now() + 15 * 60 * 1000;
-    while (!TERMINAL_RE.test(text) && Date.now() < deadline) {
+    while (!TERMINAL_RE.test(text)) {
+      // An error answer (unknown job, bad arguments) has no status line: fail fast with it.
+      if (!/^status: /m.test(text)) return text;
+      if (Date.now() >= deadline) {
+        console.error(`  e2e job ${m[1]} still running after 15 min; cancelling it`);
+        return call('zcode_cancel', { job_id: m[1] });
+      }
       text = await call('zcode_status', { job_id: m[1], wait_ms: 120000 });
     }
     return call('zcode_result', { job_id: m[1] });

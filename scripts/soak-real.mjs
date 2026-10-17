@@ -23,6 +23,7 @@ minutes and continues with a fresh server on the same ZCODE_MCP_HOME.
   --cap-min C     cancel the job after C minutes (default max(2N, N+20))
   --modules N     task size (default 25 modules; raise it if the job finishes too early)
   --restart-at M  minute of the server restart (default max(2, N/3))
+  --poll-sec S    zcode_status poll interval in seconds, at least 10 (default 60)
   --dry-run       print the plan and the prompt, start nothing
 Spends real ZCode quota. Report: $ZCODE_MCP_HOME/reports/soak-*.json.
 `;
@@ -67,10 +68,12 @@ export function judgeSoak(timeline) {
   const restartIdx = timeline.findIndex((e) => e.kind === 'restart');
   const polls = timeline.filter((e) => e.kind === 'poll');
   if (restartIdx < 0) reasons.push('no server restart happened during the run');
+  else if (timeline[restartIdx].killed === false) reasons.push('the kill of the MCP server was refused (identity mismatch); restart not tested');
   else if (!timeline.slice(restartIdx + 1).some((e) => e.kind === 'poll')) reasons.push('no poll after the restart');
 
   for (const p of polls) if (p.state === 'lost') reasons.push(`job turned lost at t=${p.t}s`);
-  const running = polls.filter((p) => !TERMINAL.includes(p.state));
+  // Only `running` polls: the runner writes no heartbeat while `starting`.
+  const running = polls.filter((p) => p.state === 'running');
   for (let i = 1; i < running.length; i++) {
     const a = Date.parse(running[i - 1].heartbeatAt);
     const b = Date.parse(running[i].heartbeatAt);
@@ -101,6 +104,18 @@ export function judgeSoak(timeline) {
   };
 }
 
+/** Option checks -> list of error messages ([] = ok). */
+export function validateSoakOptions({ minutes, modules, restartAt, capMin, pollSec }) {
+  const errors = [];
+  for (const [name, v] of [['--minutes', minutes], ['--modules', modules], ['--restart-at', restartAt], ['--cap-min', capMin], ['--poll-sec', pollSec]]) {
+    if (!Number.isFinite(v) || v <= 0) errors.push(`${name} must be a positive number`);
+  }
+  if (Number.isFinite(modules) && !Number.isInteger(modules)) errors.push('--modules must be an integer');
+  // The runner beats every 5 s; shorter polls would see unchanged heartbeats.
+  if (Number.isFinite(pollSec) && pollSec > 0 && pollSec < 10) errors.push('--poll-sec must be at least 10 (the heartbeat interval is 5 s)');
+  return errors;
+}
+
 async function main() {
   const flags = startCli(process.argv.slice(2), { boolean: ['dry-run'], value: ['minutes', 'modules', 'restart-at', 'cap-min', 'poll-sec'] }, USAGE);
   const minutes = Number(flags.minutes ?? 25);
@@ -108,8 +123,9 @@ async function main() {
   const restartAt = Number(flags['restart-at'] ?? Math.max(2, minutes / 3));
   const capMin = Number(flags['cap-min'] ?? Math.max(2 * minutes, minutes + 20));
   const pollSec = Number(flags['poll-sec'] ?? 60);
-  if (![minutes, modules, restartAt, capMin, pollSec].every((n) => Number.isFinite(n) && n > 0) || !Number.isInteger(modules)) {
-    process.stderr.write(`numeric flags must be positive (--modules an integer)\n\n${USAGE}`);
+  const errors = validateSoakOptions({ minutes, modules, restartAt, capMin, pollSec });
+  if (errors.length) {
+    process.stderr.write(`${errors.join('\n')}\n\n${USAGE}`);
     return 2;
   }
   const plan = { minutes, modules, restartAtMin: restartAt, capMin, pollEverySec: pollSec, prompt: soakPrompt(modules) };
@@ -124,6 +140,26 @@ async function main() {
   const sec = () => Math.round((Date.now() - t0) / 1000);
   let client = await realServer(home);
   let jobId = null;
+  // Cancels the job through a live server (a fresh one if the current one is gone).
+  const cancelJob = async () => {
+    if (!jobId) return;
+    const c = client && !client.hasExited ? client : await realServer(home).catch(() => null);
+    if (!c) return;
+    await c.callTool('zcode_cancel', { job_id: jobId }, { timeoutMs: 60000 }).catch(() => {});
+    if (c !== client) await stopServer(c);
+  };
+  // Hard wall-clock guard: whatever hangs, the job is cancelled and the run ends.
+  const hardMs = (capMin + 15) * 60000;
+  const watchdog = setTimeout(async () => {
+    report.error = `hard wall-clock guard hit after ${capMin + 15} min`;
+    await cancelJob();
+    await stopServer(client);
+    report.timeline = timeline;
+    report.verdict = judgeSoak(timeline);
+    report.ok = false;
+    writeReport(home, 'soak', report);
+    process.exit(1);
+  }, hardMs);
   try {
     const started = await client.callTool('zcode_run', { prompt: plan.prompt, cwd: repo, wait_ms: 0 }, { timeoutMs: 120000 });
     jobId = parseResultText(started.text).jobId;
@@ -134,10 +170,20 @@ async function main() {
       await sleep(pollSec * 1000);
       if (!restarted && Date.now() - t0 >= restartAt * 60000) {
         const killed = safeSignal(client.pid, 'SIGKILL', { expectStart: client.identity });
-        await client.exited;
         timeline.push({ kind: 'restart', t: sec(), killed });
-        client = await realServer(home);
         restarted = true;
+        if (!killed) {
+          // Never wait for a server we could not kill: cancel and end with a failed verdict.
+          report.error = 'the MCP server kill was refused (identity mismatch); job cancelled';
+          await client.callTool('zcode_cancel', { job_id: jobId }, { timeoutMs: 60000 }).catch(() => {});
+          break;
+        }
+        await Promise.race([client.exited, sleep(10000)]);
+        try {
+          client = await realServer(home);
+        } catch (error) {
+          throw new Error(`the replacement MCP server did not start: ${error.message}`);
+        }
       }
       const r = await client.callTool('zcode_status', { job_id: jobId }, { timeoutMs: 120000 });
       const p = parseResultText(r.text);
@@ -158,8 +204,9 @@ async function main() {
     report.result = fin.text.slice(0, 4000);
   } catch (error) {
     report.error = String(error && error.stack ? error.stack : error);
-    if (jobId && !client.hasExited) await client.callTool('zcode_cancel', { job_id: jobId }, { timeoutMs: 60000 }).catch(() => {});
+    await cancelJob();
   } finally {
+    clearTimeout(watchdog);
     await stopServer(client);
   }
   try {

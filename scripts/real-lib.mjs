@@ -3,7 +3,7 @@
 // stdio, polling a job to its end, leftover checks and the JSON report.
 // Pure functions first; everything below `--- side effects ---` touches disk or processes.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StdioClient, assertNoLeftoverProcesses, waitFor } from '../test/helpers.mjs';
@@ -194,9 +194,19 @@ export async function followJob(client, jobId, { t0 = Date.now(), capMs = 600000
   return { t0, jobId, capped, text: final.text, isError: final.isError, parsed: parseResultText(final.text), status };
 }
 
-/** Throws when a runner/server of this run (markers) or a recorded ZCode child is still alive. */
+/** Entries left in <home>/locks (a finished run must leave none); [] when the dir is missing. */
+export function leftoverLocks(home) {
+  try { return readdirSync(join(home, 'locks')).sort(); } catch { return []; }
+}
+
+/**
+ * Throws when a runner/server of this run (markers) or a recorded ZCode child is
+ * still alive, or when a directory lock is left in <home>/locks (spec §13: 0 processes, 0 locks).
+ */
 export async function assertNothingLeft(markers, home, jobIds) {
   await assertNoLeftoverProcesses(markers, { timeoutMs: 5000 });
+  const locks = leftoverLocks(home);
+  if (locks.length) throw new Error(`leftover locks in ${join(home, 'locks')}: ${locks.join(', ')}`);
   for (const jobId of jobIds) {
     const s = readJobStatus(home, jobId);
     if (!s || !Number.isInteger(s.childPid)) continue;

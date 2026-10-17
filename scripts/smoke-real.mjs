@@ -119,8 +119,9 @@ export function judgeRun(task, run, oracle) {
     if (task.outputIncludes && !String(run.output || '').includes(task.outputIncludes)) {
       return { ok: false, falseSuccess: true, reason: `completed but the output does not contain ${task.outputIncludes}` };
     }
+    // Ruling: an impossible task reported completed without no_changes is a false success.
     if (task.kind === 'impossible' && !warnings.includes('no_changes')) {
-      return { ok: false, falseSuccess: false, reason: 'completed without the no_changes warning' };
+      return { ok: false, falseSuccess: true, reason: 'completed without the no_changes warning' };
     }
     return { ok: true, falseSuccess: false };
   }

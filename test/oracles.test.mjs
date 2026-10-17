@@ -5,12 +5,12 @@ import assert from 'node:assert/strict';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeGitRepo, run, removeDir } from './helpers.mjs';
-import { parseResultText, percentile, parseFlags, changedPaths } from '../scripts/real-lib.mjs';
+import { parseResultText, percentile, parseFlags, changedPaths, leftoverLocks } from '../scripts/real-lib.mjs';
 import { SMOKE_TASKS, checkOracle, judgeRun, setupTask, summarizePath } from '../scripts/smoke-real.mjs';
-import { judgeSoak, soakPrompt, checkSoakEffect } from '../scripts/soak-real.mjs';
+import { judgeSoak, soakPrompt, checkSoakEffect, validateSoakOptions } from '../scripts/soak-real.mjs';
 import {
   SCENARIOS, selectScenarios, isZCodeAppRunning, judgeKill, judgeAuth, judgeNonGit,
-  judgeDirty, judgeParallel, judgeUnwritable,
+  judgeDirty, judgeParallel, judgeUnwritable, authIsolationEnv,
 } from '../scripts/faults-real.mjs';
 
 const dirs = [];
@@ -62,6 +62,15 @@ test('parseResultText: running text, unavailable changes, worktree block', () =>
   assert.equal(w.worktreeBranch, 'zcode/x-1');
   assert.equal(w.worktreeDir, '/tmp/r/.zcode-worktrees/x-1');
   assert.deepEqual(w.changedFiles, []);
+});
+
+test('leftoverLocks lists entries of <home>/locks and tolerates a missing dir', () => {
+  const home = repo();
+  assert.deepEqual(leftoverLocks(home), []);
+  mkdirSync(join(home, 'locks'));
+  assert.deepEqual(leftoverLocks(home), []);
+  writeFileSync(join(home, 'locks', 'abc.lock'), '{}');
+  assert.deepEqual(leftoverLocks(home), ['abc.lock']);
 });
 
 test('percentile uses nearest rank and tolerates empty input', () => {
@@ -183,6 +192,7 @@ test('judgeRun: impossible task accepts failed or completed+no_changes, never an
   assert.equal(judgeRun(t, { state: 'completed', warnings: ['no_changes'] }, ok).ok, true);
   const noWarn = judgeRun(t, { state: 'completed', warnings: [] }, ok);
   assert.equal(noWarn.ok, false);
+  assert.equal(noWarn.falseSuccess, true);
   assert.match(noWarn.reason, /no_changes/);
   const invented = judgeRun(t, { state: 'completed', warnings: [] }, { ok: false, reason: 'invented file x' });
   assert.deepEqual([invented.ok, invented.falseSuccess], [false, true]);
@@ -262,6 +272,34 @@ test('judgeSoak: no restart, no poll after restart, untruthful failure, wrong ef
   assert.ok(judgeSoak([...base]).reasons.some((r) => /never reached a terminal state/.test(r)));
 });
 
+test('judgeSoak compares heartbeats only between running polls', () => {
+  const v = judgeSoak([
+    poll(10, 0, 0, { state: 'starting' }),
+    poll(70, 0, 0),
+    { kind: 'restart', t: 100 },
+    poll(130, 128, 120),
+    { kind: 'final', t: 200, state: 'completed', errorKind: null, effectOk: true },
+  ].map((e) => (e.state === 'starting' ? { ...e, heartbeatAt: iso(5) } : e)));
+  assert.deepEqual(v.reasons, []);
+});
+
+test('judgeSoak fails when the server kill was refused', () => {
+  const v = judgeSoak([
+    poll(60, 58, 50),
+    { kind: 'restart', t: 61, killed: false },
+    { kind: 'final', t: 70, state: 'cancelled', errorKind: 'cancelled' },
+  ]);
+  assert.ok(v.reasons.some((r) => /kill of the MCP server was refused/.test(r)), v.reasons.join('; '));
+});
+
+test('validateSoakOptions rejects a poll interval under 10 s and non-positive values', () => {
+  const good = { minutes: 25, modules: 25, restartAt: 8, capMin: 50, pollSec: 60 };
+  assert.deepEqual(validateSoakOptions(good), []);
+  assert.ok(validateSoakOptions({ ...good, pollSec: 5 }).some((e) => /--poll-sec must be at least 10/.test(e)));
+  assert.ok(validateSoakOptions({ ...good, modules: 2.5 }).length > 0);
+  assert.ok(validateSoakOptions({ ...good, minutes: 0 }).length > 0);
+});
+
 test('soakPrompt and checkSoakEffect agree on the module count', () => {
   const p = soakPrompt(3);
   assert.match(p, /mod3\.js/);
@@ -311,6 +349,25 @@ test('judgeAuth: auth is ok, a completion means credentials outside HOME, a refu
   const other = judgeAuth({ state: 'failed', errorKind: 'unknown', error: 'boom' });
   assert.equal(other.status, 'failed');
   assert.match(other.reason, /expected error_kind auth/);
+});
+
+test('authIsolationEnv clears ZCode/XDG variables and detects leftovers into ~/.zcode', () => {
+  const env = {
+    PATH: '/usr/bin', HOME: '/Users/u', ZCODE_BIN: '/bin/z', ZCODE_MCP_HOME: '/tmp/h', ZCODE_MCP_STATE: '/tmp/h/s.json',
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: '/Applications/ZCode.app/x.json',
+    ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: '/Users/u/.zcode/v2/provider_config.json',
+    ZCODE_FOO: '1', XDG_CONFIG_HOME: '/Users/u/.config',
+  };
+  const { overrides, leaks } = authIsolationEnv(env, '/Users/u', '/tmp/empty');
+  assert.equal(overrides.HOME, '/tmp/empty');
+  for (const k of ['ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', 'ZCODE_FOO', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME']) {
+    assert.ok(k in overrides && overrides[k] === undefined, k);
+  }
+  for (const k of ['ZCODE_BIN', 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', 'ZCODE_MCP_HOME', 'ZCODE_MCP_STATE', 'PATH']) assert.ok(!(k in overrides), k);
+  assert.deepEqual(leaks, []);
+  const bad = authIsolationEnv({ ...env, ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: '/Users/u/.zcode/b.json', OTHER: '/Users/u/.zcode' }, '/Users/u', '/tmp/empty');
+  assert.deepEqual(bad.leaks.sort(), ['OTHER', 'ZCODE_BUILTIN_PROVIDER_CONFIG_FILE']);
+  assert.deepEqual(authIsolationEnv({ ...env, X: '/Users/u/.zcode-mcp/jobs' }, '/Users/u', '/tmp/e').leaks, []);
 });
 
 test('judgeNonGit, judgeDirty, judgeParallel, judgeUnwritable', () => {
