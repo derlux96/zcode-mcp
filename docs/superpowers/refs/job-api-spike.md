@@ -55,12 +55,20 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
   still comes on top.
 - Temporary provider errors are continued in the same session only on the protocol path; the CLI
   path has no continue (rerun with `resume` manually), and `max_transient_retries` is rejected there.
-- Z.ai's `[1113] Insufficient balance or no resource package` (HTTP 429) is retried like any 429:
-  for a real balance problem that costs up to the full schedule (~33.5 min of waiting with the defaults, bounded
-  by `timeout_ms`) before the real message is reported.
-- Continuing a session after `turn.failed` is verified against the fake app-server only; whether
-  the real app-server keeps every failed turn's session usable for `session/send` was not run
-  against the real binary on this branch.
+- Z.ai's `[1113] Insufficient balance or no resource package` / `余额不足` is a separate balance
+  class (R31): at most 2 retries (30 s, 60 s), then the real message with `error_kind: quota`, so a
+  real exhaustion or a wrong endpoint surfaces within ~1.5 min.
+- ZCode's `retryable` flag on provider errors is not honoured (R30): it marks provider 429s
+  `retryable: false` although they often clear.
+- VERIFIED on the real binary (controller): a second `session/send` into the same session after a
+  failed turn completed and wrote a file. The real `turn.failed` layout is
+  `payload.error = { type, code, message (localized, e.g. Chinese), detail, underlyingErrorMessage, stack }`,
+  e.g. `{ code: 'model_not_found', message: 'Provider Registry 中不存在 Model: …', detail: 'Model creation failed' }`;
+  classification therefore searches all of those fields.
+- A real provider 429 `turn.failed` payload was never observed. An earlier ZCode log showed
+  `statusCode: 429` with `statusMessage: [1113][Insufficient balance or no resource package. Please recharge.][…]`
+  (marked `retryable: false`); the fake app-server's `fail-status-1113-always` mode mirrors that
+  shape, the exact field names on `turn.failed` remain unverified.
 - The `sess_` id is lost when a protocol job times out or is cancelled silently after
   `session/create` (no event carried it yet): such a result is not resumable.
 - A `session/send` acknowledgement timeout is booked as `timeout_total` with a misleading message.

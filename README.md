@@ -56,8 +56,9 @@ create no job.
 
 `providers` is always reported, without any network access: one entry `{id, enabled, baseUrl,
 apiType, accessType}` per provider rule in `$ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, else
-`~/.zcode/v2/provider_config.json` (API keys, tokens and secret-named URL parameters are never
-shown). Each enabled provider whose `baseUrl` is empty, contains whitespace, lacks the scheme,
+`~/.zcode/v2/provider_config.json` (API keys, tokens, URL userinfo, URL fragments and
+secret-named URL parameters are never shown; path segments of a `baseUrl` are shown as they are,
+so do not put secrets into the path). Each enabled provider whose `baseUrl` is empty, contains whitespace, lacks the scheme,
 does not parse as a URL, is not http(s) or ends with stray punctuation adds a warning, e.g.
 `provider zai-coding-plan: baseUrl "https://api.z.ai/api/coding/paas/v4." ends with "." — probably a typo`
 (such a slip otherwise only shows up at the first real job, as the generic `Model request failed.`).
@@ -65,8 +66,10 @@ A missing file is not an error (`providers: []`); invalid JSON adds one warning.
 
 `probe_model: true` (default `false`; **costs one tiny model request**) runs, after the other
 checks, `Reply with exactly the single word OK. Do not use any tools.` through the protocol path
-with ZCode's current model in a throwaway temp directory (60 s cap, 30 s idle limit, never
-retried; the directory and the app-server are always removed) and adds
+with ZCode's current model in a throwaway temp directory (never retried; the directory and the
+app-server are always removed). It can take **up to ~75 s** (60 s for the turn, 30 s idle limit,
+75 s wall clock including app-server start-up); cancelling the `zcode_check` call ends it
+(`errorKind: cancelled`). It adds
 `modelProbe: {ok, durationMs, model, errorKind?, error?, hint?}`. A failed probe adds the warning
 `model probe failed: <kind>: <error>` (for `Model creation failed` also the login/provider
 `hint`), but the top-level `ok` keeps meaning "binary reachable". If the app-server cannot start
@@ -81,27 +84,50 @@ model: *The previous attempt was interrupted by a temporary provider error (rate
 network). Continue the task exactly where you stopped. Do not redo work that is already finished;
 re-run the tests if you were in the middle of testing.*
 
-- Transient: HTTP `429`, `500`, `502`, `503`, `504`, `529`, `overloaded`, `rate limit`,
-  `too many requests`, `temporarily unavailable`, `try again`, provider stream timeouts, network
-  errors (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EPIPE`,
-  `fetch failed`, `socket hang up`, `network error`, `terminated`, `stream ended/closed
-  unexpectedly`). Z.ai's `[1113] Insufficient balance or no resource package` arrives as HTTP 429
-  and is retried like any 429 (bounded; the real message is reported in the end).
-- Never retried: auth (`401`, `403`, invalid key, `project_token_login_failed`), model problems
+- Where the cause is read: every diagnostic field of the `turn.failed` error — `code`, `type`,
+  `message` (often localized, e.g. Chinese), `detail`, `underlyingErrorMessage`, `statusMessage` and
+  a structured `statusCode`/`status` (never the stack). The same combined text decides
+  `error_kind` and the login/provider `hint:`; the `error:` line shows the message plus the distinct
+  English causes (`message | detail | …`). ZCode's own `retryable` flag is **not** honoured: ZCode
+  marks provider 429s `retryable: false` although they often clear.
+- HTTP status codes count only in a status context (`429 …` at the start of a field,
+  `HTTP 503`, `status code: 502`, `[429]`, or the structured `statusCode`), so numbers such as
+  `max_tokens must be <= 500` or `Daily limit of 500 requests` never trigger a retry.
+- Transient classes:
+  - **rate limit**: HTTP 429, `rate limit`, `too many requests`, `速率限制`, `请求过多`, `频率`;
+  - **overloaded**: HTTP 5xx (incl. 529), `overloaded`, `temporarily unavailable`,
+    `service unavailable`, `bad gateway`, `gateway timeout`, `try again`, `稍后重试`/`稍后再试`,
+    `过载`, `繁忙`;
+  - **network**: `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EPIPE`,
+    `fetch failed`, `socket hang up`, `network error`, `other side closed`, `terminated` only
+    next to `socket`/`connection`, `stream ended/closed unexpectedly`, stream/upstream/gateway/read/
+    connection timeouts and `request timed out` (not a bare `timeout`, e.g. `Tool execution timeout`);
+  - **balance** (Z.ai business code `1113`, `Insufficient balance or no resource package`,
+    `余额不足`): retried **at most 2 times** (waits of 30 s and 60 s), whatever
+    `max_transient_retries` says (a lower value still applies), then the job fails with the real
+    message, `error_kind: quota` and `transient_retries_exhausted:N`. A real exhaustion or a
+    misconfigured endpoint (a wrong `baseUrl` can produce exactly this error) thus surfaces within
+    about 1.5 minutes.
+- Never retried (a permanent cause in any field wins): auth (`401`, `403`, invalid key, `project_token_login_failed`), model problems
   (`Model creation failed`, `Select a model`, `Model is unavailable`), the generic
   `Model request failed.` (a wrong `baseUrl` produces it), context/length errors, `400`/`404`/`422`,
   content filters, a crashed app-server, and our own idle/total timeouts and cancellation.
 - Schedule: 30 s, 60 s, 2 min, 5 min, 10 min, 15 min (±10 % jitter; later attempts repeat the
-  last step); a numeric `retry-after` in the error payload replaces the step (capped at 15 min).
+  last step); a `retry-after` in plain seconds (fractions rounded up; `ms` values and dates are
+  ignored) replaces the step, at least 1 s and at most 15 min.
   `max_transient_retries` (`zcode_run`, 0..20, default 6; `0` disables) sets the number of retries.
 - `timeout_ms` is a deadline for the whole protocol job, measured from the first message:
   every wait gets the time that is left, and a backoff that would pass the deadline is not
   started (the last failure is reported with the warning `retry_budget_exhausted`). The idle timer
-  does not run during a backoff; heartbeats continue; `zcode_cancel` ends a backoff at once.
+  does not run during a backoff; heartbeats continue; `zcode_cancel` ends a backoff at once, and
+  so does an app-server that dies during it (`error_kind: crash`).
 - While a job waits it stays `status: running`; `zcode_status` shows
   `retrying: attempt 2/6 in 120s (HTTP 429 …)` and a progress line
-  `retrying in 120s (attempt 2/6): …`. The result shows `retries: N (recovered)` or
-  `retries: N (exhausted)` above the output marker, `result.json` keeps the history
+  `retrying in 120s (attempt 2/6): …`. The result shows `retries: N (<outcome>)` above the output
+  marker, where `<outcome>` is `recovered` (completed after the retries), `exhausted` (the retries
+  or the `timeout_ms` budget ran out), or the job's final state when it ended otherwise after
+  retrying: `failed` (a later non-transient error or a crashed app-server), `timeout`,
+  `cancelled`. `result.json` keeps the history
   (`retries: [{at, attempt, delayMs, reason}]`), and the warnings are
   `recovered_after_transient_errors:N` or `transient_retries_exhausted:N`. After the last retry the
   failure is reported exactly as before (`status: failed`, the real message and `error_kind`).

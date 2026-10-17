@@ -20,7 +20,8 @@ Also read its other fields:
 - `providers`: the personal provider config, checked statically; a warning such as
   `baseUrl "…/v4." ends with "."` is a config typo the user must fix before jobs can work.
 - `include_models: true` adds the model catalog (see 4).
-- `probe_model: true` sends one tiny real model request (costs one request, never retried) and
+- `probe_model: true` sends one tiny real model request (costs one request, never retried, can
+  take up to ~75 s) and
   reports `modelProbe`; use it when the first job on a machine matters or a job failed with an
   unclear `model`/`auth` error. `modelProbe.ok: false` with `errorKind` tells you why.
 
@@ -76,6 +77,8 @@ job: it waits (30 s, 60 s, 2, 5, 10, 15 min) and continues in the same session, 
 following it with `zcode_status`, do not cancel or restart it. The result says
 `retries: N (recovered)` (warning `recovered_after_transient_errors:N`) or `retries: N (exhausted)`
 (then `status: failed` with the real error). Auth, model and configuration errors are never retried.
+A balance error (Z.ai `1113`, `Insufficient balance`, `余额不足`) is retried only twice (~1.5 min):
+if it persists, tell the user to check the plan/balance and the provider `baseUrl`.
 
 `timeout_ms: 0` removes the total cap: use it for big tasks that must never be cut off by the clock. The job then ends by itself, by the idle timeout (protocol path) or when you call `zcode_cancel`; on the CLI path nothing detects a hung ZCode in that case, so prefer the protocol path for `0`.
 
