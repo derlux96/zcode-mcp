@@ -19,3 +19,37 @@ Task sent: "Create a file hello.txt containing hi" (one throwaway session, model
 - `turn.completed.payload`: `response`, `tokenCount`, `usage`, `toolCallCount`, `duration` (ms), `resultType: "success"`.
 - Oddity: the `session/create` response reported `session.mode: "build"` even though `mode: 'yolo'` was passed, yet the Write succeeded. Whether the response echoes the mode wrongly or yolo is applied later was not investigated.
 - User plugin hooks (superpowers SessionStart) show up as `session.updated` events.
+
+## Smoke baseline (stage 4, `node scripts/smoke-real.mjs --real`)
+
+Date: 2026-10-17, one run (14:35-14:40 UTC), ZCode 0.16.9, macOS arm64, ZCode desktop app open.
+6 tiny tasks (create file, change file, run tests, multi-file change, impossible task, read-only
+question) per path, each in a fresh temp git repo, sequential, one MCP server over stdio.
+Latency = `zcode_run` call -> `finishedAt` of the job (includes runner spawn, app-server/CLI
+start, model work and change collection). First activity = `zcode_run` call -> first protocol
+event in `events.log` (protocol path only; the CLI emits nothing until the end).
+
+| Path | Result | p50 latency | p95 latency | first activity p50 / p95 |
+|---|---|---|---|---|
+| protocol, default model (`zai-coding-plan/GLM-5.3`, reasoning high) | 6/6 ok | 17.6 s | 26.4 s | 0.93 s / 0.95 s |
+| protocol, `zai-coding-plan/GLM-5.3-Flash`, reasoning low | 6/6 ok | 13.3 s | 18.6 s | 0.95 s / 0.99 s |
+| CLI, `mode: yolo` | 6/6 ok | 14.7 s | 18.7 s | n/a |
+
+False successes: 0. Failed oracles: 0. Leftover processes: 0. The impossible and read-only tasks
+ended `completed` with warning `no_changes` and an unchanged working tree on every path; nothing
+was invented. With 6 samples per path p95 equals the slowest run; treat the numbers as a first
+baseline, not a threshold. The overhead against direct ZCode was not measured separately; the
+time to the first protocol event (~0.95 s) bounds the job machinery's start-up cost on the
+protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 s per path.
+
+## Known limitations (final)
+
+- Denied tool calls are not reported (`deniedTools` unverified: no deny event observed, see (a)).
+- The CLI path has no progress and no idle detection (output only at the end); only `timeout_ms` applies.
+- `yolo` and the protocol path can write outside `cwd`; only `isolate_worktree` gives isolation, and
+  worktrees are never removed automatically.
+- Non-git directories: no changed-file report (`changes: unavailable`) and no `no_changes` check.
+- `lost`/`stalled` detection relies on `ps -o lstart=,command=`; verified on macOS only.
+- The latency baseline above is a single run of 18 tiny tasks; the soak (stage 5) and the real
+  fault scenarios (stage 6) are run separately by the controller.
+- `zcode_run`'s `wait_ms` (max 300 s) assumes the MCP host has no shorter tool-call timeout (unverified).
