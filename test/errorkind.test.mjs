@@ -36,6 +36,10 @@ const CASES = [
   ['账户余额不足', 'quota'],
   ['请求过多，请稍后再试', 'quota'],
   ['触发速率限制', 'quota'],
+  ['请求频率过高', 'quota'],
+  ['当前API请求次数超过限制', 'quota'],
+  ['参数 frequency_penalty（频率惩罚）取值无效', 'unknown'],
+  ['频率惩罚参数超出范围', 'unknown'],
   ['[1113][Insufficient balance or no resource package. Please recharge.][req]', 'quota'],
 ];
 

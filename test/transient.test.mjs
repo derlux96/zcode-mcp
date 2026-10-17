@@ -18,6 +18,13 @@ const TRANSIENT = [
   ['请求过多，请稍后再试', 'rate_limit'],
   ['触发速率限制', 'rate_limit'],
   ['请求频率过高', 'rate_limit'],
+  ['调用频率超限', 'rate_limit'],
+  ['请求次数超过限制', 'rate_limit'],
+  ['当前API请求次数超过限制', 'rate_limit'],
+  ['Internal Server Error', 'overloaded'],
+  ['upstream connect error or disconnect/reset before headers. reset reason: connection termination', 'network'],
+  ['upstream connect error', 'network'],
+  ['reset before headers', 'network'],
   ['500 Internal Server Error', 'overloaded'],
   ['HTTP 502 Bad Gateway', 'overloaded'],
   ['status 503', 'overloaded'],
@@ -86,6 +93,14 @@ const PERMANENT = [
   'Tool execution timeout',
   'Process terminated by user',
   'job took 503 seconds',
+  'Tool execution timeout: bash exceeded 120s',
+  'Invalid request: tools[0].name is invalid. Please fix it and try again.',
+  // 频率 alone is "frequency": a parameter error, not a rate limit.
+  '参数 frequency_penalty（频率惩罚）取值无效',
+  '频率惩罚参数超出范围',
+  'frequency_penalty must be between -2 and 2',
+  'The operation was aborted due to timeout',
+  'Tool execution aborted due to timeout',
 ];
 
 test('transient provider errors are recognised with their class (table)', () => {
@@ -188,4 +203,10 @@ test('retryDelayMs honours retry-after with a 1 s floor and the largest step as 
   assert.equal(retryDelayMs(1, { delaysMs: delays, jitter: 0.1, retryAfter: 0 }), 1000, 'retry-after 0 must not drain retries');
   // The cap wins over the floor when the whole schedule is shorter than 1 s (tests).
   assert.equal(retryDelayMs(1, { delaysMs: [5], jitter: 0, retryAfter: 0 }), 5);
+});
+
+test('"aborted due to timeout" is transient only next to a fetch/stream/network word', () => {
+  assert.equal(classifyTransient({ message: 'The operation was aborted due to timeout', underlyingErrorMessage: 'fetch to the model stream' }).klass, 'network');
+  assert.equal(classifyTransient({ message: 'TypeError: fetch: The operation was aborted due to timeout' }).klass, 'network');
+  assert.equal(isTransientProviderError({ message: 'The operation was aborted due to timeout' }), false);
 });

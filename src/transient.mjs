@@ -36,6 +36,7 @@ const PERMANENT = [
   new RegExp([
     'unauthori[sz]ed', 'invalid api key', 'project_token_login_failed', 'login failed',
     'model creation failed', 'select a model', 'model is unavailable',
+    String.raw`\binvalid (?:request|parameter|argument|value)\b`, String.raw`\bis invalid\b`, '取值无效', '参数无效', '参数错误',
     String.raw`context (?:length|window)`, 'maximum context', String.raw`(?:prompt|input|message|request body) is too long`,
     String.raw`content[ _-]?filter`,
     String.raw`app-server child (?:exited|failed)`,
@@ -45,19 +46,23 @@ const PERMANENT = [
 // [klass, patterns] in priority order; the structured status is handled separately.
 const CLASSES = [
   ['balance', [/\[1113\]|insufficient balance|no resource package|余额不足/i]],
-  ['rate_limit', [statusContext('429'), /rate[ _-]?limit|too many requests|速率限制|请求过多|频率/i]],
+  // 频率 alone means "frequency" (frequency_penalty parameter errors): only rate phrases count.
+  ['rate_limit', [statusContext('429'), /rate[ _-]?limit|too many requests|速率限制|请求过多|请求频率|调用频率|访问频率|频率(?:过高|超限|限制|太高)|次数超过限制/i]],
   ['overloaded', [
     statusContext(String.raw`5\d\d`),
-    /overloaded|temporarily unavailable|service unavailable|bad gateway|gateway timeout|try again|稍后重试|稍后再试|过载|繁忙/i,
+    /overloaded|temporarily unavailable|service unavailable|internal server error|bad gateway|gateway timeout|try again|稍后重试|稍后再试|过载|繁忙/i,
   ]],
   ['network', [new RegExp([
     'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE',
     'fetch failed', 'socket hang up', 'network error', 'other side closed',
+    'upstream connect error', String.raw`(?:disconnect|reset) before headers`,
     String.raw`\bterminated\b.{0,40}\b(?:socket|connection)`,
     String.raw`stream (?:ended|closed) unexpectedly`,
     String.raw`\b(?:stream|upstream|gateway|read|connection|connect)\s+(?:timeout|timed out)\b`,
     String.raw`\brequest timed out\b`,
-  ].join('|'), 'i')]],
+  ].join('|'), 'i'),
+  // A fetch/stream abort by timeout; a tool's own "aborted due to timeout" is not a provider error.
+  { test: (t) => /aborted due to timeout/i.test(t) && /\b(?:fetch|stream|network|socket|undici)\b/i.test(t) }]],
 ];
 
 /** The structured HTTP status (statusCode or status, 100..599) or null. */
