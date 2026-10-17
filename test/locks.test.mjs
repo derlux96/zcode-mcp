@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readdirSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { acquireCwdLock, releaseCwdLock, lockKey } from '../src/locks.mjs';
+import { acquireCwdLock, releaseCwdLock, removeStaleLock, lockKey } from '../src/locks.mjs';
 import { stateHome } from '../src/jobstore.mjs';
 
 const LOCKS_MODULE = new URL('../src/locks.mjs', import.meta.url).href;
@@ -120,12 +120,49 @@ test('race on a fresh lock: exactly one of several processes wins', withEnv(asyn
   assert.deepEqual(readdirSync(locksDir()), [`${lockKey(dir)}.lock`]);
 }));
 
-test('race on a stale lock: exactly one of several processes wins', withEnv(async (root) => {
+test('race on a stale lock, 20 rounds: exactly one winner each time, nothing left behind', withEnv(async (root) => {
+  for (let round = 0; round < 20; round++) {
+    const base = join(root, `r${round}`);
+    const dir = join(base, 'proj');
+    mkdirSync(dir, { recursive: true });
+    acquireCwdLock(dir, 'job_dead', always);
+    // Only the pre-existing job_dead is dead; the winner's job_N counts as alive for the losers.
+    const results = await raceChildren(dir, 4, "(id) => id !== 'job_dead'");
+    const winners = results.flatMap((r, i) => (r.ok ? [`job_${i}`] : []));
+    assert.equal(winners.length, 1, `round ${round}: ${JSON.stringify(results)}`);
+    assert.deepEqual(readdirSync(locksDir()).filter((f) => f.startsWith(lockKey(dir))), [`${lockKey(dir)}.lock`]);
+    releaseCwdLock(dir, winners[0]);
+  }
+  assert.deepEqual(readdirSync(locksDir()), []);
+}));
+
+test('abandoned claim (older than 30 s) does not block takeover', withEnv(async (root) => {
   const dir = join(root, 'proj');
   mkdirSync(dir);
   acquireCwdLock(dir, 'job_dead', always);
-  // Only the pre-existing job_dead is dead; the winner's job_N counts as alive for the losers.
-  const results = await raceChildren(dir, 4, "(id) => id !== 'job_dead'");
-  assert.equal(results.filter((r) => r.ok).length, 1, JSON.stringify(results));
+  const claim = join(locksDir(), `${lockKey(dir)}.lock.claim`);
+  writeFileSync(claim, JSON.stringify({ pid: 1, createdAt: new Date(Date.now() - 60_000).toISOString() }));
+  assert.deepEqual(acquireCwdLock(dir, 'job_new', (id) => id !== 'job_dead'), { ok: true });
   assert.deepEqual(readdirSync(locksDir()), [`${lockKey(dir)}.lock`]);
+}));
+
+test('removeStaleLock removes a stale lock, spares a live one, false when none', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  assert.equal(removeStaleLock(dir, never), false);
+  acquireCwdLock(dir, 'job_a', always);
+  assert.equal(removeStaleLock(dir, always), false);
+  assert.deepEqual(acquireCwdLock(dir, 'job_b', always), { ok: false, blockingJobId: 'job_a' });
+  assert.equal(removeStaleLock(dir, never), true);
+  assert.deepEqual(readdirSync(locksDir()), []);
+  assert.deepEqual(acquireCwdLock(dir, 'job_b', always), { ok: true });
+}));
+
+test('takeover and removal leave no temp or claim files behind', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  acquireCwdLock(dir, 'job_new', never);
+  removeStaleLock(dir, never);
+  assert.deepEqual(readdirSync(locksDir()), []);
 }));
