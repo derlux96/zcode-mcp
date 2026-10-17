@@ -15,6 +15,7 @@ import { reap } from './reaper.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
 import { checkProviderConfig } from './provider-check.mjs';
 import { probeModel } from './model-probe.mjs';
+import { LOGIN_HINT } from './errorkind.mjs';
 
 export { oneLine, cleanName };
 
@@ -149,7 +150,6 @@ const toolSchemas = {
 
 // ZCode's CLI prints "Model creation failed" for a missing/expired login or a broken provider
 // config alike. Fixed text, so it can sit outside the untrusted block.
-const LOGIN_HINT = 'hint: often caused by a missing, expired or misconfigured ZCode login/provider — check ~/.zcode/v2/provider_config.json (baseUrl, key) or run zcode login';
 const loginHint = (r) => (r.errorKind === 'model' && /model creation failed/i.test(`${r.errorMessage || ''}\n${r.stderr || ''}`) ? [LOGIN_HINT] : []);
 
 // R25: text produced by ZCode (or a caller) outside the untrusted output block goes
@@ -241,13 +241,6 @@ function versionWarnings(ok, raw) {
   return [`ZCode version ${v} is not in the verified list (${KNOWN_ZCODE_VERSIONS.join(', ')}); protocol behaviour may differ`];
 }
 
-// probe_model result for the payload: the fixed login hint for "Model creation failed".
-function probeSection(probe) {
-  const out = { ...probe };
-  if (out.errorKind === 'model' && /model creation failed/i.test(out.error || '')) out.hint = LOGIN_HINT;
-  return out;
-}
-
 // probe: test hook ({ timeoutMs, idleTimeoutMs, totalMs, tmpRoot }) for probeModel.
 function buildCheckHandler(reaper, probe = {}) {
   return async (args = {}, ctx = {}) => {
@@ -280,7 +273,7 @@ function buildCheckHandler(reaper, probe = {}) {
     const warnings = [...versionWarnings(ok, version.stdout.trim()), ...providers.warnings];
     let modelProbe;
     if (args.probe_model === true) {
-      modelProbe = probeSection(await probeModel({ ...probe, signal: ctx.signal }));
+      modelProbe = await probeModel({ ...probe, signal: ctx.signal });
       if (!modelProbe.ok) warnings.push(oneLine(`model probe failed: ${modelProbe.errorKind}: ${modelProbe.error}`));
     }
     const payload = JSON.stringify({

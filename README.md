@@ -94,12 +94,16 @@ re-run the tests if you were in the middle of testing.*
   `HTTP 503`, `status code: 502`, `[429]`, or the structured `statusCode`), so numbers such as
   `max_tokens must be <= 500` or `Daily limit of 500 requests` never trigger a retry.
 - Transient classes:
-  - **rate limit**: HTTP 429, `rate limit`, `too many requests`, `速率限制`, `请求过多`, `频率`;
-  - **overloaded**: HTTP 5xx (incl. 529), `overloaded`, `temporarily unavailable`,
+  - **rate limit**: HTTP 429, `rate limit`, `too many requests`, `速率限制`, `请求过多`,
+    `请求频率`/`调用频率`/`访问频率`, `频率过高|超限|限制|太高`, `(请求)次数超过限制` (a bare `频率`,
+    "frequency", is not enough: `frequency_penalty（频率惩罚）` errors are permanent);
+  - **overloaded**: HTTP 5xx (incl. 529), `internal server error`, `overloaded`, `temporarily unavailable`,
     `service unavailable`, `bad gateway`, `gateway timeout`, `try again`, `稍后重试`/`稍后再试`,
     `过载`, `繁忙`;
   - **network**: `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EPIPE`,
-    `fetch failed`, `socket hang up`, `network error`, `other side closed`, `terminated` only
+    `fetch failed`, `socket hang up`, `network error`, `other side closed`, Envoy's
+    `upstream connect error` / `disconnect/reset before headers`, `aborted due to timeout` only next
+    to `fetch`/`stream`/`network`/`socket`/`undici`, `terminated` only
     next to `socket`/`connection`, `stream ended/closed unexpectedly`, stream/upstream/gateway/read/
     connection timeouts and `request timed out` (not a bare `timeout`, e.g. `Tool execution timeout`);
   - **balance** (Z.ai business code `1113`, `Insufficient balance or no resource package`,
@@ -108,7 +112,8 @@ re-run the tests if you were in the middle of testing.*
     message, `error_kind: quota` and `transient_retries_exhausted:N`. A real exhaustion or a
     misconfigured endpoint (a wrong `baseUrl` can produce exactly this error) thus surfaces within
     about 1.5 minutes.
-- Never retried (a permanent cause in any field wins): auth (`401`, `403`, invalid key, `project_token_login_failed`), model problems
+- Never retried (a permanent cause in any field wins): invalid requests/parameters
+  (`Invalid request`, `… is invalid`, `取值无效`, `参数无效`, `参数错误`, even with "try again"), auth (`401`, `403`, invalid key, `project_token_login_failed`), model problems
   (`Model creation failed`, `Select a model`, `Model is unavailable`), the generic
   `Model request failed.` (a wrong `baseUrl` produces it), context/length errors, `400`/`404`/`422`,
   content filters, a crashed app-server, and our own idle/total timeouts and cancellation.
@@ -121,6 +126,10 @@ re-run the tests if you were in the middle of testing.*
   started (the last failure is reported with the warning `retry_budget_exhausted`). The idle timer
   does not run during a backoff; heartbeats continue; `zcode_cancel` ends a backoff at once, and
   so does an app-server that dies during it (`error_kind: crash`).
+- `attempt k/N` counts within the error's class (k = retries of that class so far, N = its cap,
+  e.g. `1/2` for a balance error even after two rate-limit retries), and the class's own retry
+  count picks the wait (a first balance retry always waits 30 s); `result.json` keeps the global
+  attempt number and the class (`klass`) per retry.
 - While a job waits it stays `status: running`; `zcode_status` shows
   `retrying: attempt 2/6 in 120s (HTTP 429 …)` and a progress line
   `retrying in 120s (attempt 2/6): …`. The result shows `retries: N (<outcome>)` above the output
@@ -128,7 +137,7 @@ re-run the tests if you were in the middle of testing.*
   or the `timeout_ms` budget ran out), or the job's final state when it ended otherwise after
   retrying: `failed` (a later non-transient error or a crashed app-server), `timeout`,
   `cancelled`. `result.json` keeps the history
-  (`retries: [{at, attempt, delayMs, reason}]`), and the warnings are
+  (`retries: [{at, attempt, delayMs, reason, klass}]`), and the warnings are
   `recovered_after_transient_errors:N` or `transient_retries_exhausted:N`. After the last retry the
   failure is reported exactly as before (`status: failed`, the real message and `error_kind`).
 - The CLI path cannot continue a session: `max_transient_retries` is rejected there; continue

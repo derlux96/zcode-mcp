@@ -6,7 +6,7 @@ import { basename, join } from 'node:path';
 import { createProtocol } from '../src/protocol.mjs';
 import { buildTools } from '../src/mcp-server.mjs';
 import { SessionStore } from '../src/state.mjs';
-import { PROBE_PROMPT } from '../src/model-probe.mjs';
+import { PROBE_PROMPT, probeModel } from '../src/model-probe.mjs';
 import { makeTempDir, removeDir, fakeBin, fakeAppserverBin, assertNoLeftoverProcesses, TestScope } from './helpers.mjs';
 
 const temps = [];
@@ -239,4 +239,16 @@ test('cancelling the zcode_check request ends the probe', async () => {
   assert.ok(Date.now() - t0 < 8000);
   assert.equal(payload.modelProbe.ok, false);
   assert.equal(payload.modelProbe.errorKind, 'cancelled');
+});
+
+test('the probe hint comes from the full error text, not the 300-char excerpt', async () => {
+  const long = `Provider Registry 中不存在 Model: ${'很长的说明'.repeat(80)}`;
+  const run = async () => ({ ok: false, model: { providerId: 'p', modelId: 'm' }, error: { code: 'model_not_found', message: long, detail: 'Model creation failed' } });
+  const probe = await probeModel({ run, tmpRoot: ctx.tmpRoot });
+  assert.equal(probe.errorKind, 'model');
+  assert.ok(probe.error.length <= 300);
+  assert.ok(!/Model creation failed/.test(probe.error), 'the excerpt lost the English cause');
+  assert.equal(probe.hint, LOGIN_HINT);
+  const ok = await probeModel({ run: async () => ({ ok: false, model: null, error: { message: 'HTTP 401 Unauthorized' } }), tmpRoot: ctx.tmpRoot });
+  assert.equal('hint' in ok, false);
 });

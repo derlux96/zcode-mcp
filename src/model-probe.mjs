@@ -5,7 +5,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runTaskWithModel, resolveBin } from './appserver.mjs';
-import { classifyError } from './errorkind.mjs';
+import { classifyError, LOGIN_HINT } from './errorkind.mjs';
 import { oneLine } from './sanitize.mjs';
 import { describeTurnError, errorText } from './transient.mjs';
 
@@ -20,7 +20,9 @@ const TIMEOUT_CODES = new Set(['idle', 'turn_timeout', 'request_timeout']);
 const modelName = (m) => (m && m.providerId && m.modelId ? `${m.providerId}/${m.modelId}` : null);
 
 /**
- * -> { ok, durationMs, model: 'provider/model' | null, errorKind?, error? }.
+ * -> { ok, durationMs, model: 'provider/model' | null, errorKind?, error?, hint? }.
+ * hint (the login/provider hint for "Model creation failed") is decided on the
+ * full error text, before `error` is cut to 300 characters.
  * totalMs bounds the whole probe (start-up included); `signal` (the caller's
  * request) cancels it (errorKind 'cancelled'). tmpRoot / run: test hooks
  * (parent of the work dir; the task runner).
@@ -55,8 +57,10 @@ export async function probeModel({
     if (res.ok) return done({ ok: true, model: modelName(res.model) });
     // Localized message plus the English cause from detail & co. (real payload layout).
     const message = res.error ? describeTurnError(res.error) : 'turn failed';
-    const kind = classifyError({ message: errorText(res.error) || message });
-    return done({ ok: false, model: modelName(res.model), errorKind: kind, error: oneLine(message, ERROR_MAX) });
+    const full = errorText(res.error) || message;
+    const kind = classifyError({ message: full });
+    const hint = kind === 'model' && /model creation failed/i.test(full) ? { hint: LOGIN_HINT } : {};
+    return done({ ok: false, model: modelName(res.model), errorKind: kind, error: oneLine(message, ERROR_MAX), ...hint });
   } catch (err) {
     if (overBudget) {
       return done({ ok: false, model: null, errorKind: 'timeout', error: `model probe exceeded its total budget of ${totalMs} ms (start-up included)` });
