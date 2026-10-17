@@ -1,8 +1,10 @@
-// Detached job runner (CLI path): `node src/job-runner.mjs <jobDir> <token>`.
+// Detached job runner: `node src/job-runner.mjs <jobDir> <token>`.
 // The job manager creates <jobDir>/job.json, takes the cwd lock and spawns this
 // process detached. The runner is the only writer of status.json/result.json;
 // it runs ZCode, records its identity and heartbeat, honours cancellation
 // (cancel file, SIGTERM, SIGINT) and always ends with a terminal state.
+// job.path 'cli' runs the headless CLI; 'protocol' runs the app-server protocol,
+// whose event stream allows an idle timeout and progress lines.
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,13 +13,15 @@ import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
 import { classifyError } from './errorkind.mjs';
 import { releaseCwdLock } from './locks.mjs';
-import { runZCodeTask, OUTPUT_CAP, DEFAULT_TIMEOUT_MS, worktreeSummary } from './runner.mjs';
+import { runZCodeTask, OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, worktreeSummary } from './runner.mjs';
+import { runTaskWithModel, resolveBin } from './appserver.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { discoverZCode } from './discover.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
 const ACTIVITY_WRITE_MS = 1000;
+const PROGRESS_LINES = 5;
 
 // Process group of the ZCode child while it runs (null before spawn / after exit).
 // A fatal error in the runner kills this group before the lock is released.
@@ -67,6 +71,18 @@ export function writeCrashState(dir, job, err, { startedMs, warnings = [], onSta
   if (onStatus) onStatus(merged, { state: 'failed' });
 }
 
+// One progress line for a protocol session/event, or null for noise
+// (model.streaming, session.updated, ...).
+export function describeEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+  if (event.type === 'tool.updated') {
+    const p = event.payload || {};
+    return `tool ${p.toolName ?? '?'} ${p.kind ?? '?'}`;
+  }
+  if (['turn.started', 'turn.completed', 'turn.failed', 'checkpoint.created'].includes(event.type)) return event.type;
+  return null;
+}
+
 // Timeout and cancellation are decided here; only a plain failure is classified.
 function outcome(res, params) {
   if (res.timedOut && res.timeoutKind === 'cancelled') {
@@ -88,6 +104,34 @@ function outcome(res, params) {
   return { state: 'failed', errorKind, errorMessage };
 }
 
+// Protocol outcome: the runner decides timeouts and cancellation from the
+// AppServerError; only a real failure is classified.
+function protocolOutcome(res, err, params) {
+  if (err) {
+    const message = String((err && err.message) || err);
+    if (err.code === 'aborted') {
+      return { state: 'cancelled', errorKind: 'cancelled', errorMessage: 'Job was cancelled', timeoutKind: 'cancelled' };
+    }
+    if (message.includes('no activity')) {
+      const idle = params.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS;
+      return { state: 'timeout', errorKind: 'timeout_idle', errorMessage: `No activity for ${idle} ms`, timeoutKind: 'idle' };
+    }
+    // A request timeout during startup is a failed start, not the job's total cap.
+    if (message.includes('timed out after') && !err.startup) {
+      return {
+        state: 'timeout', errorKind: 'timeout_total',
+        errorMessage: `Timed out after ${params.timeout_ms ?? DEFAULT_TIMEOUT_MS} ms`, timeoutKind: 'total',
+      };
+    }
+    return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
+  }
+  if (!res.ok) {
+    const message = (res.error && res.error.message) || 'turn failed';
+    return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
+  }
+  return { state: 'completed', errorKind: null, errorMessage: null, timeoutKind: null };
+}
+
 async function collectChanges(job, params) {
   if (job.worktree) {
     try {
@@ -98,6 +142,166 @@ async function collectChanges(job, params) {
     }
   }
   return changesSince(params.cwd, job.baseline);
+}
+
+// Records the spawned child (ZCode CLI or app-server) as the job's running child.
+// childPgid: the child leads its own process group, so the manager/reaper (and the
+// fatal handler via activeChildPgid) can signal the whole group after verifying it.
+function childRecorder(setStatus, warn) {
+  return (child) => {
+    activeChildPgid = child.pid;
+    const id = getProcessIdentity(child.pid);
+    const t = now();
+    try {
+      setStatus({
+        state: 'running',
+        childPid: child.pid,
+        childPgid: child.pid,
+        childStart: id ? id.start : null,
+        heartbeatAt: t,
+        lastActivityAt: t,
+      });
+    } catch {
+      warn('status_write_failed');
+    }
+  };
+}
+
+// CLI path. `idle`: pass idle_timeout_ms on (false for the protocol fallback:
+// the CLI writes nothing until it ends, so an idle limit would kill live work).
+async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, idle }) {
+  const binPath = discoverZCode();
+  let lastActivityWrite = 0;
+  const res = await runZCodeTask({
+    binPath,
+    prompt: params.prompt,
+    cwd: runCwd,
+    mode: params.mode,
+    resume: params.resume,
+    target: params.target,
+    timeoutMs: params.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    idleTimeoutMs: idle ? params.idle_timeout_ms : undefined,
+    signal,
+    killGroup: true,
+    onSpawn: childRecorder(setStatus, warn),
+    onStdout: (chunk) => {
+      try { appendFileSync(outputLogPath, chunk); } catch { warn('output_log_failed'); }
+      const n = Date.now();
+      if (n - lastActivityWrite >= ACTIVITY_WRITE_MS) {
+        lastActivityWrite = n;
+        try { setStatus({ lastActivityAt: new Date(n).toISOString() }); } catch { /* best effort */ }
+      }
+    },
+  });
+  activeChildPgid = null;
+  const { state, errorKind, errorMessage } = outcome(res, params);
+  return {
+    state, errorKind, errorMessage,
+    timeoutKind: res.timeoutKind || null,
+    sessionId: res.sessionId || null,
+    output: res.stdout,
+    exitCode: res.code,
+    stderr: res.stderr,
+    progress: null,
+  };
+}
+
+// Protocol path. Returns null when the app-server has no model to offer
+// (the caller falls back to the CLI). Every session/event is activity:
+// lastActivityAt and progress reach status.json at most once per
+// ACTIVITY_WRITE_MS (first one at once, a trailing write for the rest),
+// so an event flood costs a handful of writes.
+async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath }) {
+  const binPath = resolveBin();
+  const eventsLog = join(dir, 'events.log');
+  const progress = [];
+  let eventSession = null;
+  let lastEventMs = 0;
+  let lastWriteMs = 0;
+  let dirty = false;
+  let flushTimer = null;
+  const flush = () => {
+    flushTimer = null;
+    if (!dirty) return;
+    dirty = false;
+    lastWriteMs = Date.now();
+    try {
+      setStatus({ lastActivityAt: new Date(lastEventMs).toISOString(), progress: progress.slice() });
+    } catch { /* best effort */ }
+  };
+  const onEvent = (event) => {
+    lastEventMs = Date.now();
+    if (!eventSession && typeof event.sessionId === 'string') eventSession = event.sessionId;
+    const line = describeEvent(event);
+    if (line) {
+      progress.push(line);
+      if (progress.length > PROGRESS_LINES) progress.shift();
+      try {
+        appendFileSync(eventsLog, `${new Date(lastEventMs).toISOString()} ${line}\n`, { mode: 0o600 });
+      } catch {
+        warn('events_log_failed');
+      }
+    }
+    dirty = true;
+    if (flushTimer) return;
+    const wait = lastWriteMs + ACTIVITY_WRITE_MS - lastEventMs;
+    if (wait <= 0) {
+      flush();
+    } else {
+      flushTimer = setTimeout(flush, wait);
+      flushTimer.unref();
+    }
+  };
+  const model = job.model || {};
+  const call = () => runTaskWithModel({
+    binPath,
+    cwd: runCwd,
+    prompt: params.prompt,
+    providerId: model.providerId,
+    modelId: model.modelId,
+    reasoningLevel: params.reasoning_level ?? 'high',
+    timeoutMs: params.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    idleTimeoutMs: params.idle_timeout_ms ?? DEFAULT_IDLE_TIMEOUT_MS,
+    killGroup: true,
+    signal,
+    onSpawn: childRecorder(setStatus, warn),
+    onEvent,
+  });
+
+  let res = null;
+  let error = null;
+  try {
+    try {
+      res = await call();
+    } catch (err) {
+      // A failed start (spawn, settle, session/create) is retried once; after
+      // session/send the task may be running and is never repeated.
+      if (!err || !err.startup || signal.aborted) throw err;
+      activeChildPgid = null;
+      res = await call();
+    }
+  } catch (err) {
+    error = err;
+  } finally {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+    activeChildPgid = null;
+  }
+  if (error && error.code === 'no-model') return null;
+
+  if (res && res.reasoningSubstitution) {
+    warn(`reasoning_level_substituted:${res.reasoningSubstitution.requested}->${res.reasoningSubstitution.used}`);
+  }
+  const text = (res && res.response) || '';
+  try { writeFileSync(outputLogPath, text); } catch { warn('output_log_failed'); }
+  return {
+    ...protocolOutcome(res, error, params),
+    sessionId: (res && res.sessionId) || eventSession,
+    output: text,
+    exitCode: null,
+    stderr: '',
+    progress,
+  };
 }
 
 // opts.heartbeatMs: heartbeat interval; opts.signal: external abort (the CLI's
@@ -144,7 +348,6 @@ export async function runJob(dir, opts = {}) {
     if (!job.jobId || !params.cwd) throw new Error('job.json is missing or incomplete');
     writeFileSync(outputLogPath, '', { mode: 0o600 });
 
-    const binPath = discoverZCode();
     const runCwd = job.worktree ? job.worktree.dir : params.cwd;
     // Best effort: a failed heartbeat write must not end the runner.
     heartbeat = setInterval(() => {
@@ -156,57 +359,21 @@ export async function runJob(dir, opts = {}) {
     cancelPoll.unref();
     checkCancel();
 
-    let lastActivityWrite = 0;
-    const res = await runZCodeTask({
-      binPath,
-      prompt: params.prompt,
-      cwd: runCwd,
-      mode: params.mode,
-      resume: params.resume,
-      target: params.target,
-      timeoutMs: params.timeout_ms ?? DEFAULT_TIMEOUT_MS,
-      idleTimeoutMs: params.idle_timeout_ms,
-      signal: ctl.signal,
-      killGroup: true,
-      onSpawn: (child) => {
-        activeChildPgid = child.pid;
-        const id = getProcessIdentity(child.pid);
-        const t = now();
-        try {
-          // childPgid: ZCode leads its own process group, so the manager/reaper can
-          // signal the whole group after verifying the child's identity.
-          setStatus({
-            state: 'running',
-            childPid: child.pid,
-            childPgid: child.pid,
-            childStart: id ? id.start : null,
-            heartbeatAt: t,
-            lastActivityAt: t,
-          });
-        } catch {
-          warn('status_write_failed');
-        }
-      },
-      onStdout: (chunk) => {
-        try { appendFileSync(outputLogPath, chunk); } catch { warn('output_log_failed'); }
-        const n = Date.now();
-        if (n - lastActivityWrite >= ACTIVITY_WRITE_MS) {
-          lastActivityWrite = n;
-          try { setStatus({ lastActivityAt: new Date(n).toISOString() }); } catch { /* best effort */ }
-        }
-      },
-    });
-    activeChildPgid = null;
+    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath };
+    let run = job.path === 'protocol' ? await runProtocol(ctx) : await runCli({ ...ctx, idle: true });
+    if (run === null) {
+      warn('idle_detection_unavailable');
+      run = await runCli({ ...ctx, idle: false });
+    }
     clearInterval(heartbeat);
     clearInterval(cancelPoll);
 
-    const { state, errorKind, errorMessage } = outcome(res, params);
+    const { state, errorKind, errorMessage, sessionId } = run;
     const changes = await collectChanges(job, params);
     if (state === 'completed' && changes.available && changes.changedFiles.length === 0 && params.mode !== 'plan') {
       warn('no_changes');
     }
 
-    const sessionId = res.sessionId || null;
     try {
       new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()).append({
         id: sessionId || jobId,
@@ -226,7 +393,7 @@ export async function runJob(dir, opts = {}) {
     writeResult(dir, {
       state,
       sessionId,
-      output: cap(res.stdout),
+      output: cap(run.output),
       outputLogPath,
       changedFiles: changes.changedFiles,
       diffStat: changes.diffStat,
@@ -235,12 +402,15 @@ export async function runJob(dir, opts = {}) {
       warnings,
       errorKind,
       errorMessage,
-      timeoutKind: res.timeoutKind || null,
-      exitCode: res.code,
-      stderr: cap(res.stderr),
+      timeoutKind: run.timeoutKind,
+      exitCode: run.exitCode,
+      stderr: cap(run.stderr),
       durationMs: Date.now() - startedMs,
     });
-    setStatus({ state, sessionId, warnings, errorKind, finishedAt: now() });
+    setStatus({
+      state, sessionId, warnings, errorKind, finishedAt: now(),
+      ...(run.progress ? { progress: run.progress } : {}),
+    });
     finished = true;
   } catch (err) {
     if (!finished) {

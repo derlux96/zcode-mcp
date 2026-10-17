@@ -19,6 +19,7 @@
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { discoverZCode } from './discover.mjs';
+import { signalGroup } from './procid.mjs';
 import { buildSpawnEnv, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS } from './runner.mjs';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -104,8 +105,17 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
   return { level: fallback, substitution: { requested, used: fallback } };
 }
 
+// Client options beyond the basics:
+//   killGroup  spawn the app-server detached (own process group, pgid = pid)
+//              and make every kill signal the whole group
+//   onSpawn    (child) => void, called once the child has a pid; if it
+//              throws, the child is killed and the constructor throws
+//   onEvent    (params) => void, called for every session/event, in order
+//   signal     AbortSignal; aborting closes the client (kills the child)
 export class AppServerClient {
-  constructor({ binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn } = {}) {
+  constructor({
+    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, signal,
+  } = {}) {
     if (typeof binPath !== 'string' || binPath === '') throw new TypeError('binPath is required');
     if (typeof cwd !== 'string' || cwd === '') throw new TypeError('cwd is required');
     this.binPath = binPath;
@@ -120,7 +130,40 @@ export class AppServerClient {
     this._closed = false;
     this._exited = false;
     this._closePromise = null;
+    this._killGroup = killGroup;
+    this._onEvent = onEvent || null;
     this._spawnChild();
+    if (onSpawn && this.child.pid !== undefined) {
+      try {
+        onSpawn(this.child);
+      } catch (err) {
+        this._kill('SIGKILL');
+        this._closed = true;
+        throw err;
+      }
+    }
+    if (signal) {
+      this._signal = signal;
+      this._onAbort = () => { this.close(); };
+      if (signal.aborted) this.close();
+      else signal.addEventListener('abort', this._onAbort, { once: true });
+    }
+  }
+
+  // Signal the child, or its whole process group when killGroup is set.
+  _kill(sig) {
+    const pid = this.child.pid;
+    if (this._killGroup && Number.isInteger(pid) && pid > 1) {
+      try {
+        signalGroup(pid, sig);
+        return;
+      } catch {
+        // fall back to the child alone
+      }
+    }
+    try {
+      this.child.kill(sig);
+    } catch { /* already gone */ }
   }
 
   get events() {
@@ -137,9 +180,10 @@ export class AppServerClient {
     // sibling builtin provider config injected.
     const env = buildSpawnEnv(this.binPath);
     const appArgs = ['app-server', '--stdio'];
+    const opts = this._killGroup ? { cwd: this.cwd, env, detached: true } : { cwd: this.cwd, env };
     this.child = NODE_SCRIPT_RE.test(this.binPath)
-      ? this._spawnFn(process.execPath, [this.binPath, ...appArgs], { cwd: this.cwd, env })
-      : this._spawnFn(this.binPath, appArgs, { cwd: this.cwd, env });
+      ? this._spawnFn(process.execPath, [this.binPath, ...appArgs], opts)
+      : this._spawnFn(this.binPath, appArgs, opts);
 
     this.child.stdin.on('error', () => {}); // EPIPE when the child dies mid-write
     this.child.stderr.on('data', () => {}); // keep draining; never protocol
@@ -219,6 +263,11 @@ export class AppServerClient {
     if (msg.method !== 'session/event' || !msg.params || typeof msg.params !== 'object') return;
     if (this._events.length >= EVENT_BUFFER_CAP) this._events.shift();
     this._events.push(msg.params);
+    if (this._onEvent) {
+      try {
+        this._onEvent(msg.params);
+      } catch { /* a failing observer must not wedge the protocol */ }
+    }
     this._dispatchEvent(msg.params);
   }
 
@@ -350,18 +399,15 @@ export class AppServerClient {
   close() {
     if (this._closePromise) return this._closePromise;
     this._closed = true;
+    if (this._signal) this._signal.removeEventListener('abort', this._onAbort);
     this._closePromise = (async () => {
       if (!this._exited) {
-        try {
-          this.child.kill('SIGTERM');
-        } catch { /* already gone */ }
-        const killTimer = setTimeout(() => {
-          try {
-            this.child.kill('SIGKILL');
-          } catch { /* already gone */ }
-        }, CLOSE_KILL_GRACE_MS);
+        this._kill('SIGTERM');
+        const killTimer = setTimeout(() => this._kill('SIGKILL'), CLOSE_KILL_GRACE_MS);
         await this._exitPromise;
         clearTimeout(killTimer);
+      } else if (this._killGroup) {
+        this._kill('SIGKILL'); // leader gone: take down any group members it left behind
       }
       this._failAll(new AppServerError('app-server client closed'));
     })();
@@ -372,11 +418,19 @@ export class AppServerClient {
 /**
  * One-shot mode B task: create a session with an explicit model selection,
  * run the prompt to turn completion, and tear the server down.
- * Returns { ok, sessionId, response, failed, error, catalog,
+ * Returns { ok, sessionId, response, failed, error, catalog, model,
  * reasoningSubstitution } on turn completion — reasoningSubstitution is
  * {requested, used} when the requested reasoningLevel was not offered by
  * the model's catalog entry and its defaultLevel was sent instead, else
  * null. Rejects on timeouts, protocol errors, and child death.
+ *
+ * providerId/modelId are optional as a pair: when both are omitted the
+ * session's own settings.model.current is used, else the first catalog
+ * entry; with neither, rejects with AppServerError code 'no-model'.
+ * Errors before session/send (spawn, settle, session/create, subscribe)
+ * carry `startup: true`. Aborting `signal` closes the client and rejects
+ * with AppServerError code 'aborted'. killGroup/onSpawn/onEvent are passed
+ * to AppServerClient.
  */
 export async function runTaskWithModel({
   binPath,
@@ -388,14 +442,19 @@ export async function runTaskWithModel({
   timeoutMs = DEFAULT_TASK_TIMEOUT_MS,
   idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
   spawnFn,
+  killGroup = false,
+  onSpawn,
+  onEvent,
+  signal,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new TypeError('prompt must be a non-empty string');
   }
-  if (typeof providerId !== 'string' || providerId.trim() === '') {
+  const explicitModel = providerId !== undefined || modelId !== undefined;
+  if (explicitModel && (typeof providerId !== 'string' || providerId.trim() === '')) {
     throw new TypeError('providerId must be a non-empty string');
   }
-  if (typeof modelId !== 'string' || modelId.trim() === '') {
+  if (explicitModel && (typeof modelId !== 'string' || modelId.trim() === '')) {
     throw new TypeError('modelId must be a non-empty string');
   }
   if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
@@ -412,7 +471,16 @@ export async function runTaskWithModel({
     throw new TypeError('reasoningLevel must be a non-empty string');
   }
 
-  const client = new AppServerClient({ binPath, cwd, spawnFn });
+  const aborted = () => new AppServerError('app-server task aborted', { code: 'aborted' });
+  if (signal && signal.aborted) throw aborted();
+  let client;
+  try {
+    client = new AppServerClient({ binPath, cwd, spawnFn, killGroup, onSpawn, onEvent, signal });
+  } catch (err) {
+    if (err instanceof AppServerError) err.startup = true;
+    throw err;
+  }
+  let startup = true;
   try {
     await client.settle();
 
@@ -430,6 +498,16 @@ export async function runTaskWithModel({
     const sessionId = created && created.session && created.session.sessionId;
     if (!sessionId) throw new AppServerError('session/create response is missing session.sessionId');
     const catalog = (created.settings && created.settings.model && created.settings.model.available) || null;
+    if (!explicitModel) {
+      const current = created.settings && created.settings.model && created.settings.model.current;
+      const first = Array.isArray(catalog) && catalog[0] && catalog[0].ref;
+      const pick = current && current.providerId && current.modelId ? current
+        : first && first.providerId && first.modelId ? first
+          : null;
+      if (!pick) throw new AppServerError('no model available: session/create carries no current model and no catalog', { code: 'no-model' });
+      providerId = pick.providerId;
+      modelId = pick.modelId;
+    }
 
     // Catalog-aware reasoning level (Controller Ruling 14): live catalogs
     // offer level sets like ['low','medium','xhigh'] — 'high' (our default)
@@ -443,6 +521,7 @@ export async function runTaskWithModel({
 
     // ACK-only: acceptance says nothing about model validity; the turn
     // outcome arrives as a session/event notification (notes §5/§6).
+    startup = false; // from here on the task may be running: never retry
     await client.request('session/send', {
       sessionId,
       content: prompt,
@@ -459,6 +538,7 @@ export async function runTaskWithModel({
         failed: true,
         error: { code: err.code ?? null, message: err.message ?? 'turn failed without an error payload' },
         catalog,
+        model: { providerId, modelId },
         reasoningSubstitution,
       };
     }
@@ -469,8 +549,13 @@ export async function runTaskWithModel({
       failed: false,
       error: null,
       catalog,
+      model: { providerId, modelId },
       reasoningSubstitution,
     };
+  } catch (err) {
+    if (signal && signal.aborted) throw aborted();
+    if (startup && err instanceof AppServerError && err.code !== 'no-model') err.startup = true;
+    throw err;
   } finally {
     await client.close();
   }

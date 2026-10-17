@@ -23,6 +23,10 @@
 //   auth-fail   like fail, but the error message is "project_token_login_failed"
 //   chatty    acks send, then emits a model.streaming session/event every
 //             150 ms for 1.5 s before turn.completed (idle-timeout tests)
+//   tools     acks send, then emits six tool.updated session/events
+//             (toolName T0..T5, kind 'scheduled') before the ok turn
+//   no-model  like ok, but session/create carries no current model and an
+//             empty catalog (runner falls back to the CLI path)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
 //
@@ -176,11 +180,13 @@ function sendCreateResponse(req) {
       },
       settings: {
         mode: { current: 'build' },
-        model: {
-          available: CATALOG,
-          current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
-          lastUsed: { providerId: 'glm-test', modelId: 'small' },
-        },
+        model: MODE === 'no-model'
+          ? { available: [] }
+          : {
+              available: CATALOG,
+              current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
+              lastUsed: { providerId: 'glm-test', modelId: 'small' },
+            },
         permission: { mode: 'build' },
         thoughtLevel: { available: [], current: 'high', enabled: true },
       },
@@ -227,6 +233,26 @@ function handleSend(req) {
       }
       emitTurn(req);
     }, 25);
+    return;
+  }
+  if (MODE === 'tools') {
+    for (let i = 0; i < 6; i++) {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous',
+          sessionId: SESSION_ID,
+          turnId: 'turn_fake1',
+          traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_tool_${i}`,
+          seq: 50 + i,
+          timestamp: Date.now(),
+          type: 'tool.updated',
+          payload: { toolName: `T${i}`, toolCallId: `call_${i}`, kind: 'scheduled' },
+        },
+      });
+    }
+    setTimeout(() => emitTurn(req), 25);
     return;
   }
   if (MODE === 'chatty') {
