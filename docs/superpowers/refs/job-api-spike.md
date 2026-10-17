@@ -73,3 +73,19 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 - The latency baseline above is a single run of 18 tiny tasks; the soak (stage 5) and the real
   fault scenarios (stage 6) are run separately by the controller.
 - `zcode_run`'s `wait_ms` (max 300 s) assumes the MCP host has no shorter tool-call timeout (unverified).
+
+## Evidence runs against the real ZCode (2026-10-17, after the follow-up fixes)
+
+Preflight: one tiny real job (create `hi.txt`) completed.
+
+- `node scripts/faults-real.mjs --real`: **8/8 ok** (kill-zcode-mid-run, invalid-api-key,
+  parallel-worktree-jobs, zcode-app-open, path-with-spaces-and-symlink, non-git-dir,
+  dirty-tree-baseline, unwritable-job-dir). `invalid-api-key` ends `failed` with `error_kind: model`
+  plus the fixed login/provider hint (ZCode's CLI prints `Model creation failed` on stderr for a
+  missing login; the judge accepts `auth`, or `model` with that text/hint).
+- `node scripts/soak-real.mjs --real` (run once): the 25-module task **completed in 422 s** (75/75
+  tests, `progress.log` 25 steps, `done.txt` DONE, effect check ok, 0 stalled polls, 0 leftovers),
+  but the script's verdict is **not ok**: the planned `kill -9` of the MCP server is scheduled at
+  minute max(2, N/3) = 8.3 and the job had already finished, so "no server restart happened".
+  The restart/recovery half of the soak is therefore still unproven on the real binary. Rerun with
+  a longer task or an earlier restart (`--restart-at 3`, or more `--modules`); not repeated here.
