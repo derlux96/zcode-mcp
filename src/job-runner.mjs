@@ -159,7 +159,7 @@ function childRecorder(setStatus, warn) {
         state: 'running',
         childPid: child.pid,
         childPgid: child.pid,
-        childStart: id ? id.start : null,
+        childStart: id && !id.unknown ? id.start : null,
         heartbeatAt: t,
         lastActivityAt: t,
       });
@@ -345,7 +345,7 @@ export async function runJob(dir, opts = {}) {
     setStatus({
       state: 'starting',
       pid: process.pid,
-      pidStart: self ? self.start : null,
+      pidStart: self && !self.unknown ? self.start : null,
       token: job.token,
       startedAt: new Date(startedMs).toISOString(),
       warnings: [],

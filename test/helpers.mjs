@@ -167,7 +167,7 @@ export class StdioClient {
 export function safeSignal(pid, signal, { expectStart, marker, group = false, kill } = {}) {
   if (!Number.isInteger(pid) || pid <= 1) return false;
   const id = getProcessIdentity(pid);
-  if (!id) return false;
+  if (!id || id.unknown) return false;
   const byStart = typeof expectStart === 'string' && id.start === expectStart;
   const byMarker = typeof marker === 'string' && marker !== '' && id.command.includes(marker);
   if (!byStart && !byMarker) return false;
@@ -269,7 +269,7 @@ export class TestScope {
     try {
       await assertNoLeftoverProcesses(this.markers);
       for (const w of this.watched) {
-        await waitFor(() => { const id = getProcessIdentity(w.pid); return !id || id.start !== w.start; }, { timeoutMs: 3000, what: `recorded child ${w.pid} to be gone` });
+        await waitFor(() => { const id = getProcessIdentity(w.pid); return !id || (!id.unknown && id.start !== w.start); }, { timeoutMs: 3000, what: `recorded child ${w.pid} to be gone` });
       }
     } finally {
       for (const d of this.dirs) removeDir(d);

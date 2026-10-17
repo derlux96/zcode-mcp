@@ -11,7 +11,7 @@ import {
   patchStatus, writeResult, listJobDirs, isJobId, jobDir,
 } from './jobstore.mjs';
 import { acquireCwdLock, releaseCwdLock } from './locks.mjs';
-import { getProcessIdentity, matchesIdentity, signalGroup } from './procid.mjs';
+import { getProcessIdentity, matchesIdentity, identityAlive, signalGroup } from './procid.mjs';
 import { captureBaseline, changesSince } from './changes.mjs';
 import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktreeSummary } from './runner.mjs';
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
@@ -36,8 +36,9 @@ export function chooseJobPath(args = {}) {
 }
 
 // Liveness from already-read files (token check per R10, startup grace per R22).
-// `match`: identity check, replaceable only by tests (via the reaper's opts).
-export function aliveFrom(job, status, match = matchesIdentity) {
+// `match`: identity check; the default counts an unknown ps sample as alive (M1).
+// Signalling passes matchesIdentity (a definite match only); tests may replace it.
+export function aliveFrom(job, status, match = identityAlive) {
   if (!job || typeof job.token !== 'string' || job.token === '') return false;
   if (status && isTerminal(status.state)) return false;
   if (!status || !Number.isInteger(status.pid)) {
@@ -290,16 +291,19 @@ export function groupHasMembers(pgid) {
 // Returns the process groups that were signalled. runnerGroup: false never signals the
 // runner (the reaper). Groups that passed the checks but could not be signalled (EPERM)
 // are pushed to `failed` when given. `signal` replaces signalGroup in tests only.
-export function signalJob(job, dir, sig, { runnerGroup = true, failed, signal = signalGroup } = {}) {
+// `exec`: test hook for the ps calls. An unknown identity sample never leads to a signal.
+export function signalJob(job, dir, sig, { runnerGroup = true, failed, signal = signalGroup, exec } = {}) {
   const signalled = [];
   const s = readStatus(dir) || {};
   if (isTerminal(s.state)) return signalled;
-  if (runnerGroup && aliveFrom(job, s) && Number.isInteger(s.pid)) {
+  const idOpts = exec ? { exec } : undefined;
+  if (runnerGroup && aliveFrom(job, s, (e) => matchesIdentity(e, idOpts)) && Number.isInteger(s.pid)) {
     try { if (signal(s.pid, sig)) signalled.push(s.pid); } catch { if (failed) failed.push(s.pid); }
   }
   const pgid = s.childPgid;
   if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return signalled;
-  const id = getProcessIdentity(s.childPid);
+  const id = getProcessIdentity(s.childPid, idOpts);
+  if (id && id.unknown) return signalled;
   const ok = id ? typeof s.childStart === 'string' && id.start === s.childStart : groupHasMembers(pgid);
   if (ok) {
     try { if (signal(pgid, sig)) signalled.push(pgid); } catch { if (failed) failed.push(pgid); }

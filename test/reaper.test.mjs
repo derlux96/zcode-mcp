@@ -7,9 +7,10 @@ import {
 import { join } from 'node:path';
 import { makeTempDir, removeDir } from './helpers.mjs';
 import { reap, removeJobDir } from '../src/reaper.mjs';
-import { createJobDir, patchStatus, readResult, readStatus, stateHome, jobsRoot, writeResult } from '../src/jobstore.mjs';
+import { createJobDir, patchStatus, readJson, readResult, readStatus, stateHome, jobsRoot, writeResult } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
-import { getProcessIdentity, matchesIdentity } from '../src/procid.mjs';
+import { getProcessIdentity, matchesIdentity, identityAlive } from '../src/procid.mjs';
+import { signalJob } from '../src/jobs.mjs';
 import { listJobDirs } from '../src/jobstore.mjs';
 
 const temps = [];
@@ -394,4 +395,25 @@ test('a verified group that cannot be signalled is reported as kill_failed', asy
   } finally {
     try { process.kill(-child, 'SIGKILL'); } catch {}
   }
+});
+
+// M1: an unknown identity sample (ps could not run) is alive, never lost, and never signalled.
+test('an unknown identity sample never declares a job lost', async () => {
+  const j = handJob({ lock: true, status: deadRunner() });
+  const failingPs = () => { throw Object.assign(new Error('fork failed'), { code: 'EAGAIN' }); };
+  const r = await reap({ ...GRACE, identityOverride: (e) => identityAlive(e, { exec: failingPs }) });
+  assert.deepEqual(r.lost, []);
+  assert.equal(readStatus(j.dir).state, 'running');
+  assert.equal(existsSync(lockFile(j.lockCwd)), true);
+});
+
+test('signalJob never signals a child whose identity sample is unknown', async () => {
+  const child = spawnSleep();
+  const j = handJob({ status: deadRunner({ childPid: child, childPgid: child, childStart: getProcessIdentity(child).start }) });
+  const failingPs = () => { throw Object.assign(new Error('fork failed'), { code: 'EAGAIN' }); };
+  const sent = [];
+  const out = signalJob(readJson(join(j.dir, 'job.json')), j.dir, 'SIGTERM', { exec: failingPs, signal: (p, s) => { sent.push([p, s]); return true; } });
+  assert.deepEqual(out, []);
+  assert.deepEqual(sent, []);
+  assert.equal(alive(child), true);
 });

@@ -11,7 +11,7 @@ import {
   patchStatus, writeResult,
 } from './jobstore.mjs';
 import { lockKey, removeStaleLock } from './locks.mjs';
-import { matchesIdentity } from './procid.mjs';
+import { identityAlive } from './procid.mjs';
 import { aliveFrom, isJobAlive, signalJob, groupHasMembers, collectChanges } from './jobs.mjs';
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -164,7 +164,7 @@ function retention(now) {
 export async function reap({
   now = Date.now(), killGraceMs = KILL_GRACE_MS, confirmMs = CONFIRM_MS, identityOverride, signalOverride,
 } = {}) {
-  const o = { killGraceMs, confirmMs, match: identityOverride || matchesIdentity, signal: signalOverride };
+  const o = { killGraceMs, confirmMs, match: identityOverride || identityAlive, signal: signalOverride };
   const out = { lost: [], deleted: [], killed: [] };
   for (const dir of listJobDirs()) {
     const jobId = basename(dir);

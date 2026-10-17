@@ -132,7 +132,7 @@ export async function realServer(home, env = {}) {
   });
   client.home = home;
   const id = getProcessIdentity(client.pid);
-  client.identity = id ? id.start : null;
+  client.identity = id && !id.unknown ? id.start : null;
   await client.initialize();
   return client;
 }
@@ -212,7 +212,7 @@ export async function assertNothingLeft(markers, home, jobIds) {
     if (!s || !Number.isInteger(s.childPid)) continue;
     await waitFor(() => {
       const id = getProcessIdentity(s.childPid);
-      return !id || id.start !== s.childStart;
+      return !id || (!id.unknown && id.start !== s.childStart);
     }, { timeoutMs: 5000, what: `ZCode child ${s.childPid} of ${jobId} to be gone` });
   }
 }
