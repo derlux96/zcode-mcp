@@ -36,7 +36,8 @@ export function chooseJobPath(args = {}) {
 }
 
 // Liveness from already-read files (token check per R10, startup grace per R22).
-export function aliveFrom(job, status) {
+// `match`: identity check, replaceable only by tests (via the reaper's opts).
+export function aliveFrom(job, status, match = matchesIdentity) {
   if (!job || typeof job.token !== 'string' || job.token === '') return false;
   if (status && isTerminal(status.state)) return false;
   if (!status || !Number.isInteger(status.pid)) {
@@ -44,7 +45,7 @@ export function aliveFrom(job, status) {
     return Number.isFinite(created) && Date.now() - created < STARTUP_GRACE_MS;
   }
   if (typeof status.pidStart !== 'string') return false;
-  return matchesIdentity({ pid: status.pid, start: status.pidStart, token: job.token });
+  return match({ pid: status.pid, start: status.pidStart, token: job.token });
 }
 
 // Callers pass only jobDir(id) results (or listJobDirs entries), never raw tool input.
@@ -53,7 +54,7 @@ export function isJobAlive(dir) {
   return aliveFrom(readJson(join(dir, 'job.json')), readStatus(dir));
 }
 
-export function viewOf(jobId, dir) {
+function viewOf(jobId, dir) {
   const job = readJson(join(dir, 'job.json'));
   if (!job) return null;
   let status = readStatus(dir);
@@ -286,20 +287,22 @@ export function groupHasMembers(pgid) {
 
 // R18: the runner's group after its identity check; ZCode's group if the child
 // is alive with its recorded start time, or gone while its group still has members.
-// Returns the process groups that were signalled.
-export function signalJob(job, dir, sig) {
+// Returns the process groups that were signalled. runnerGroup: false never signals the
+// runner (the reaper). Groups that passed the checks but could not be signalled (EPERM)
+// are pushed to `failed` when given.
+export function signalJob(job, dir, sig, { runnerGroup = true, failed } = {}) {
   const signalled = [];
   const s = readStatus(dir) || {};
   if (isTerminal(s.state)) return signalled;
-  if (aliveFrom(job, s) && Number.isInteger(s.pid)) {
-    try { if (signalGroup(s.pid, sig)) signalled.push(s.pid); } catch { /* invalid or foreign: skip */ }
+  if (runnerGroup && aliveFrom(job, s) && Number.isInteger(s.pid)) {
+    try { if (signalGroup(s.pid, sig)) signalled.push(s.pid); } catch { if (failed) failed.push(s.pid); }
   }
   const pgid = s.childPgid;
   if (!Number.isInteger(pgid) || pgid <= 1 || !Number.isInteger(s.childPid)) return signalled;
   const id = getProcessIdentity(s.childPid);
   const ok = id ? typeof s.childStart === 'string' && id.start === s.childStart : groupHasMembers(pgid);
   if (ok) {
-    try { if (signalGroup(pgid, sig)) signalled.push(pgid); } catch { /* skip */ }
+    try { if (signalGroup(pgid, sig)) signalled.push(pgid); } catch { if (failed) failed.push(pgid); }
   }
   return signalled;
 }

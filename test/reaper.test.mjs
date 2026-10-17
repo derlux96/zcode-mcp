@@ -6,17 +6,18 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { makeTempDir, removeDir } from './helpers.mjs';
-import { reap } from '../src/reaper.mjs';
+import { reap, removeJobDir } from '../src/reaper.mjs';
 import { createJobDir, patchStatus, readResult, readStatus, stateHome, jobsRoot, writeResult } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
-import { getProcessIdentity } from '../src/procid.mjs';
+import { getProcessIdentity, matchesIdentity } from '../src/procid.mjs';
+import { listJobDirs } from '../src/jobstore.mjs';
 
 const temps = [];
 const extraPids = [];
 const DAY = 24 * 60 * 60 * 1000;
 const DEAD_PID = 999999; // above the pid range of macOS; on Linux the start time check fails anyway
 const WRONG_START = 'Mon Jan  1 00:00:00 2001';
-const GRACE = { killGraceMs: 300 };
+const GRACE = { killGraceMs: 300, confirmMs: 20 };
 
 beforeEach(() => {
   process.env.ZCODE_MCP_HOME = makeTempDir('zcode-home-');
@@ -97,12 +98,12 @@ function handJob({ cwd = tempDir(), status, lock = false, createdAt, worktree } 
 }
 
 // Job whose runner is a live process carrying the job token on its command line.
-async function liveJob(opts = {}) {
+async function liveJob(opts = {}, extraStatus = {}) {
   const j = handJob(opts);
   const { pid } = await spawnNode("process.stdout.write('ready\\n');setInterval(()=>{},1000);", [j.token]);
   patchStatus(j.dir, {
     state: 'running', pid, pidStart: getProcessIdentity(pid).start, token: j.token,
-    startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), warnings: [],
+    startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), warnings: [], ...extraStatus,
   });
   return j;
 }
@@ -314,4 +315,85 @@ test('a terminal job is never overwritten', async () => {
   const r = await reap(GRACE);
   assert.deepEqual(r, { lost: [], deleted: [], killed: [] });
   assert.deepEqual(snapshot(j.dir), before);
+});
+
+test('never signals a live runner or its child, even when one identity sample fails', async () => {
+  for (const flaky of [false, true]) {
+    const child = spawnSleep();
+    const j = await liveJob({}, { childPid: child, childPgid: child, childStart: getProcessIdentity(child).start });
+    const runner = readStatus(j.dir).pid;
+    let calls = 0;
+    const identityOverride = (id) => (flaky && calls++ === 0 ? false : matchesIdentity(id));
+    const r = await reap({ ...GRACE, identityOverride });
+    assert.deepEqual(r, { lost: [], deleted: [], killed: [] });
+    if (flaky) assert.ok(calls >= 2, 'the failed first sample was re-checked');
+    await sleep(100);
+    assert.equal(alive(runner), true);
+    assert.equal(alive(child), true);
+    assert.equal(readStatus(j.dir).state, 'running');
+    assert.equal(readResult(j.dir), null);
+  }
+});
+
+test('equal mtimes: the newest job ids are kept', async () => {
+  const t = new Date(Date.now() - 60000);
+  const jobs = [];
+  for (let i = 0; i < 52; i++) {
+    const j = finishedJob('completed');
+    jobs.push(j);
+    await sleep(2); // distinct id timestamps
+  }
+  for (const j of jobs) {
+    for (const name of readdirSync(j.dir)) utimesSync(join(j.dir, name), t, t);
+    utimesSync(j.dir, t, t);
+  }
+  const r = await reap(GRACE);
+  assert.deepEqual(r.deleted.sort(), jobs.slice(0, 2).map((j) => j.jobId).sort());
+});
+
+test('terminal result.json with a non-terminal status: status takes the result state, not lost', async () => {
+  const j = handJob({ status: deadRunner() });
+  writeResult(j.dir, { state: 'completed', output: 'ok', warnings: [] });
+  const before = readFileSync(join(j.dir, 'result.json'), 'utf8');
+  const r = await reap(GRACE);
+  assert.deepEqual(r.lost, []);
+  assert.equal(readStatus(j.dir).state, 'completed');
+  assert.equal(readFileSync(join(j.dir, 'result.json'), 'utf8'), before);
+});
+
+test('removeJobDir refuses a job-dir symlink that points outside the jobs root', async () => {
+  const outside = tempDir('zcode-outside-');
+  writeFileSync(join(outside, 'keep.txt'), 'keep');
+  mkdirSync(jobsRoot(), { recursive: true });
+  const link = join(jobsRoot(), 'job_zzzzzzzz_abcdef');
+  symlinkSync(outside, link);
+  assert.equal(removeJobDir(link, realpathSync(jobsRoot())), false);
+  assert.equal(readFileSync(join(outside, 'keep.txt'), 'utf8'), 'keep');
+  assert.equal(existsSync(link), true);
+  assert.deepEqual(listJobDirs(), []);
+  assert.deepEqual((await reap({ ...GRACE, now: Date.now() + 365 * DAY })).deleted, []);
+  assert.equal(existsSync(join(outside, 'keep.txt')), true);
+});
+
+// A process group led by a root-owned process: verified, but not signallable (EPERM).
+function rootGroupLeader() {
+  const out = execFileSync('ps', ['-axo', 'pid=,pgid=,uid='], { encoding: 'utf8' });
+  for (const line of out.trim().split('\n')) {
+    const [pid, pgid, uid] = line.trim().split(/\s+/).map(Number);
+    if (uid === 0 && pid === pgid && pid > 1 && getProcessIdentity(pid)) return pid;
+  }
+  return null;
+}
+
+test('a verified group that cannot be signalled is reported as kill_failed', {
+  skip: process.getuid?.() === 0 ? 'root could signal the group' : false,
+}, async (t) => {
+  const leader = rootGroupLeader();
+  if (!leader) return t.skip('no root-owned group leader found');
+  const j = handJob({ status: deadRunner({ childPid: leader, childPgid: leader, childStart: getProcessIdentity(leader).start }) });
+  const r = await reap(GRACE);
+  assert.deepEqual(r.lost, [j.jobId]);
+  assert.deepEqual(r.killed, []);
+  assert.ok(readResult(j.dir).warnings.includes('kill_failed'));
+  assert.ok(readStatus(j.dir).warnings.includes('kill_failed'));
 });
