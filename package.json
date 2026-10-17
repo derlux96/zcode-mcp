@@ -7,6 +7,9 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
-    "test:client": "node scripts/test-client.mjs"
+    "test:client": "node scripts/test-client.mjs",
+    "smoke": "node scripts/smoke-real.mjs",
+    "soak": "node scripts/soak-real.mjs",
+    "faults": "node scripts/faults-real.mjs"
   }
 }
