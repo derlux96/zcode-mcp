@@ -115,7 +115,7 @@ export async function waitJob(jobId, { waitMs = 0, signal, until = 'terminal' } 
   }
 }
 
-function formatCatalog(catalog) {
+export function formatCatalog(catalog) {
   if (!Array.isArray(catalog)) return [];
   return catalog
     .filter((e) => e && e.ref && e.ref.providerId && e.ref.modelId)

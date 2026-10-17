@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createProtocol } from '../src/protocol.mjs';
 
 const echoTool = {
@@ -74,4 +75,51 @@ test('handler exceptions become -32603, not a crash', async () => {
   });
   assert.equal(reply.error.code, -32603);
   assert.match(reply.error.message, /boom/);
+});
+
+test('serverInfo.version equals package.json version', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const reply = await makeProto().handleMessage({ jsonrpc: '2.0', id: 9, method: 'initialize', params: {} });
+  assert.equal(reply.result.serverInfo.version, pkg.version);
+});
+
+test('tool handlers receive an AbortSignal in ctx', async () => {
+  let seen = null;
+  const spy = { ...echoTool, handler: async (args, ctx) => { seen = ctx; return { content: [] }; } };
+  await createProtocol({ tools: [spy] }).handleMessage({
+    jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'echo', arguments: { text: 'x' } },
+  });
+  assert.ok(seen && seen.signal instanceof AbortSignal);
+  assert.equal(seen.signal.aborted, false);
+});
+
+test('notifications/cancelled aborts the in-flight call and no response is emitted', async () => {
+  let aborted = false;
+  const slow = {
+    ...echoTool,
+    handler: (args, { signal }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => { aborted = true; resolve({ content: [{ type: 'text', text: 'late' }] }); });
+    }),
+  };
+  const p = createProtocol({ tools: [slow] });
+  const pending = p.handleMessage({
+    jsonrpc: '2.0', id: 'req-1', method: 'tools/call', params: { name: 'echo', arguments: { text: 'x' } },
+  });
+  // Unknown ids are ignored; the call stays in flight.
+  assert.equal(await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'other' } }), null);
+  assert.equal(aborted, false);
+  assert.equal(await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'req-1', reason: 'user' } }), null);
+  assert.equal(aborted, true);
+  assert.equal(await pending, null);
+});
+
+test('a cancelled call whose handler throws emits no response either', async () => {
+  const p = createProtocol({
+    tools: [{ ...echoTool, handler: (args, { signal }) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')))) }],
+  });
+  const pending = p.handleMessage({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'echo', arguments: { text: 'x' } } });
+  await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 11 } });
+  assert.equal(await pending, null);
+  // The finished call is no longer tracked: a late cancel for the same id is a no-op.
+  assert.equal(await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 11 } }), null);
 });
