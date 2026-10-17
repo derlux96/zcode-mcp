@@ -301,7 +301,7 @@ test('cancel via SIGTERM to a separately spawned runner process ends cancelled a
     assert.equal(readResult(dir).state, 'cancelled');
     await waitFor(() => !alive(st.childPid), 2000);
   } finally {
-    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    safeSignal(child.pid, 'SIGKILL', { marker: 'job-runner.mjs', group: true }); // the detached runner we spawned
   }
 });
 
@@ -331,7 +331,7 @@ async function assertGrandchildGone(res) {
   try {
     await waitFor(() => !alive(gc), 2000);
   } finally {
-    try { process.kill(gc, 'SIGKILL'); } catch {} // cleanup only after the assertion ran
+    safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode' }); // cleanup only after the assertion ran
   }
 }
 
@@ -447,8 +447,8 @@ test('a fatal runner error kills ZCode\'s group before releasing the lock', asyn
     assert.ok(members.includes(st.childPid));
     for (const pid of members) await waitFor(() => !alive(pid), 2000);
   } finally {
-    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-    for (const pid of members) { try { process.kill(pid, 'SIGKILL'); } catch {} } // after the assertions
+    safeSignal(child.pid, 'SIGKILL', { marker: 'job-runner.mjs', group: true }); // the detached runner we spawned
+    for (const pid of members) safeSignal(pid, 'SIGKILL', { marker: 'fake-zcode' }); // after the assertions
   }
 });
 

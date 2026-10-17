@@ -75,9 +75,7 @@ afterEach(async () => {
   for (const v of listJobs()) {
     if (!TERMINAL.includes(v.state)) await cancelJob(v.jobId, { termGraceMs: 2000 });
   }
-  for (const pgid of extraGroups.splice(0)) {
-    try { process.kill(-pgid, 'SIGKILL'); } catch {}
-  }
+  for (const g of extraGroups.splice(0)) safeSignal(g.pgid, 'SIGKILL', { expectStart: g.start, group: true });
   for (const k of ['FAKE_ZCODE_MODE', 'FAKE_ZCODE_VERSION', 'FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG']) delete process.env[k];
 });
 
@@ -317,7 +315,7 @@ test('a job whose runner dies renders as status lost', async () => {
   process.env.FAKE_ZCODE_MODE = 'hang';
   const pending = call('zcode_run', { prompt: 'x', cwd: tempCwd(), mode: 'yolo', wait_ms: 15000 });
   const view = await waitFor(() => listJobs().find((v) => v.state === 'running' && v.status && Number.isInteger(v.status.childPgid)));
-  extraGroups.push(view.status.childPgid);
+  extraGroups.push({ pgid: view.status.childPgid, start: view.status.childStart });
   assert.equal(safeSignal(view.status.pid, 'SIGKILL', { expectStart: view.status.pidStart }), true);
   assert.equal(safeSignal(view.status.childPgid, 'SIGKILL', { expectStart: view.status.childStart, group: true }), true);
   const reply = await pending;

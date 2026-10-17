@@ -60,7 +60,8 @@ if (mode === 'hang') {
   // Same process group (not detached); PID reported on stderr so tests can
   // verify/kill it.
   const { spawn } = require('node:child_process');
-  const gc = spawn('sleep', ['60'], { stdio: 'ignore' });
+  // node (not sleep) so the command line carries a marker the tests' safeSignal checks.
+  const gc = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', 'fake-zcode-grandchild'], { stdio: 'ignore' });
   process.stderr.write(`grandchild pid ${gc.pid}\n`);
   setTimeout(() => process.exit(0), 30000);
 } else if (mode === 'leave-grandchild') {

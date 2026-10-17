@@ -1,10 +1,15 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateRunArgs, runZCodeTask, runZCodeArgs,
   OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS,
 } from '../src/runner.mjs';
 import { makeTempDir, removeDir, fakeBin, safeSignal } from './helpers.mjs';
+
+// Every temp dir made by a test is removed at the end, including the zcode-app-* ones.
+const temps = [];
+const mk = (prefix) => { const d = makeTempDir(prefix); temps.push(d); return d; };
+after(() => { for (const d of temps) removeDir(d); });
 
 const base = { prompt: 'do it', cwd: '/tmp' };
 
@@ -30,7 +35,7 @@ test('validateRunArgs rejects nonexistent cwd', () => {
 });
 
 test('runZCodeTask runs the fake bin, extracts sess_ id, reports exit 0', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd });
   assert.equal(res.code, 0);
   assert.equal(res.timedOut, false);
@@ -40,7 +45,7 @@ test('runZCodeTask runs the fake bin, extracts sess_ id, reports exit 0', async 
 });
 
 test('runZCodeTask passes --mode/--resume/--target through', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_ECHO_ARGS = '1';
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, mode: 'plan', resume: 'sess_x1', target: 'goal text' });
@@ -55,7 +60,7 @@ test('runZCodeTask passes --mode/--resume/--target through', async () => {
 });
 
 test('nonzero exit is reported, session id still extracted', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'fail';
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd });
@@ -79,7 +84,7 @@ test('timeout_ms 0 means no total cap: accepted, while 1..999 and negatives stay
 });
 
 test('timeoutMs 0 arms no total timer: a 1.5 s run completes instead of being killed at once', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'chatty';
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 0 });
@@ -93,7 +98,7 @@ test('timeoutMs 0 arms no total timer: a 1.5 s run completes instead of being ki
 });
 
 test('timeoutMs 0 can still be cancelled through the abort signal (no cap is not no control)', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'hang';
   const ctl = new AbortController();
   try {
@@ -108,7 +113,7 @@ test('timeoutMs 0 can still be cancelled through the abort signal (no cap is not
 });
 
 test('timeout kills the child and flags timedOut', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'hang';
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 400 });
@@ -121,7 +126,7 @@ test('timeout kills the child and flags timedOut', async () => {
 });
 
 test('abort signal stops the child and reports kind cancelled; onSpawn sees the child', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'hang';
   try {
     const ctl = new AbortController();
@@ -149,7 +154,7 @@ async function waitDead(pid, ms = 2000) {
 }
 
 test('killGroup: a timeout also kills the grandchild', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'spawn-grandchild';
   let gc;
   try {
@@ -159,14 +164,14 @@ test('killGroup: a timeout also kills the grandchild', async () => {
     assert.equal(await waitDead(gc), true, 'grandchild killed with the group');
   } finally {
     delete process.env.FAKE_ZCODE_MODE;
-    if (gc) try { process.kill(gc, 'SIGKILL'); } catch {}
+    if (gc) safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode-grandchild' });
     removeDir(cwd);
   }
 });
 
 // I3: a normal exit leaves no background process of ZCode's group behind.
 async function leaveGrandchild(env, opts = {}) {
-  const cwd = makeTempDir();
+  const cwd = mk();
   const saved = { ...process.env };
   Object.assign(process.env, { FAKE_ZCODE_MODE: 'leave-grandchild' }, env);
   let gc;
@@ -228,7 +233,7 @@ test('killGroup: the total timer firing during the leftover sweep leaves a clean
 });
 
 test('a daemonized leftover holding the pipes does not delay the result past stdioGraceMs', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'daemonize-pipe-holder';
   let gc;
   try {
@@ -250,7 +255,7 @@ test('a daemonized leftover holding the pipes does not delay the result past std
 });
 
 test('killGroup: a clean exit reports no leftovers', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, killGroup: true });
     assert.equal(res.code, 0);
@@ -261,7 +266,7 @@ test('killGroup: a clean exit reports no leftovers', async () => {
 });
 
 test('a throwing onSpawn kills the child and rejects', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'hang';
   let pid;
   try {
@@ -280,7 +285,7 @@ test('a throwing onSpawn kills the child and rejects', async () => {
 });
 
 test('onStdout sees the full, uncapped stdout', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'bigoutput';
   try {
     let seen = 0;
@@ -294,7 +299,7 @@ test('onStdout sees the full, uncapped stdout', async () => {
 });
 
 test('idle timeout aborts a silent child and reports kind idle', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'hang';
   try {
     const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 10000, idleTimeoutMs: 300 });
@@ -307,7 +312,7 @@ test('idle timeout aborts a silent child and reports kind idle', async () => {
 });
 
 test('active output keeps a run alive past the idle limit', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'chatty';
   try {
     // ~1.5 s of runtime with output every 150 ms, idle limit 600 ms.
@@ -328,7 +333,7 @@ test('validateRunArgs leaves idle_timeout_ms unset by default and rejects out-of
 });
 
 test('output is capped at OUTPUT_CAP characters', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   process.env.FAKE_ZCODE_MODE = 'bigoutput';
   try {
     const res = await runZCodeArgs(fakeBin, [], { cwd, timeoutMs: 5000 });
@@ -341,7 +346,7 @@ test('output is capped at OUTPUT_CAP characters', async () => {
 });
 
 test('runZCodeArgs runs version and doctor subcommands', async () => {
-  const cwd = makeTempDir();
+  const cwd = mk();
   const v = await runZCodeArgs(fakeBin, ['version'], { cwd, timeoutMs: 5000 });
   assert.match(v.stdout, /0\.16\.9/);
   removeDir(cwd);
@@ -359,9 +364,9 @@ test('injects the app-bundle builtin provider config on fresh shells', async () 
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   const prevHome = process.env.HOME;
-  const home = makeTempDir('zcode-home-'); // no personal provider config there
+  const home = mk('zcode-home-'); // no personal provider config there
   process.env.HOME = home;
-  const app = makeTempDir('zcode-app-');
+  const app = mk('zcode-app-');
   const glm = join(app, 'glm');
   const cfg = join(app, 'config', 'provider');
   mkdirSync(glm, { recursive: true });
@@ -392,12 +397,12 @@ test('completes the pair: injects the personal provider config default alongside
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   const prevHome = process.env.HOME;
-  const home = makeTempDir('zcode-home-');
+  const home = mk('zcode-home-');
   const personalDir = join(home, '.zcode', 'v2');
   mkdirSync(personalDir, { recursive: true });
   writeFileSync(join(personalDir, 'provider_config.json'), '{"schemaVersion":1}');
   process.env.HOME = home;
-  const app = makeTempDir('zcode-app-');
+  const app = mk('zcode-app-');
   const glm = join(app, 'glm');
   const cfg = join(app, 'config', 'provider');
   mkdirSync(glm, { recursive: true });
@@ -427,7 +432,7 @@ test('never overrides an explicitly set ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', as
   const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
   process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = '/custom/personal.json';
-  const app = makeTempDir('zcode-app-');
+  const app = mk('zcode-app-');
   const glm = join(app, 'glm');
   const cfg = join(app, 'config', 'provider');
   mkdirSync(glm, { recursive: true });
@@ -454,7 +459,7 @@ test('never overrides an explicitly set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', asy
   const prevPersonal = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = '/custom/location.json';
   delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
-  const scratch = makeTempDir();
+  const scratch = mk();
   try {
     process.env.FAKE_ZCODE_DUMP_ENV = '1';
     const res = await runZCodeArgs(fakeBin, [], { cwd: scratch, timeoutMs: 5000 });
@@ -476,12 +481,12 @@ test('injects nothing when the binary has no sibling builtin config', async () =
   delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
   delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   const prevHome = process.env.HOME;
-  const home = makeTempDir('zcode-home-');
+  const home = mk('zcode-home-');
   const personalDir = join(home, '.zcode', 'v2');
   mkdirSync(personalDir, { recursive: true });
   writeFileSync(join(personalDir, 'provider_config.json'), '{"schemaVersion":1}');
   process.env.HOME = home;
-  const plain = makeTempDir('zcode-plain-');
+  const plain = mk('zcode-plain-');
   const bin = join(plain, 'fake-zcode.cjs');
   copyFileSync(fakeBin, bin);
   try {
