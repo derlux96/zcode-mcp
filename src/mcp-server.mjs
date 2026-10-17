@@ -23,6 +23,9 @@ const DEFAULT_WAIT_MS = 60000;
 const MAX_WAIT_MS = 300000;
 const MAX_STATUS_WAIT_MS = 120000;
 const REAP_THROTTLE_MS = 30000;
+const REAP_STALE_MS = 5 * 60 * 1000; // an in-flight pass older than this no longer blocks a new one
+const REAP_WAIT_MS = 30000; // longest a tool call waits for a pass before rendering anyway
+const STALE_NOTE = 'reaper: still running; state may be stale';
 const ONE_LINE_MAX = 300;
 const PREVIEW_CHARS = 60;
 export const KNOWN_ZCODE_VERSIONS = ['0.16.9'];
@@ -127,18 +130,30 @@ const toolSchemas = {
   },
 };
 
+const CONTROL_ESCAPES = { '\n': '\\n', '\r': '\\r', '\t': '\\t' };
+// C0 controls and DEL become visible escapes (`\n`, `\x1b`, ...).
+const escapeControls = (s) => s.replace(/[\x00-\x1f\x7f]/g, (c) => CONTROL_ESCAPES[c] || `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+const cut = (s, max) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
 // R25: text produced by ZCode (or a caller) outside the untrusted output block is
 // one short line, so it can never forge a `status:` or `job_id:` line.
 export function oneLine(value, max = ONE_LINE_MAX) {
-  const s = String(value ?? '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  return cut(escapeControls(String(value ?? '').replace(/\s+/g, ' ').trim()), max);
+}
+
+// One name (a file, a session id) on one line: control characters escaped, not
+// collapsed, so the name stays recognisable; capped at ONE_LINE_MAX.
+export function cleanName(value) {
+  return cut(escapeControls(String(value ?? '')), ONE_LINE_MAX);
 }
 
 // One in-process reaper scheduler: passes never overlap; lazy passes are
 // throttled to one per REAP_THROTTLE_MS (measured from the start of the last pass).
-function createReaper({ reapFn, now }) {
+// A pass in flight for longer than REAP_STALE_MS is presumed hung and ignored.
+function createReaper({ reapFn, now, waitMs = REAP_WAIT_MS }) {
   let inFlight = null;
   let lastStart = null;
+  const current = () => (inFlight && now() - lastStart <= REAP_STALE_MS ? inFlight : null);
   let stats = { lastRunAt: null, lost: 0, deleted: 0, killed: 0 };
   const count = (v) => (Array.isArray(v) ? v.length : 0);
   function start() {
@@ -148,7 +163,7 @@ function createReaper({ reapFn, now }) {
     }, (error) => {
       process.stderr.write(`[zcode-delegate] reaper pass failed: ${error && error.stack ? error.stack : error}\n`);
     }).finally(() => {
-      if (inFlight === pass) inFlight = null;
+      if (inFlight === pass) inFlight = null; // a late, stale pass never clears a newer one
     });
     inFlight = pass;
     return pass;
@@ -156,14 +171,32 @@ function createReaper({ reapFn, now }) {
   return {
     // Never rejects.
     soon() {
-      if (inFlight) return inFlight;
-      if (lastStart !== null && now() - lastStart <= REAP_THROTTLE_MS) return Promise.resolve();
+      const running = current();
+      if (running) return running;
+      if (!inFlight && lastStart !== null && now() - lastStart <= REAP_THROTTLE_MS) return Promise.resolve();
       return start();
     },
-    // Waits for the pass in flight, then runs one more (throttle bypassed).
-    async force() {
-      if (inFlight) await inFlight;
-      await (inFlight || start());
+    // Waits for the pass in flight, then runs one more (throttle bypassed), for at
+    // most waitMs and only until `signal` aborts. -> true when the pass finished.
+    forceWithin(signal) {
+      const pass = (async () => {
+        const running = current();
+        if (running) await running;
+        await (current() || start());
+      })();
+      return new Promise((resolve) => {
+        if (signal && signal.aborted) return resolve(false);
+        const done = (finished) => {
+          clearTimeout(timer);
+          if (signal) signal.removeEventListener('abort', onAbort);
+          resolve(finished);
+        };
+        const onAbort = () => done(false);
+        const timer = setTimeout(() => done(false), waitMs);
+        timer.unref();
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        pass.then(() => done(true));
+      });
     },
     stats: () => ({ ...stats }),
   };
@@ -257,21 +290,40 @@ function capBody(body) {
 }
 
 const seconds = (ms) => Math.max(0, Math.round(ms / 1000));
-const fileList = (files) => (files.length ? files.join(', ') : 'none');
+const fileList = (files) => (files.length ? files.map(cleanName).join(', ') : 'none');
 
 function sessionLine(sessionId, jobId) {
-  const id = sessionId || jobId;
+  const id = cleanName(sessionId || jobId);
   return `session_id: ${id}${id.startsWith('sess_') ? '' : '  (server run-id, not resumable)'}`;
+}
+
+// diff_stat = git's --stat (names quoted by git, every line indented) followed by
+// the raw `?? name` entries of changedFiles, which may contain newlines. Those
+// entries are cut off and re-rendered one cleaned name per line. Any other line
+// that does not start with whitespace is indented, so none can pass for a header.
+function diffStatText(diffStat, changedFiles) {
+  if (!diffStat) return '(no changes)';
+  const untracked = changedFiles.filter((f) => typeof f === 'string' && f.startsWith('?? '));
+  const tail = untracked.join('\n');
+  let stat = diffStat;
+  let entries = [];
+  if (tail && diffStat.endsWith(tail)) {
+    stat = diffStat.slice(0, diffStat.length - tail.length).replace(/\n$/, '');
+    entries = untracked;
+  }
+  const statLines = stat ? stat.split('\n').map(cleanName).map((l) => (/^\s/.test(l) ? l : `  ${l}`)) : [];
+  return [...statLines, ...entries.map(cleanName)].join('\n');
 }
 
 function changesLines(r) {
   const avail = r.changesAvailable === true;
-  const files = avail ? fileList(r.changedFiles || []) : '(unavailable)';
-  const stat = avail ? (r.diffStat || '(no changes)') : '(unavailable)';
+  const changed = Array.isArray(r.changedFiles) ? r.changedFiles : [];
+  const files = avail ? fileList(changed) : '(unavailable)';
+  const stat = avail ? diffStatText(typeof r.diffStat === 'string' ? r.diffStat : '', changed) : '(unavailable)';
   if (r.worktree) {
     return [
-      `worktree_branch: ${oneLine(r.worktree.branch)}`,
-      `worktree_dir: ${oneLine(r.worktree.dir)}`,
+      `worktree_branch: ${cleanName(r.worktree.branch)}`,
+      `worktree_dir: ${cleanName(r.worktree.dir)}`,
       `changed_files: ${files}`,
       `diff_stat:\n${stat}`,
       'worktree kept — merge it (git merge) or remove it (git worktree remove) explicitly.',
@@ -331,12 +383,12 @@ function noticeLines(warnings, job) {
     .map((m) => `[notice] reasoning_level ${m[1]} not offered by ${by}; using ${m[2]} instead`);
 }
 
-// note: an extra line after job_id (zcode_cancel's "already finished").
-async function terminalResult(view, { note } = {}) {
+// notes: extra lines after job_id (zcode_cancel's "already finished", the stale-reaper note).
+async function terminalResult(view, { notes = [] } = {}) {
   const { r, logOnly } = await resultOrFallback(view);
   const warnings = [...new Set([...(Array.isArray(r.warnings) ? r.warnings : []), ...view.warnings])];
   const lines = [statusHead(view, r), `job_id: ${view.jobId}`];
-  if (note) lines.push(note);
+  lines.push(...notes);
   lines.push(sessionLine(r.sessionId, view.jobId));
   if (warnings.length) lines.push(`warnings: ${oneLine(warnings.join(', '))}`);
   lines.push(...noticeLines(warnings, view.job).map((l) => oneLine(l)));
@@ -409,14 +461,17 @@ const badJobId = () => failText('Invalid arguments: job_id must be a string');
 
 // R23: a job that is effectively lost but not yet recorded as such gets a reaper
 // pass (throttle bypassed) before it is rendered, so leftovers are cleaned first.
-async function settledView(view, reaper) {
-  if (view.state !== 'lost' || (view.status && view.status.state === 'lost')) return view;
-  await reaper.force();
-  return getJob(view.jobId) || view;
+// The wait is bounded and ends with ctx.signal; then the current state is rendered
+// with a stale note. -> { view, notes }
+async function settledView(view, reaper, signal) {
+  if (view.state !== 'lost' || (view.status && view.status.state === 'lost')) return { view, notes: [] };
+  const finished = await reaper.forceWithin(signal);
+  return { view: getJob(view.jobId) || view, notes: finished ? [] : [STALE_NOTE] };
 }
 
-async function renderForStatus(view) {
-  if (TERMINAL_STATES.includes(view.state)) return terminalResult(view);
+// A lost job is terminal, so `notes` only ever applies to the terminal text.
+async function renderForStatus({ view, notes }) {
+  if (TERMINAL_STATES.includes(view.state)) return terminalResult(view, { notes });
   return runningResult(view, await collectChanges(view.job));
 }
 
@@ -435,11 +490,11 @@ function listText() {
   if (!views.length) return text('no jobs recorded yet');
   const rows = views.map((v) => {
     const p = v.job.params || {};
-    return [v.jobId, v.state, ageText(v), oneLine(p.cwd), oneLine(p.prompt, PREVIEW_CHARS), `path:${oneLine(v.job.path)}`].join(' | ');
+    return [v.jobId, v.state, ageText(v), cleanName(p.cwd), oneLine(p.prompt, PREVIEW_CHARS), `path:${oneLine(v.job.path)}`].join(' | ');
   });
   const worktrees = views
     .filter((v) => v.job.worktree)
-    .map((v) => `${v.jobId} | ${oneLine(v.job.worktree.branch)} | ${oneLine(v.job.worktree.dir)}`);
+    .map((v) => `${v.jobId} | ${cleanName(v.job.worktree.branch)} | ${cleanName(v.job.worktree.dir)}`);
   return text([
     'jobs (newest first):', ...rows, '',
     worktrees.length ? `open worktrees:\n${worktrees.join('\n')}` : 'open worktrees: none',
@@ -457,31 +512,32 @@ function buildStatusHandler(reaper) {
     // Aborting ctx.signal (notifications/cancelled) ends only the wait.
     const view = await waitJob(args.job_id, { waitMs, signal: ctx.signal, until: 'change' });
     if (!view) return unknownJob(args.job_id);
-    return renderForStatus(await settledView(view, reaper));
+    return renderForStatus(await settledView(view, reaper, ctx.signal));
   };
 }
 
 function buildResultHandler(reaper) {
-  return async (args = {}) => {
+  return async (args = {}, ctx = {}) => {
     if (typeof args.job_id !== 'string') return badJobId();
     const view = getJob(args.job_id);
     if (!view) return unknownJob(args.job_id);
-    return renderForStatus(await settledView(view, reaper));
+    return renderForStatus(await settledView(view, reaper, ctx.signal));
   };
 }
 
 // The cancel itself succeeded, so its answer is never a tool error (isError
 // stays reserved for unknown ids and bad arguments).
 function buildCancelHandler(reaper) {
-  return async (args = {}) => {
+  return async (args = {}, ctx = {}) => {
     if (typeof args.job_id !== 'string') return badJobId();
     const before = getJob(args.job_id);
     if (!before) return unknownJob(args.job_id);
-    const settled = await settledView(before, reaper);
+    const { view: settled, notes } = await settledView(before, reaper, ctx.signal);
     const finished = TERMINAL_STATES.includes(settled.state);
     const view = finished ? settled : await cancelJob(args.job_id);
     if (!view) return unknownJob(args.job_id);
-    const result = await terminalResult(view, finished ? { note: 'already finished' } : {});
+    if (finished) notes.unshift(settled.state === 'lost' ? 'already ended (lost)' : 'already finished');
+    const result = await terminalResult(view, { notes });
     delete result.isError;
     return result;
   };
@@ -492,12 +548,13 @@ function withReap(tool, reaper) {
   return { ...tool, handler: (args, ctx) => { reaper.soon(); return tool.handler(args, ctx); } };
 }
 
-// reapFn / now / reaper: test hooks only; production never passes them.
+// reapFn / now / reapWaitMs / reaper: test hooks only; production never passes them.
 export function buildTools({
   store = new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()),
   reapFn = reap,
   now = Date.now,
-  reaper = createReaper({ reapFn, now }),
+  reapWaitMs = REAP_WAIT_MS,
+  reaper = createReaper({ reapFn, now, waitMs: reapWaitMs }),
 } = {}) {
   return [
     { ...toolSchemas.zcode_check, handler: buildCheckHandler(reaper) },
