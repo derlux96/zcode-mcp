@@ -23,7 +23,10 @@ beforeEach(() => {
   for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
   // PATH gets node via its own dir, never the directory of a real `claude`.
   symlinkSync(process.execPath, join(dirs.nodeBin, 'node'));
-  const desktopDir = join(dirs.home, 'Library', 'Application Support', 'Claude');
+  // Claude Desktop's config dir: macOS Application Support, else $XDG_CONFIG_HOME (unset here) -> ~/.config.
+  const desktopDir = process.platform === 'darwin'
+    ? join(dirs.home, 'Library', 'Application Support', 'Claude')
+    : join(dirs.home, '.config', 'Claude');
   mkdirSync(desktopDir, { recursive: true });
   writeFileSync(join(dirs.bin, 'claude'), `#!/bin/sh\nexec "${process.execPath}" "${FAKE_CLAUDE}" "$@"\n`, { mode: 0o755 });
   t = {
