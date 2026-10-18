@@ -54,7 +54,7 @@ Details: [INSTALL.md](INSTALL.md). Setup done by an AI model: [llms-install.md](
 - **MCP server** (stdio) with six tools (table below)
 - **Skill** `zcode-delegate`: when and how to delegate (paths, prompt quality, job workflow, verification loop)
 - **Agent** `zcode-worker`: a delegation-engineer subagent (Grok/Cursor: `agents/zcode-worker.md` with the
-  bare tool names; Claude: `claude/agents/zcode-worker.md` with the `mcp__…` names and no editing tools)
+  bare tool names; Claude: `claude/agents/zcode-worker.md` with the `mcp__…` names plus Read, Grep, Glob — no shell, no editing tools)
 
 | Tool | Purpose |
 |---|---|

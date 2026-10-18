@@ -58,8 +58,9 @@ test('the Claude agent lists every tool in the plugin and the user-level form, a
     assert(tools.includes(`mcp__plugin_zcode-delegate_zcode__${t}`), `plugin form of ${t}`);
     assert(tools.includes(`mcp__zcode__${t}`), `user-level form of ${t}`);
   }
-  for (const banned of ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']) assert(!tools.includes(banned), `no ${banned}`);
-  assert.deepEqual(tools.filter((t) => !t.startsWith('mcp__')), ['Read', 'Grep', 'Glob', 'Bash']);
+  // Bash can edit files too: the delegate gets read-only tools only.
+  for (const banned of ['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash']) assert(!tools.includes(banned), `no ${banned}`);
+  assert.deepEqual(tools.filter((t) => !t.startsWith('mcp__')), ['Read', 'Grep', 'Glob']);
 });
 
 test('the Grok/Cursor agent keeps its bare tool names', () => {
