@@ -15,9 +15,11 @@ import { classifyError } from './errorkind.mjs';
 import { releaseCwdLock } from './locks.mjs';
 import { isJobAlive } from './jobs.mjs';
 import { runZCodeTask, OUTPUT_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, worktreeSummary } from './runner.mjs';
-import { runTaskWithModel, resolveBin } from './appserver.mjs';
+import { runTaskWithModel, resolveBin, DEFAULT_MAX_TRANSIENT_RETRIES } from './appserver.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { discoverZCode } from './discover.mjs';
+import { oneLine } from './sanitize.mjs';
+import { describeTurnError, errorText } from './transient.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
@@ -26,6 +28,7 @@ const IDENTITY_ATTEMPTS = 5;
 const IDENTITY_RETRY_DELAY_MS = 100;
 const ACTIVITY_WRITE_MS = 1000;
 const PROGRESS_LINES = 5;
+const RETRY_REASON_MAX = 200;
 
 // Process group of the ZCode child while it runs (null before spawn / after exit).
 // A fatal error in the runner kills this group before the lock is released.
@@ -132,8 +135,10 @@ function protocolOutcome(res, err, params) {
     return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
   }
   if (!res.ok) {
-    const message = (res.error && res.error.message) || 'turn failed';
-    return { state: 'failed', errorKind: classifyError({ message, stderr: '' }), errorMessage: message, timeoutKind: null };
+    // The real payload may carry a localized message and the English cause in
+    // detail/underlyingErrorMessage/statusMessage: classify all of them, show both.
+    const message = res.error ? describeTurnError(res.error) : 'turn failed';
+    return { state: 'failed', errorKind: classifyError({ message: errorText(res.error) || message, stderr: '' }), errorMessage: message, timeoutKind: null };
   }
   return { state: 'completed', errorKind: null, errorMessage: null, timeoutKind: null };
 }
@@ -255,7 +260,10 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
 // lastActivityAt and progress reach status.json at most once per
 // ACTIVITY_WRITE_MS (first one at once, a trailing write for the rest),
 // so an event flood costs a handful of writes.
-async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs, identity, identityRetryDelayMs }) {
+// Transient provider errors (src/transient.mjs) continue the same session after a
+// backoff: status.retry shows the pending retry (cleared when the next turn starts),
+// a progress line names it, and the history lands in result.json.
+async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs, identity, identityRetryDelayMs, retryDelaysMs }) {
   const binPath = resolveBin();
   const eventsLog = join(dir, 'events.log');
   const progress = [];
@@ -273,19 +281,39 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
       setStatus({ lastActivityAt: new Date(lastEventMs).toISOString(), progress: progress.slice() });
     } catch { /* best effort */ }
   };
+  const addProgress = (line, ms) => {
+    progress.push(line);
+    if (progress.length > PROGRESS_LINES) progress.shift();
+    try {
+      appendFileSync(eventsLog, `${new Date(ms).toISOString()} ${line}\n`, { mode: 0o600 });
+    } catch {
+      warn('events_log_failed');
+    }
+  };
+  const retries = [];
+  let retryPending = false;
+  // attempt k/N is shown within the error's class; the history keeps the global attempt.
+  const onRetry = ({ attempt, classAttempt, classMaxRetries, klass, delayMs, reason, at }) => {
+    const why = oneLine(reason, RETRY_REASON_MAX);
+    retries.push({ at, attempt, delayMs, reason: why, klass });
+    retryPending = true;
+    addProgress(`retrying in ${Math.round(delayMs / 1000)}s (attempt ${classAttempt}/${classMaxRetries}): ${why}`, Date.parse(at));
+    try {
+      setStatus({
+        retry: { attempt: classAttempt, maxRetries: classMaxRetries, klass, nextAt: new Date(Date.parse(at) + delayMs).toISOString(), delayMs, reason: why },
+        progress: progress.slice(),
+      });
+    } catch { /* best effort */ }
+  };
   const onEvent = (event) => {
     lastEventMs = Date.now();
     if (!eventSession && typeof event.sessionId === 'string') eventSession = event.sessionId;
-    const line = describeEvent(event);
-    if (line) {
-      progress.push(line);
-      if (progress.length > PROGRESS_LINES) progress.shift();
-      try {
-        appendFileSync(eventsLog, `${new Date(lastEventMs).toISOString()} ${line}\n`, { mode: 0o600 });
-      } catch {
-        warn('events_log_failed');
-      }
+    if (retryPending && event.type === 'turn.started') {
+      retryPending = false;
+      try { setStatus({ retry: null }); } catch { /* best effort */ }
     }
+    const line = describeEvent(event);
+    if (line) addProgress(line, lastEventMs);
     dirty = true;
     if (flushTimer) return;
     const wait = lastWriteMs + ACTIVITY_WRITE_MS - lastEventMs;
@@ -311,6 +339,11 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     signal,
     onSpawn: childRecorder(setStatus, warn, identity, identityRetryDelayMs),
     onEvent,
+    transientRetry: {
+      maxRetries: params.max_transient_retries ?? DEFAULT_MAX_TRANSIENT_RETRIES,
+      ...(retryDelaysMs ? { delaysMs: retryDelaysMs } : {}),
+      onRetry,
+    },
   });
 
   let res = null;
@@ -340,19 +373,37 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   }
   const text = (res && res.response) || '';
   try { writeFileSync(outputLogPath, text); } catch { warn('output_log_failed'); }
+  const result = protocolOutcome(res, error, params);
+  const stop = res && res.retryStop;
+  let retryOutcome = null;
+  if (res && res.ok && retries.length) {
+    retryOutcome = 'recovered';
+    warn(`recovered_after_transient_errors:${retries.length}`);
+  } else if (stop) {
+    if (retries.length) {
+      retryOutcome = 'exhausted';
+      warn(`transient_retries_exhausted:${retries.length}`);
+    }
+    if (stop === 'deadline') warn('retry_budget_exhausted');
+  } else if (retries.length) {
+    retryOutcome = result.state; // a later non-transient failure, a timeout or a cancel
+  }
   return {
-    ...protocolOutcome(res, error, params),
+    ...result,
     sessionId: (res && res.sessionId) || (error && error.sessionId) || eventSession,
     output: text,
     exitCode: null,
     stderr: '',
     progress,
+    retries,
+    retryOutcome,
   };
 }
 
 // opts.heartbeatMs: heartbeat interval; opts.signal: external abort (the CLI's
 // early signal handlers); opts.onStatus(merged, patch): test hook seeing every status write;
-// opts.requestTimeoutMs: protocol request timeout (test hook; default 30 s).
+// opts.requestTimeoutMs: protocol request timeout (test hook; default 30 s);
+// opts.retryDelaysMs: backoff schedule for transient provider errors (test hook).
 export async function runJob(dir, opts = {}) {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const onStatus = opts.onStatus;
@@ -426,7 +477,7 @@ export async function runJob(dir, opts = {}) {
     cancelPoll.unref();
     checkCancel();
 
-    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs, identity, identityRetryDelayMs: retryDelayMs };
+    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs, identity, identityRetryDelayMs: retryDelayMs, retryDelaysMs: opts.retryDelaysMs };
     let run = job.path === 'protocol' ? await runProtocol(ctx) : await runCli({ ...ctx, idle: true });
     if (run === null) {
       warn('idle_detection_unavailable');
@@ -437,7 +488,7 @@ export async function runJob(dir, opts = {}) {
     // A cancel whose ZCode exit was seen before the abort (signal or cancel-file
     // poll) is still a cancel; a genuinely completed run stays completed.
     if (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile))) {
-      run = { ...run, ...CANCELLED };
+      run = { ...run, ...CANCELLED, ...(run.retryOutcome && run.retryOutcome !== 'exhausted' ? { retryOutcome: 'cancelled' } : {}) };
     }
 
     const { state, errorKind, errorMessage, sessionId } = run;
@@ -492,10 +543,12 @@ export async function runJob(dir, opts = {}) {
       exitCode: run.exitCode,
       stderr: cap(run.stderr),
       durationMs: Date.now() - startedMs,
+      ...(run.retries ? { retries: run.retries, retryOutcome: run.retryOutcome } : {}),
     });
     setFinalStatus({
       state, sessionId, warnings, errorKind, finishedAt: now(),
       ...(run.progress ? { progress: run.progress } : {}),
+      ...(run.retries ? { retry: null } : {}),
     });
     finished = true;
   } catch (err) {
@@ -519,14 +572,20 @@ const MIN_HEARTBEAT_MS = 1000;
 const MAX_HEARTBEAT_MS = 10000;
 
 // Options from the runner's environment. ZCODE_MCP_HEARTBEAT_MS is clamped to
-// 1000..10000 and ZCODE_MCP_TEST_FATAL_AFTER_SPAWN ignored unless NODE_ENV=test.
+// 1000..10000; ZCODE_MCP_TEST_FATAL_AFTER_SPAWN and ZCODE_MCP_TEST_RETRY_DELAYS_MS
+// (comma list of ms) are ignored unless NODE_ENV=test.
 export function runnerEnvOptions(env = process.env) {
   const testing = env.NODE_ENV === 'test';
   let heartbeatMs = Number(env.ZCODE_MCP_HEARTBEAT_MS);
   if (!Number.isFinite(heartbeatMs) || heartbeatMs <= 0) heartbeatMs = undefined;
   else if (!testing) heartbeatMs = Math.min(MAX_HEARTBEAT_MS, Math.max(MIN_HEARTBEAT_MS, heartbeatMs));
   const fatal = Number(env.ZCODE_MCP_TEST_FATAL_AFTER_SPAWN);
-  return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0 };
+  let retryDelaysMs;
+  if (testing && typeof env.ZCODE_MCP_TEST_RETRY_DELAYS_MS === 'string') {
+    const list = env.ZCODE_MCP_TEST_RETRY_DELAYS_MS.split(',').map((v) => (v.trim() === '' ? NaN : Number(v)));
+    if (list.length && list.every((n) => Number.isInteger(n) && n >= 0)) retryDelaysMs = list;
+  }
+  return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0, retryDelaysMs };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -551,13 +610,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   };
   process.on('uncaughtException', onFatal);
   process.on('unhandledRejection', onFatal);
-  const { heartbeatMs, fatalAfterMs: fatalAfter } = runnerEnvOptions();
+  const { heartbeatMs, fatalAfterMs: fatalAfter, retryDelaysMs } = runnerEnvOptions();
   // TEST ONLY (NODE_ENV=test): throw an uncaught error <ms> after ZCode spawned.
   const onStatus = fatalAfter > 0
     ? (_s, patch) => {
       if (patch.state === 'running') setTimeout(() => { throw new Error('test fatal after spawn'); }, fatalAfter);
     }
     : undefined;
-  runJob(dir, { heartbeatMs, signal: early.signal, onStatus })
+  runJob(dir, { heartbeatMs, signal: early.signal, onStatus, retryDelaysMs })
     .then(() => process.exit(0), onFatal);
 }

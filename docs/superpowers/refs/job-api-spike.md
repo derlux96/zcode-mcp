@@ -49,9 +49,26 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 - `yolo` and the protocol path can write outside `cwd`; nothing prevents it. `isolate_worktree` only
   keeps the job's in-repo edits off the user's working tree (separate branch/worktree), it does not
   stop writes outside the cwd; worktrees are never removed automatically.
-- `timeout_ms` is a hard total cap only on the CLI path. On the protocol path it bounds the wait for
-  the turn; app-server start-up (up to ~30 s per request, retried once) comes on top, so a few
-  minutes of overrun are possible.
+- `timeout_ms` on the protocol path is now a deadline for the whole task from the first
+  `session/send` (transient-error backoffs and continues included; fixed on `feature/transient-retry`).
+  Only the app-server start-up before that first send (up to ~30 s per request, retried once)
+  still comes on top.
+- Temporary provider errors are continued in the same session only on the protocol path; the CLI
+  path has no continue (rerun with `resume` manually), and `max_transient_retries` is rejected there.
+- Z.ai's `[1113] Insufficient balance or no resource package` / `余额不足` is a separate balance
+  class (R31): at most 2 retries (30 s, 60 s), then the real message with `error_kind: quota`, so a
+  real exhaustion or a wrong endpoint surfaces within ~1.5 min.
+- ZCode's `retryable` flag on provider errors is not honoured (R30): it marks provider 429s
+  `retryable: false` although they often clear.
+- VERIFIED on the real binary (controller): a second `session/send` into the same session after a
+  failed turn completed and wrote a file. The real `turn.failed` layout is
+  `payload.error = { type, code, message (localized, e.g. Chinese), detail, underlyingErrorMessage, stack }`,
+  e.g. `{ code: 'model_not_found', message: 'Provider Registry 中不存在 Model: …', detail: 'Model creation failed' }`;
+  classification therefore searches all of those fields.
+- A real provider 429 `turn.failed` payload was never observed. An earlier ZCode log showed
+  `statusCode: 429` with `statusMessage: [1113][Insufficient balance or no resource package. Please recharge.][…]`
+  (marked `retryable: false`); the fake app-server's `fail-status-1113-always` mode mirrors that
+  shape, the exact field names on `turn.failed` remain unverified.
 - The `sess_` id is lost when a protocol job times out or is cancelled silently after
   `session/create` (no event carried it yet): such a result is not resumable.
 - A `session/send` acknowledgement timeout is booked as `timeout_total` with a misleading message.
@@ -73,6 +90,7 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 - The latency baseline above is a single run of 18 tiny tasks; the soak (stage 5) and the real
   fault scenarios (stage 6) are run separately by the controller.
 - `zcode_run`'s `wait_ms` (max 300 s) assumes the MCP host has no shorter tool-call timeout (unverified).
+- Transient-error classifier (`src/transient.mjs`): a permanent-wording rule (`invalid request/parameter/argument/value`, `is invalid`) takes precedence over transient signals, so a genuine 5xx/overloaded error whose text also says "invalid …" is NOT retried (the job then fails with the real message, as before the retry feature; it fails safe). Genuinely transient texts that carry no recognised signal (for example an unusual provider phrasing) are not retried either. The real field names of a provider 429 `turn.failed` payload have still not been observed; the classifier reads `code`, `type`, `message`, `detail`, `underlyingErrorMessage`, `statusMessage` and `statusCode`/`status`.
 
 ## Evidence runs against the real ZCode (2026-10-17, after the follow-up fixes)
 

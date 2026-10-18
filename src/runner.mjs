@@ -14,6 +14,7 @@ export const DEFAULT_IDLE_TIMEOUT_MS = 600000;
 export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 21600000;
 export const MODES = ['plan', 'build', 'edit', 'yolo'];
+export const MAX_TRANSIENT_RETRIES = 20;
 export const LEFTOVER_GRACE_MS = 2000;
 // After ZCode exited and the group sweep ended, stdout/stderr may still be held open by a
 // leftover outside the group (setsid/daemonized): wait this long, then destroy the pipes.
@@ -63,6 +64,11 @@ export function validateRunArgs(args = {}) {
   if (args.isolate_worktree !== undefined && typeof args.isolate_worktree !== 'boolean') {
     return { ok: false, error: 'isolate_worktree must be a boolean' };
   }
+  // Optional here; the caller rejects it on the CLI path (which cannot continue a session).
+  const maxTransientRetries = args.max_transient_retries;
+  if (maxTransientRetries !== undefined && (!Number.isInteger(maxTransientRetries) || maxTransientRetries < 0 || maxTransientRetries > MAX_TRANSIENT_RETRIES)) {
+    return { ok: false, error: `max_transient_retries must be an integer between 0 and ${MAX_TRANSIENT_RETRIES}` };
+  }
   return {
     ok: true,
     value: {
@@ -74,6 +80,7 @@ export function validateRunArgs(args = {}) {
       timeoutMs,
       idleTimeoutMs,
       isolateWorktree: args.isolate_worktree === true,
+      maxTransientRetries,
     },
   };
 }

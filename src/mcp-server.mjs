@@ -8,11 +8,14 @@ import { createProtocol, PARSE_ERROR } from './protocol.mjs';
 import { discoverZCode, ZCodeNotFoundError } from './discover.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { getModelCatalog, resolveBin } from './appserver.mjs';
-import { runZCodeArgs, MODES, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS, OUTPUT_CAP } from './runner.mjs';
+import { runZCodeArgs, MODES, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_TRANSIENT_RETRIES, OUTPUT_CAP } from './runner.mjs';
 import { startJob, waitJob, getJob, cancelJob, listJobs, collectChanges, formatCatalog, REASONING_LEVELS } from './jobs.mjs';
 import { TERMINAL_STATES, jobsRoot } from './jobstore.mjs';
 import { reap } from './reaper.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
+import { checkProviderConfig } from './provider-check.mjs';
+import { probeModel } from './model-probe.mjs';
+import { LOGIN_HINT } from './errorkind.mjs';
 
 export { oneLine, cleanName };
 
@@ -40,7 +43,7 @@ const toolSchemas = {
   zcode_check: {
     name: 'zcode_check',
     description:
-      'Verify that a ZCode installation is reachable: binary path, version, and a best-effort health check. Call this once before the first delegation on a machine.',
+      'Verify that a ZCode installation is reachable: binary path, version, a best-effort health check, and a static check of the personal provider config (providers, baseUrl typos; keys are never shown). Call this once before the first delegation on a machine; add probe_model to also test a real model request.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -48,6 +51,11 @@ const toolSchemas = {
           type: 'boolean',
           description:
             'Append the available model catalog (one "providerId/modelId (reasoning: low,medium,xhigh)" line per model), fetched via a throwaway app-server session. Best-effort: on failure a [warning] line is appended instead and the check result is unaffected.',
+        },
+        probe_model: {
+          type: 'boolean',
+          description:
+            'Also send one tiny model request (costs one tiny model request: "reply OK", no tools, in a throwaway temp dir, never retried; the probe can take up to ~75 s including app-server start-up, and cancelling the zcode_check call ends it) through the protocol path with ZCode\'s current model, and report modelProbe {ok, durationMs, model, errorKind, error, hint}. Catches a broken login, key or provider baseUrl before the first real job. A failure adds a warning; the top-level ok (binary reachable) is unaffected. Default false.',
         },
       },
       additionalProperties: false,
@@ -81,6 +89,12 @@ const toolSchemas = {
           type: 'string',
           enum: REASONING_LEVELS,
           description: 'Reasoning effort for the model; protocol path only. Default high. A level the model does not offer is replaced by its catalog default and noted in the result.',
+        },
+        max_transient_retries: {
+          type: 'integer',
+          minimum: 0,
+          maximum: MAX_TRANSIENT_RETRIES,
+          description: `Protocol path only: how often a turn that failed with a temporary provider error (HTTP 429/5xx, overload, rate limit, network) is continued in the same session after a wait (30 s, 60 s, 2, 5, 10, 15 min, ±10 %; a numeric retry-after is honoured). Default 6, max ${MAX_TRANSIENT_RETRIES}, 0 disables it. Balance errors (Z.ai 1113, insufficient balance) are retried at most twice. Auth, model and configuration errors are never retried. Waits count against timeout_ms. Rejected on the CLI path, which cannot continue a session (rerun with resume instead).`,
         },
       },
       required: ['prompt', 'cwd'],
@@ -136,7 +150,6 @@ const toolSchemas = {
 
 // ZCode's CLI prints "Model creation failed" for a missing/expired login or a broken provider
 // config alike. Fixed text, so it can sit outside the untrusted block.
-const LOGIN_HINT = 'hint: often caused by a missing, expired or misconfigured ZCode login/provider — check ~/.zcode/v2/provider_config.json (baseUrl, key) or run zcode login';
 const loginHint = (r) => (r.errorKind === 'model' && /model creation failed/i.test(`${r.errorMessage || ''}\n${r.stderr || ''}`) ? [LOGIN_HINT] : []);
 
 // R25: text produced by ZCode (or a caller) outside the untrusted output block goes
@@ -228,10 +241,14 @@ function versionWarnings(ok, raw) {
   return [`ZCode version ${v} is not in the verified list (${KNOWN_ZCODE_VERSIONS.join(', ')}); protocol behaviour may differ`];
 }
 
-function buildCheckHandler(reaper) {
-  return async (args = {}) => {
+// probe: test hook ({ timeoutMs, idleTimeoutMs, totalMs, tmpRoot }) for probeModel.
+function buildCheckHandler(reaper, probe = {}) {
+  return async (args = {}, ctx = {}) => {
     if (args.include_models !== undefined && typeof args.include_models !== 'boolean') {
       return failText('Invalid arguments: include_models must be a boolean');
+    }
+    if (args.probe_model !== undefined && typeof args.probe_model !== 'boolean') {
+      return failText('Invalid arguments: probe_model must be a boolean');
     }
     let binPath;
     try {
@@ -252,6 +269,13 @@ function buildCheckHandler(reaper) {
     }
     const ok = version.code === 0;
     const jobs = listJobs();
+    const providers = checkProviderConfig();
+    const warnings = [...versionWarnings(ok, version.stdout.trim()), ...providers.warnings];
+    let modelProbe;
+    if (args.probe_model === true) {
+      modelProbe = await probeModel({ ...probe, signal: ctx.signal });
+      if (!modelProbe.ok) warnings.push(oneLine(`model probe failed: ${modelProbe.errorKind}: ${modelProbe.error}`));
+    }
     const payload = JSON.stringify({
       ok,
       binPath,
@@ -259,7 +283,9 @@ function buildCheckHandler(reaper) {
       doctor,
       jobs: { dir: jobsRoot(), writable: jobsDirWritable(), running: jobs.filter((j) => !TERMINAL_STATES.includes(j.state)).length, total: jobs.length },
       reaper: reaper.stats(),
-      warnings: versionWarnings(ok, version.stdout.trim()),
+      providers: providers.providers,
+      ...(modelProbe ? { modelProbe } : {}),
+      warnings,
     }, null, 2);
     if (args.include_models !== true) return text(payload);
     // Best-effort catalog section via a throwaway app-server session: a
@@ -378,6 +404,20 @@ function noticeLines(warnings, job) {
     .map((m) => `[notice] reasoning_level ${m[1]} not offered by ${by}; using ${m[2]} instead`);
 }
 
+// status.retry (a backoff after a transient provider error) as one line, or null.
+function retryingLine(retry) {
+  if (!retry || typeof retry !== 'object') return null;
+  const next = Date.parse(retry.nextAt);
+  const left = Number.isFinite(next) ? `${seconds(next - Date.now())}s` : '?';
+  return oneLine(`retrying: attempt ${Number(retry.attempt)}/${Number(retry.maxRetries)} in ${left} (${retry.reason ?? ''})`);
+}
+
+// result.retries / retryOutcome as one line, or null when nothing was retried.
+function retriesLine(r) {
+  const n = Array.isArray(r.retries) ? r.retries.length : 0;
+  return n ? oneLine(`retries: ${n} (${r.retryOutcome || 'unknown'})`) : null;
+}
+
 // notes: extra lines after job_id (zcode_cancel's "already finished", the stale-reaper note).
 async function terminalResult(view, { notes = [] } = {}) {
   const { r, logOnly } = await resultOrFallback(view);
@@ -390,6 +430,8 @@ async function terminalResult(view, { notes = [] } = {}) {
   if (r.errorKind) lines.push(`error_kind: ${oneLine(r.errorKind)}`);
   if (r.errorMessage) lines.push(`error: ${oneLine(r.errorMessage)}`);
   lines.push(...loginHint(r));
+  const retries = retriesLine(r);
+  if (retries) lines.push(retries);
   if (view.state === 'timeout' && (r.timeoutKind === 'idle' || r.timeoutKind === 'total')) {
     lines.push(`timeout: ${r.timeoutKind}`);
   }
@@ -413,6 +455,8 @@ function runningResult(view, changes) {
   if (Number.isFinite(started)) lines.push(`elapsed: ${seconds(Date.now() - started)}s`);
   const activity = Date.parse(s.lastActivityAt);
   if (Number.isFinite(activity)) lines.push(`last_activity: ${seconds(Date.now() - activity)}s ago`);
+  const retrying = retryingLine(s.retry);
+  if (retrying) lines.push(retrying);
   if (view.warnings.length) lines.push(`warnings: ${oneLine(view.warnings.join(', '))}`);
   if (changes) lines.push(`changed_files: ${changes.available ? fileList(changes.changedFiles) : '(unavailable)'}`);
   if (Array.isArray(s.progress) && s.progress.length) lines.push('progress:', ...s.progress.map((l) => oneLine(l)));
@@ -551,16 +595,17 @@ function withReap(tool, reaper) {
   return { ...tool, handler: (args, ctx) => { reaper.soon(); return tool.handler(args, ctx); } };
 }
 
-// reapFn / now / reapWaitMs / reaper: test hooks only; production never passes them.
+// reapFn / now / reapWaitMs / reaper / probe: test hooks only; production never passes them.
 export function buildTools({
   store = new SessionStore(process.env.ZCODE_MCP_STATE || defaultStatePath()),
   reapFn = reap,
   now = Date.now,
   reapWaitMs = REAP_WAIT_MS,
   reaper = createReaper({ reapFn, now, waitMs: reapWaitMs }),
+  probe,
 } = {}) {
   return [
-    { ...toolSchemas.zcode_check, handler: buildCheckHandler(reaper) },
+    { ...toolSchemas.zcode_check, handler: buildCheckHandler(reaper, probe) },
     { ...toolSchemas.zcode_run, handler: buildRunHandler() },
     { ...toolSchemas.zcode_sessions, handler: buildSessionsHandler(store) },
     { ...toolSchemas.zcode_status, handler: buildStatusHandler(reaper) },

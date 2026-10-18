@@ -21,9 +21,11 @@ import { statSync } from 'node:fs';
 import { discoverZCode } from './discover.mjs';
 import { signalGroup } from './procid.mjs';
 import { buildSpawnEnv, DEFAULT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS } from './runner.mjs';
+import { classifyTransient, describeTurnError, retryAfterMs, retryDelayMs } from './transient.mjs';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 export const DEFAULT_TASK_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;
+export const DEFAULT_CONTINUE_PROMPT = 'The previous attempt was interrupted by a temporary provider error (rate limit or network). Continue the task exactly where you stopped. Do not redo work that is already finished; re-run the tests if you were in the middle of testing.';
 
 const NODE_SCRIPT_RE = /\.(?:c|m)?js$/;
 const EVENT_BUFFER_CAP = 2000;
@@ -133,6 +135,8 @@ export class AppServerClient {
     this._spawnFn = spawnFn || ((cmd, args, opts) => spawn(cmd, args, opts));
     this._pending = new Map(); // our request id -> { resolve, reject, timer, method }
     this._events = []; // session/event params, in arrival order
+    this._eventOrds = []; // ordinal of each buffered event (parallel to _events)
+    this._ordinal = 0; // ordinal of the newest session/event; never shifts with the buffer
     this._eventWaiters = [];
     this._nextId = 1;
     this._lastMessageAt = Date.now();
@@ -179,8 +183,18 @@ export class AppServerClient {
     return this._events;
   }
 
+  /** Ordinal of the newest session/event so far (0 = none); a cursor for waitForEvent's `since`. */
+  get eventOrdinal() {
+    return this._ordinal;
+  }
+
   isRunning() {
     return !this._exited;
+  }
+
+  /** Resolves once the app-server child has exited (or failed to start). */
+  get exited() {
+    return this._exitPromise;
   }
 
   _spawnChild() {
@@ -270,14 +284,19 @@ export class AppServerClient {
     // Only session/event matters; startup/storageState, process/*,
     // state.updated, computer-use/*, v4/telemetry are ignored (notes §6/§11).
     if (msg.method !== 'session/event' || !msg.params || typeof msg.params !== 'object') return;
-    if (this._events.length >= EVENT_BUFFER_CAP) this._events.shift();
+    const ord = ++this._ordinal;
+    if (this._events.length >= EVENT_BUFFER_CAP) {
+      this._events.shift();
+      this._eventOrds.shift();
+    }
     this._events.push(msg.params);
+    this._eventOrds.push(ord);
     if (this._onEvent) {
       try {
         this._onEvent(msg.params);
       } catch { /* a failing observer must not wedge the protocol */ }
     }
-    this._dispatchEvent(msg.params);
+    this._dispatchEvent(msg.params, ord);
   }
 
   _handleServerRequest(msg) {
@@ -319,14 +338,17 @@ export class AppServerClient {
 
   /**
    * Resolve with the first buffered-or-future session/event params whose
-   * `type` matches (string or array of strings). Rejects on timeout or when
-   * the child is gone.
+   * `type` matches (string or array of strings). With `since` (an
+   * eventOrdinal taken earlier) only events that arrived after it match, so a
+   * wait after a new session/send never sees the previous turn's outcome.
+   * Rejects on timeout or when the child is gone.
    */
-  waitForEvent(types, { timeoutMs = this.timeoutMs, idleTimeoutMs = null } = {}) {
+  waitForEvent(types, { timeoutMs = this.timeoutMs, idleTimeoutMs = null, since = null } = {}) {
     const wanted = Array.isArray(types) ? types : [types];
-    const match = (p) => !!p && typeof p === 'object' && wanted.includes(p.type);
-    const buffered = this._events.find(match);
-    if (buffered) return Promise.resolve(buffered);
+    const after = Number.isInteger(since) ? since : -Infinity;
+    const match = (p, ord) => ord > after && !!p && typeof p === 'object' && wanted.includes(p.type);
+    const idx = this._events.findIndex((p, i) => match(p, this._eventOrds[i]));
+    if (idx >= 0) return Promise.resolve(this._events[idx]);
     if (this._exited || this._closed) {
       return Promise.reject(
         new AppServerError(`app-server is gone; cannot wait for session/event ${wanted.join('|')}`, {
@@ -374,10 +396,10 @@ export class AppServerClient {
    * saturated, which used to strand waiters whose scan start pinned at the
    * cap while every new event landed below it.
    */
-  _dispatchEvent(params) {
+  _dispatchEvent(params, ord) {
     for (let i = this._eventWaiters.length - 1; i >= 0; i--) {
       const waiter = this._eventWaiters[i];
-      if (waiter.match(params)) {
+      if (waiter.match(params, ord)) {
         waiter.resolve(params); // clears the timers and removes the waiter
       }
     }
@@ -428,6 +450,72 @@ export class AppServerClient {
   }
 }
 
+export const DEFAULT_RETRY_DELAYS_MS = [30000, 60000, 120000, 300000, 600000, 900000];
+export const DEFAULT_MAX_TRANSIENT_RETRIES = 6;
+
+// Abortable wait for a backoff; the timer is cleared when `signal` aborts.
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    if (signal) signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+// The turn.failed payload.error as returned to callers: code and message (falling
+// back to the other text fields) plus every other diagnostic field that is present;
+// the stack is dropped.
+const TURN_ERROR_FIELDS = ['type', 'detail', 'underlyingErrorMessage', 'statusCode', 'status', 'statusMessage', 'retryable', 'retryAfter', 'retry-after', 'Retry-After'];
+function turnError(raw) {
+  const text = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+  const error = {
+    code: raw.code ?? null,
+    message: text(raw.message) ?? text(raw.statusMessage) ?? text(raw.underlyingErrorMessage) ?? text(raw.detail) ?? 'turn failed without an error payload',
+  };
+  for (const f of TURN_ERROR_FIELDS) {
+    if (raw[f] !== undefined && raw[f] !== null) error[f] = raw[f];
+  }
+  return error;
+}
+
+// The backoff wait: ends early when the caller aborts or the app-server exits
+// (a dead app-server has no session left to continue).
+async function backoff(client, retry, delayMs, signal) {
+  const ctl = new AbortController();
+  const stop = () => ctl.abort();
+  if (signal) {
+    if (signal.aborted) stop();
+    else signal.addEventListener('abort', stop, { once: true });
+  }
+  client.exited.then(stop);
+  try {
+    await retry.sleep(delayMs, ctl.signal);
+  } finally {
+    if (signal) signal.removeEventListener('abort', stop);
+  }
+}
+
+function retryOptions(transientRetry) {
+  const o = transientRetry && typeof transientRetry === 'object' ? transientRetry : {};
+  const delaysMs = Array.isArray(o.delaysMs) && o.delaysMs.length && o.delaysMs.every((d) => Number.isFinite(d) && d >= 0)
+    ? o.delaysMs
+    : DEFAULT_RETRY_DELAYS_MS;
+  return {
+    maxRetries: Number.isInteger(o.maxRetries) && o.maxRetries >= 0 ? o.maxRetries : DEFAULT_MAX_TRANSIENT_RETRIES,
+    delaysMs,
+    jitter: Number.isFinite(o.jitter) && o.jitter >= 0 ? o.jitter : 0.1,
+    continuePrompt: typeof o.continuePrompt === 'string' && o.continuePrompt.trim() !== '' ? o.continuePrompt : DEFAULT_CONTINUE_PROMPT,
+    classify: typeof o.classify === 'function' ? o.classify : classifyTransient,
+    onRetry: typeof o.onRetry === 'function' ? o.onRetry : null,
+    sleep: typeof o.sleep === 'function' ? o.sleep : abortableSleep,
+  };
+}
+
 /**
  * One-shot mode B task: create a session with an explicit model selection,
  * run the prompt to turn completion, and tear the server down.
@@ -446,6 +534,24 @@ export class AppServerClient {
  * the client and rejects with AppServerError code 'aborted'.
  * killGroup/onSpawn/onEvent are passed to AppServerClient; requestTimeoutMs
  * is the per-request response timeout.
+ *
+ * Transient provider errors (src/transient.mjs): a turn.failed whose error is
+ * transient does not end the task while retries remain. After an abortable
+ * wait (delaysMs[min(k-1, last)] ± jitter with k = the retry count within the
+ * error's class, or a retry-after; onRetry({attempt, maxRetries, classAttempt,
+ * classMaxRetries, klass, delayMs, reason, at}) fires before it) continuePrompt is sent into the SAME session with the same
+ * modelSelection. transientRetry: { maxRetries = 6 (0 disables), delaysMs,
+ * jitter = 0.1, continuePrompt, classify (-> {transient, klass, maxRetries?};
+ * a class cap such as the balance class's 2 retries applies on top of
+ * maxRetries), onRetry, sleep(ms, signal) }. The wait also ends at once when the
+ * app-server exits (rejecting with code 'child_exited'). The returned `error`
+ * carries code, message and the payload's other diagnostic fields (type, detail,
+ * underlyingErrorMessage, statusCode, statusMessage, retryable, ...).
+ * timeoutMs > 0 is a deadline for the whole task from the first send: every
+ * wait gets the remaining time and a backoff that would pass it is not
+ * started. The result carries retries [{at, attempt, delayMs, reason}] and
+ * retryStop: null | 'exhausted' | 'deadline' (why a transient failure was
+ * returned); a rejection after a retry carries err.retries.
  */
 export async function runTaskWithModel({
   binPath,
@@ -462,6 +568,7 @@ export async function runTaskWithModel({
   onSpawn,
   onEvent,
   signal,
+  transientRetry,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new TypeError('prompt must be a non-empty string');
@@ -488,6 +595,7 @@ export async function runTaskWithModel({
   }
 
   const aborted = () => new AppServerError('app-server task aborted', { code: 'aborted' });
+  const turnTimeout = (ms) => new AppServerError(`timed out after ${ms} ms waiting for session/event turn.completed|turn.failed`, { code: 'turn_timeout' });
   if (signal && signal.aborted) throw aborted();
   let client;
   try {
@@ -498,6 +606,8 @@ export async function runTaskWithModel({
   }
   let startup = true;
   let sessionId = null;
+  const retry = retryOptions(transientRetry);
+  const retries = [];
   try {
     await client.settle();
 
@@ -539,40 +649,60 @@ export async function runTaskWithModel({
     // ACK-only: acceptance says nothing about model validity; the turn
     // outcome arrives as a session/event notification (notes §5/§6).
     startup = false; // from here on the task may be running: never retry
-    await client.request('session/send', {
-      sessionId,
-      content: prompt,
-      modelSelection: { providerId, modelId, options: { reasoningLevel: effectiveReasoningLevel } },
-    });
-
-    const event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs, idleTimeoutMs });
-    if (event.type === 'turn.failed') {
-      const err = (event.payload && event.payload.error) || {};
-      return {
-        ok: false,
-        sessionId,
-        response: null,
-        failed: true,
-        error: { code: err.code ?? null, message: err.message ?? 'turn failed without an error payload' },
-        catalog,
-        model: { providerId, modelId },
-        reasoningSubstitution,
-      };
+    const modelSelection = { providerId, modelId, options: { reasoningLevel: effectiveReasoningLevel } };
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+    const base = { sessionId, catalog, model: { providerId, modelId }, reasoningSubstitution, retries };
+    let content = prompt;
+    for (;;) {
+      const cursor = client.eventOrdinal;
+      await client.request('session/send', { sessionId, content, modelSelection });
+      const left = deadline === null ? 0 : deadline - Date.now();
+      if (deadline !== null && left <= 0) throw turnTimeout(timeoutMs);
+      let event;
+      try {
+        event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: left, idleTimeoutMs, since: cursor });
+      } catch (err) {
+        throw err instanceof AppServerError && err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
+      }
+      if (event.type === 'turn.completed') {
+        return { ...base, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
+      }
+      const raw = (event.payload && event.payload.error) || {};
+      const error = turnError(raw);
+      const failed = (retryStop) => ({ ...base, ok: false, response: null, failed: true, error, retryStop });
+      const cls = retry.classify(error) || {};
+      if (!cls.transient) return failed(null);
+      const classCap = Number.isInteger(cls.maxRetries) ? cls.maxRetries : Infinity;
+      const ofClass = retries.filter((r) => r.klass === cls.klass).length;
+      if (retries.length >= retry.maxRetries || ofClass >= classCap) return failed(retry.maxRetries > 0 ? 'exhausted' : null);
+      const attempt = retries.length + 1;
+      // Delays and the k/N display count within the class (balance: 30 s, 60 s even
+      // after earlier rate-limit retries); the history keeps the global attempt.
+      const classAttempt = ofClass + 1;
+      const classMaxRetries = Math.min(retry.maxRetries, classCap);
+      const delayMs = retryDelayMs(classAttempt, { delaysMs: retry.delaysMs, jitter: retry.jitter, retryAfter: retryAfterMs(raw) });
+      if (deadline !== null && Date.now() + delayMs >= deadline) return failed('deadline');
+      const at = new Date().toISOString();
+      const reason = describeTurnError(error);
+      const klass = cls.klass ?? null;
+      retries.push({ at, attempt, delayMs, reason, klass });
+      if (retry.onRetry) {
+        try {
+          retry.onRetry({ attempt, maxRetries: retry.maxRetries, classAttempt, classMaxRetries, klass, delayMs, reason, at });
+        } catch { /* an observer must not end the task */ }
+      }
+      await backoff(client, retry, delayMs, signal);
+      if (signal && signal.aborted) throw aborted();
+      if (!client.isRunning()) {
+        throw new AppServerError('app-server child exited during the backoff after a transient error', { code: 'child_exited' });
+      }
+      content = retry.continuePrompt;
     }
-    return {
-      ok: true,
-      sessionId,
-      response: (event.payload && event.payload.response) ?? '',
-      failed: false,
-      error: null,
-      catalog,
-      model: { providerId, modelId },
-      reasoningSubstitution,
-    };
   } catch (err) {
     const out = signal && signal.aborted ? aborted() : err;
     if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
     if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
+    if (retries.length && out && typeof out === 'object') out.retries = retries;
     throw out;
   } finally {
     await client.close();
