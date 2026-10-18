@@ -35,6 +35,9 @@ plus the skill and agent in `~/.claude/`; Claude Desktop gets an `mcpServers.zco
 `~/Library/Application Support/Claude/claude_desktop_config.json` (backup first). Restart the client
 afterwards.
 
+Claude Desktop: quit it completely (⌘Q) before the script or a hand edit touches the config. A
+running Desktop writes its in-memory config back on exit and drops the new `zcode` entry.
+
 Claude Desktop by hand (absolute paths):
 
 ```json
