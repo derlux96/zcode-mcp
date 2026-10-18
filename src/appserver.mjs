@@ -2,7 +2,7 @@
 //
 // Speaks the newline-delimited JSON protocol of
 // `zcode app-server --stdio`. Every wire shape here is transcribed from
-// .superpowers/v1.1/protocol-notes.md (spike-verified against v3.15.3):
+// docs/superpowers/refs/v1.1-protocol-notes.md (spike-verified against v3.15.3):
 //   - no handshake step, but heavy startup notifications (ignore them and
 //     match responses by id)
 //   - the protocol is bidirectional: the server sends requests TO the
