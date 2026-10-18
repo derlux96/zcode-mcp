@@ -15,6 +15,10 @@ claude mcp list        # plugin:zcode-delegate:zcode: … - ✔ Connected
 Gives the MCP server (tools `mcp__plugin_zcode-delegate_zcode__zcode_*`), the skill
 `zcode-delegate` and the agent `zcode-worker`. Remove with `claude plugin uninstall zcode-delegate@zcode-mcp`.
 
+Scope: the plugin installs for your user by default (all projects). `--scope project` (shared via the
+project's `.claude/settings.json`) or `--scope local` (this project, only you) limit it to one project:
+`claude plugin install zcode-delegate@zcode-mcp --scope project`. Uninstall with the same `--scope`.
+
 ## Script — Claude Code and/or Claude Desktop
 
 From a permanent clone (not `/tmp`; or add `--copy-to <dir>`):

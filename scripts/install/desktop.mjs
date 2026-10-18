@@ -1,7 +1,7 @@
 // Claude Desktop config: merge/remove our mcpServers entry without touching
 // anything else; refuse a file that is not valid JSON; atomic writes.
 import { isDeepStrictEqual } from 'node:util';
-import { existsSync, renameSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, renameSync, writeFileSync, rmSync, realpathSync, lstatSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { classifyServer } from './context.mjs';
 
@@ -72,6 +72,8 @@ export function freeBackupPath(path, date = new Date()) {
 
 /** Write to a temp file in the same directory, then rename over the target. */
 export function writeAtomic(path, text, mode = 0o600) {
+  // A symlinked config (dotfiles) is written through: replace the target, keep the link.
+  try { if (lstatSync(path).isSymbolicLink()) path = realpathSync(path); } catch { /* missing: plain path */ }
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
     writeFileSync(tmp, text, { mode, flag: 'wx' });

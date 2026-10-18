@@ -155,6 +155,9 @@ export function evaluateSession(session, { probe, keys = new Map(), providerFile
       }
     }
   }
+  const handled = /^(ZCode version|provider |model probe failed)/;
+  const other = (p.warnings || []).filter((w) => !handled.test(w) && !/^provider config .* is not valid JSON/.test(w));
+  if (other.length) steps.push({ name: 'selftest:warnings', ok: true, detail: `zcode_check warnings: ${other.join('; ')}` });
   const summary = table.length
     ? table.map((r) => `${r.id} (${r.enabled ? 'enabled' : 'disabled'}, ${r.access}${r.keyPresent === null ? '' : r.keyPresent ? ', key present' : ', key MISSING'}, ${r.baseUrl || 'no baseUrl'})`).join('; ')
     : 'no personal provider rules (ZCode\'s built-in login is used)';

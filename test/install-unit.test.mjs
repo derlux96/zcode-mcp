@@ -3,7 +3,7 @@
 // self-test evaluation and its fix texts.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseInstallArgs, parseDoctorArgs, UsageError } from '../scripts/install/args.mjs';
 import { mergeDesktopConfig, removeDesktopEntry, backupPath, freeBackupPath, writeAtomic } from '../scripts/install/desktop.mjs';
@@ -130,6 +130,17 @@ test('writeAtomic writes the full text and leaves no temp file', () => {
   writeAtomic(p, '{"a":1}\n');
   assert.equal(readFileSync(p, 'utf8'), '{"a":1}\n');
   assert.deepEqual(readdirSync(d), ['c.json']);
+});
+
+test('writeAtomic writes through a symlinked config and keeps the link', () => {
+  const d = tmp('zcode-inst-symw-');
+  const real = join(d, 'real.json');
+  const link = join(d, 'link.json');
+  writeFileSync(real, '{}');
+  symlinkSync(real, link);
+  writeAtomic(link, '{"a":2}\n');
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(real, 'utf8'), '{"a":2}\n');
 });
 
 // ---------- paths and detection ----------

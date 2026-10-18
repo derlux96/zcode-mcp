@@ -50,6 +50,8 @@ claude plugin install zcode-delegate@zcode-mcp
 
 Expected: `✔ Successfully added marketplace: zcode-mcp` and
 `✔ Successfully installed plugin: zcode-delegate@zcode-mcp (scope: user)`.
+Scope: default is `user` (all projects). Only add `--scope project|local` when the user asks for a
+single project, and use the same `--scope` when uninstalling.
 Verify (no model request):
 
 ```bash
