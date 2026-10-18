@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// Hilfsmodul: schreibt die drei Credential-Einträge für den "manual"-Auth-Pfad
-// (Z.ai Coding-Plan API-Key, kein OAuth-Austausch). Liest den Key von stdin.
-// Aufruf:  print -r -- "$KEY" | node write-api-key.mjs [credentials.json]
+// Helper: writes the three credential entries for the "manual" auth path
+// (Z.ai Coding Plan API key, no OAuth exchange). Reads the key from stdin.
+// Usage:  print -r -- "$KEY" | node write-api-key.mjs [credentials.json]
 import { createHash, createCipheriv, randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir, platform, userInfo } from 'node:os';
 
 const file = process.argv[2] || homedir() + '/.zcode/v2/credentials.json';
 const key = readFileSync(0, 'utf8').trim();
-if (key.length < 8) { console.error('Key zu kurz.'); process.exit(1); }
+if (key.length < 8) { console.error('Key too short.'); process.exit(1); }
 
-// Gleiche Verschlüsselung wie die ZCode-CLI: AES-256-GCM, Schlüssel aus dem
-// Fallback-Secret (bzw. ZCODE_CREDENTIAL_SECRET, falls gesetzt).
+// Same encryption as the ZCode CLI: AES-256-GCM, key derived from the
+// fallback secret (or ZCODE_CREDENTIAL_SECRET when set).
 const secret = process.env.ZCODE_CREDENTIAL_SECRET?.trim()
   || `zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`;
 const cipherKey = createHash('sha256').update(secret).digest();
@@ -29,4 +29,4 @@ creds[`account-provider:${P}:identity`] = enc(identity);
 creds[`account-provider:${P}:auth-source`] = enc('manual');
 creds[`account-provider:coding-plan:${P}:account:${encodeURIComponent(identity)}:api-key`] = enc(key);
 writeFileSync(file, JSON.stringify(creds, null, 2) + ' ');
-console.log('API-Key in credentials hinterlegt (identity ' + identity.slice(0, 10) + '…, auth-source manual).');
+console.log('API key stored in credentials.json (identity ' + identity.slice(0, 10) + '…, auth-source manual).');
