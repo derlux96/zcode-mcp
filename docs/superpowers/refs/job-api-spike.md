@@ -90,6 +90,7 @@ protocol path. Suggested threshold after more runs: p95 of a tiny task under 60 
 - The latency baseline above is a single run of 18 tiny tasks; the soak (stage 5) and the real
   fault scenarios (stage 6) are run separately by the controller.
 - `zcode_run`'s `wait_ms` (max 300 s) assumes the MCP host has no shorter tool-call timeout (unverified).
+- Transient-error classifier (`src/transient.mjs`): a permanent-wording rule (`invalid request/parameter/argument/value`, `is invalid`) takes precedence over transient signals, so a genuine 5xx/overloaded error whose text also says "invalid …" is NOT retried (the job then fails with the real message, as before the retry feature; it fails safe). Genuinely transient texts that carry no recognised signal (for example an unusual provider phrasing) are not retried either. The real field names of a provider 429 `turn.failed` payload have still not been observed; the classifier reads `code`, `type`, `message`, `detail`, `underlyingErrorMessage`, `statusMessage` and `statusCode`/`status`.
 
 ## Evidence runs against the real ZCode (2026-10-17, after the follow-up fixes)
 
