@@ -2,7 +2,7 @@
 // Fake ZCode app-server speaking the SERVER side of the app-server protocol
 // (v1.1 mode B) for deterministic tests of src/appserver.mjs.
 //
-// All wire shapes are transcribed from .superpowers/v1.1/protocol-notes.md —
+// All wire shapes are transcribed from docs/protocol/app-server-protocol.md —
 // do not "fix" them from memory; the notes are the source of truth.
 //
 // Spawn contract: node <this file> app-server --stdio

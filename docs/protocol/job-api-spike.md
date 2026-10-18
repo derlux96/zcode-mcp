@@ -5,7 +5,7 @@ Task sent: "Create a file hello.txt containing hi" (one throwaway session, model
 
 ## Results
 
-(a) Denied tool calls as events: **not observed.** The run used `mode: 'yolo'`, nothing was denied (1 Write, allowed), so `deniedTools` was `[]`. No permission/deny event type appeared at all. How a denial surfaces (e.g. in `build` mode) was not tested, so it is unknown. Consequence: spec sections 9/10 that depend on reporting denied tool calls are **not available (unverified)**; Task 8 should only note this, no new function.
+(a) Denied tool calls as events: **not observed.** The run used `mode: 'yolo'`, nothing was denied (1 Write, allowed), so `deniedTools` was `[]`. No permission/deny event type appeared at all. How a denial surfaces (e.g. in `build` mode) was not tested, so it is unknown. Consequence: reporting denied tool calls is **not available (unverified)**.
 
 (b) Largest gap between consecutive events: **11023 ms** (29 events over ~17.4 s; the gap sits before the first `model.streaming` reasoning delta). Idle timeouts must therefore be well above 11 s; a single run is a lower bound only.
 
