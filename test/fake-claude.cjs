@@ -15,6 +15,11 @@ if (!STATE) {
   process.exitCode = 0;
   return;
 }
+// Like the real CLI: the first `claude` call creates <CLAUDE_CONFIG_DIR>/.claude.json.
+if (process.env.CLAUDE_CONFIG_DIR) {
+  const cfg = require('node:path').join(process.env.CLAUDE_CONFIG_DIR, '.claude.json');
+  if (!require('node:fs').existsSync(cfg)) writeFileSync(cfg, '{}\n');
+}
 const load = () => { try { return JSON.parse(readFileSync(STATE, 'utf8')); } catch { return {}; } };
 const save = (s) => writeFileSync(STATE, JSON.stringify(s, null, 2));
 const SCOPE_TEXT = { user: 'User config (available in all your projects)', project: 'Project config (shared via .mcp.json)', local: 'Local config (private to you in this project)' };

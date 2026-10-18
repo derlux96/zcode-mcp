@@ -3,18 +3,19 @@
 // MCP server in Claude Code (`claude mcp add`) and/or Claude Desktop (config merge),
 // copies the skill and the Claude agent, then self-tests the registered command.
 // See INSTALL.md / llms-install.md; `--help` lists the options. Zero dependencies.
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { execFileSync } from 'node:child_process';
-import { basename, dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isMain } from '../src/is-main.mjs';
 import { parseInstallArgs, INSTALL_USAGE, UsageError } from './install/args.mjs';
-import { claudeHome, desktopConfigPath, findOnPath, pluginInstalled, tempPathWarning, whoami, PLUGIN_NAME } from './install/context.mjs';
+import { chooseNode, claudeHome, desktopConfigPath, findOnPath, pluginInstalled, redactArgs, tempPathWarning, userConfigFile, whoami, PLUGIN_NAME } from './install/context.mjs';
 import { mergeDesktopConfig, removeDesktopEntry, freeBackupPath, writeAtomic } from './install/desktop.mjs';
 import { registrationState, addServer, removeServer, renderAgent } from './install/claude-code.mjs';
 import { cleanEnv, forwardedEnv, runSelfTest } from './install/selftest.mjs';
-import { emit } from './install/report.mjs';
-import { main as doctorMain, nodeStep, userStep } from './doctor.mjs';
+import { emit, emitRefusal } from './install/report.mjs';
+import { main as doctorMain, nodeStep, packageVersion, userStep } from './doctor.mjs';
 import { discoverZCode } from '../src/discover.mjs';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
@@ -22,20 +23,17 @@ const CLAUDE_HINT = 'Install Claude Code (https://claude.com/claude-code) so tha
 
 const readOrNull = (p) => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
 
-// The server only starts when its argv path equals its real path (symlinks such as
-// /var -> /private/var break that), so a --copy-to dir is registered by its real path.
-function realPath(p) {
-  if (existsSync(p)) return realpathSync(p);
-  const parent = dirname(p);
-  return parent === p ? p : join(realPath(parent), basename(p));
-}
+// Marks a --copy-to directory as a zcode-mcp runtime copy (only such a directory,
+// a new or an empty one is written to without --force).
+export const RUNTIME_MARKER = '.zcode-mcp-runtime';
+const ACTION = { written: 'write', removed: 'remove', backup: 'backup' };
 
 /** Runs the whole plan; with opts.dryRun nothing is written and `claude mcp add/remove` never runs. */
 async function execute(opts, env) {
   const { user, home } = whoami(env);
-  const version = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
-  const node = process.execPath;
-  const runtime = opts.copyTo ? realPath(opts.copyTo) : repoRoot;
+  const version = packageVersion();
+  const node = chooseNode(env);
+  const runtime = opts.copyTo || repoRoot;
   const server = join(runtime, 'src', 'mcp-server.mjs');
   const regEnv = forwardedEnv(env);
   const want = { command: node, args: [server], env: regEnv };
@@ -44,7 +42,7 @@ async function execute(opts, env) {
   const files = [];
   const nextSteps = [];
   const dry = opts.dryRun;
-  const would = (a) => (dry ? `would-${a}` : a);
+  const would = (a) => (dry ? `would-${ACTION[a] || a}` : a);
   const report = () => ({ ok: steps.every((s) => s.ok), version, user, home, steps, registered, files, nextSteps });
   if (!steps[1].ok) return report();
 
@@ -85,17 +83,27 @@ async function execute(opts, env) {
 
   // --copy-to: the runtime the clients will start.
   if (opts.copyTo && !opts.uninstall) {
+    let entries = [];
+    try { entries = readdirSync(runtime); } catch { /* absent: fine */ }
+    const isCopy = entries.includes(RUNTIME_MARKER);
+    if (entries.length && !isCopy && !opts.force) {
+      steps.push({ name: 'copy-runtime', ok: false, detail: `${runtime} is not empty and is not a zcode-mcp runtime copy (no ${RUNTIME_MARKER}); nothing was copied`, fix: 'Choose a new or empty directory (e.g. ~/.local/share/zcode-mcp), or --force to copy into it anyway (it overwrites src/ and package.json there).' });
+      return report();
+    }
     const items = ['src', 'package.json', 'LICENSE'].filter((i) => existsSync(join(repoRoot, i)));
     if (!dry) {
       mkdirSync(runtime, { recursive: true });
+      // An earlier copy: replace src/ as a whole so files removed upstream do not linger.
+      if (isCopy) rmSync(join(runtime, 'src'), { recursive: true, force: true });
       for (const i of items) cpSync(join(repoRoot, i), join(runtime, i), { recursive: true, force: true });
+      writeFileSync(join(runtime, RUNTIME_MARKER), `zcode-mcp runtime copy ${version} from ${repoRoot}\n`);
     }
-    for (const i of items) files.push({ path: join(runtime, i), action: would('written') });
-    steps.push({ name: 'copy-runtime', ok: true, detail: `${dry ? 'would copy' : 'copied'} ${items.join(', ')} to ${runtime}` });
+    for (const i of [...items, RUNTIME_MARKER]) files.push({ path: join(runtime, i), action: would('written') });
+    steps.push({ name: 'copy-runtime', ok: true, detail: `${dry ? 'would copy' : 'copied'} ${items.join(', ')} to ${runtime}${isCopy ? ' (replacing an earlier copy)' : ''}` });
   }
 
   let claudeCodeUsable = false;
-  if (targets.includes('claude-code')) claudeCodeUsable = claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered, would, dry });
+  if (targets.includes('claude-code')) claudeCodeUsable = claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered, files, would, dry });
   if (targets.includes('claude-desktop')) desktopTarget({ opts, desk, want, steps, registered, files, would, dry });
   if (claudeCodeUsable) filesTarget({ opts, cHome, steps, files, would, dry });
 
@@ -103,7 +111,7 @@ async function execute(opts, env) {
   const missing = steps.find((s) => s.name === 'register:claude-code' && s.missingClaude);
   if (missing) {
     delete missing.missingClaude;
-    missing.ok = registered.some((r) => !['conflict'].includes(r.status));
+    missing.ok = registered.some((r) => !['conflict', 'elsewhere'].includes(r.status));
   }
 
   if (!dry && !opts.uninstall) {
@@ -115,7 +123,8 @@ async function execute(opts, env) {
   if (dry) nextSteps.push('Nothing was written. Show this plan to the user; re-run without --dry-run (with --yes) to apply it.');
   else if (!ok) nextSteps.push('Apply the fix of each FAIL line, then re-run the installer (it is idempotent) or `npm run doctor`.');
   else if (opts.uninstall) {
-    nextSteps.push('Restart Claude Code / quit and reopen Claude Desktop so the server disappears.');
+    if (registered.some((r) => r.status === 'removed')) nextSteps.push('Restart Claude Code / quit and reopen Claude Desktop so the server disappears.');
+    if (registered.some((r) => r.status === 'foreign')) nextSteps.push(`A server named "${opts.name}" that this installer did not add was left registered.`);
     if (opts.copyTo) nextSteps.push(`The runtime copy in ${runtime} was kept; delete it yourself if it is no longer needed.`);
   } else {
     nextSteps.push('Start a new Claude Code session / quit and reopen Claude Desktop so the server is loaded.');
@@ -127,7 +136,7 @@ async function execute(opts, env) {
 }
 
 /** -> true when skill/agent should be handled for Claude Code. */
-function claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered, would, dry }) {
+function claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered, files, would, dry }) {
   const name = 'register:claude-code';
   if (!claudeBin) {
     steps.push({ name, ok: false, missingClaude: true, detail: 'skipped: the `claude` CLI is not on PATH', fix: CLAUDE_HINT });
@@ -144,13 +153,22 @@ function claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered
   }
   // User scope from HOME, so a .mcp.json of the current directory (e.g. this clone's) is not seen.
   const run = { env, cwd: opts.scope === 'project' ? process.cwd() : whoami(env).home };
-  const cur = registrationState(claudeBin, opts.name, opts.scope, want, run);
+  // The file `claude mcp add/remove` writes. Without it no user-scope server exists, and
+  // `claude mcp get` is not called (it would create the file, also in a dry run).
+  const cfgFile = opts.scope === 'project' ? join(process.cwd(), '.mcp.json') : userConfigFile(env);
+  const cur = opts.scope === 'user' && !existsSync(cfgFile) ? { state: 'absent' } : registrationState(claudeBin, opts.name, opts.scope, want, run);
   const entry = (status) => registered.push({ target: 'claude-code', name: opts.name, scope: opts.scope, command: want.command, args: want.args, env: want.env, status });
-  const shown = cur.found ? `${cur.found.command} ${cur.found.args}` : '';
+  const shown = cur.found ? `${cur.found.command} ${redactArgs(cur.found.args)}` : '';
   const other = cur.otherScope ? `; note: a server "${opts.name}" also exists in the ${cur.otherScope} scope (not touched)` : '';
+  const wrote = (by) => files.push({ path: cfgFile, action: would('written'), by });
   if (opts.uninstall) {
     if (cur.state === 'absent') { entry('absent'); steps.push({ name, ok: true, detail: `no server "${opts.name}" registered in the ${opts.scope} scope${other}` }); return true; }
-    if (cur.state === 'different' && !opts.force) {
+    if (cur.kind === 'elsewhere' && !opts.force) {
+      entry('elsewhere');
+      steps.push({ name, ok: false, detail: `"${opts.name}" runs zcode-mcp from another location (${shown}), not from ${want.args[0]}; it stays registered`, fix: `Re-run the uninstall from that clone (or with the --copy-to used for the install), or add --force to remove it, or: claude mcp remove ${opts.name} -s ${opts.scope}` });
+      return true;
+    }
+    if (cur.kind === 'foreign' && !opts.force) {
       entry('foreign');
       steps.push({ name, ok: true, detail: `left alone: "${opts.name}" is a different server (${shown}), not added by this installer`, fix: 'Use --force to remove it anyway.' });
       return true;
@@ -159,7 +177,8 @@ function claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered
       const r = removeServer(claudeBin, opts.name, opts.scope, run);
       if (r.code !== 0) { steps.push({ name, ok: false, detail: `claude mcp remove failed: ${(r.stderr || r.stdout).trim()}`, fix: `Remove it by hand: claude mcp remove ${opts.name} -s ${opts.scope}` }); return true; }
     }
-    entry(would('removed'));
+    wrote('claude mcp remove');
+    entry(dry ? 'would-remove' : 'removed');
     steps.push({ name, ok: true, detail: `${dry ? 'would remove' : 'removed'} "${opts.name}" (${opts.scope} scope)` });
     return true;
   }
@@ -174,16 +193,17 @@ function claudeCodeTarget({ opts, env, claudeBin, cHome, want, steps, registered
     return false;
   }
   if (!dry) {
-    if (cur.state === 'different') removeServer(claudeBin, opts.name, opts.scope, run);
+    if (cur.state !== 'absent') removeServer(claudeBin, opts.name, opts.scope, run);
     const r = addServer(claudeBin, opts.name, opts.scope, want, run);
     if (r.code !== 0) {
       steps.push({ name, ok: false, detail: `claude mcp add failed: ${(r.stderr || r.stdout).trim()}`, fix: `Run it by hand: claude mcp add --scope ${opts.scope} ${opts.name} -- "${want.command}" "${want.args[0]}"` });
       return false;
     }
   }
-  const status = cur.state === 'different' ? 'replaced' : 'added';
-  entry(dry ? (status === 'added' ? 'would-add' : 'would-replace') : status);
-  steps.push({ name, ok: true, detail: `${dry ? 'would run' : 'ran'}: claude mcp add --scope ${opts.scope} ${opts.name} -- ${want.command} ${want.args[0]}${other}` });
+  wrote('claude mcp add');
+  const status = { absent: 'added', outdated: 'updated', different: 'replaced' }[cur.state];
+  entry(dry ? { added: 'would-add', updated: 'would-update', replaced: 'would-replace' }[status] : status);
+  steps.push({ name, ok: true, detail: `${dry ? 'would run' : 'ran'}: claude mcp add --scope ${opts.scope} ${opts.name} -- ${want.command} ${want.args[0]}${cur.state === 'outdated' ? ` (updates our earlier registration: ${shown})` : ''}${other}` });
   return true;
 }
 
@@ -194,7 +214,7 @@ function desktopTarget({ opts, desk, want, steps, registered, files, would, dry 
   const text = readOrNull(desk.path);
   let res;
   try {
-    res = opts.uninstall ? removeDesktopEntry(text, opts.name, entryObj, { force: opts.force }) : mergeDesktopConfig(text, opts.name, entryObj, { force: opts.force });
+    res = opts.uninstall ? removeDesktopEntry(text, opts.name, want.args[0], { force: opts.force }) : mergeDesktopConfig(text, opts.name, entryObj, { force: opts.force });
   } catch (err) {
     steps.push({ name, ok: false, detail: `${desk.path}: ${err.message}`, fix: `The user repairs ${desk.path} (or moves it away), then re-run.` });
     return;
@@ -203,6 +223,11 @@ function desktopTarget({ opts, desk, want, steps, registered, files, would, dry 
   if (res.status === 'conflict') {
     entry('conflict');
     steps.push({ name, ok: false, detail: `${desk.path} already has a different mcpServers.${opts.name}`, fix: 'Choose another --name or re-run with --force to replace it (a backup is written first).' });
+    return;
+  }
+  if (res.status === 'elsewhere') {
+    entry('elsewhere');
+    steps.push({ name, ok: false, detail: `${desk.path}: mcpServers.${opts.name} runs zcode-mcp from another location, not from ${want.args[0]}; it stays`, fix: 'Re-run the uninstall from that clone (or with the --copy-to used for the install), or add --force to remove it.' });
     return;
   }
   if (res.status === 'unchanged' || res.status === 'absent' || res.status === 'foreign') {
@@ -220,7 +245,7 @@ function desktopTarget({ opts, desk, want, steps, registered, files, would, dry 
     writeAtomic(desk.path, res.text);
   }
   files.push({ path: desk.path, action: would('written') });
-  const verb = { added: 'add', replaced: 'replace', removed: 'remove' }[res.status];
+  const verb = { added: 'add', updated: 'update', replaced: 'replace', removed: 'remove' }[res.status];
   entry(dry ? `would-${verb}` : res.status);
   steps.push({ name, ok: true, detail: `${dry ? `would ${verb}` : res.status} mcpServers.${opts.name} in ${desk.path}${note}` });
 }
@@ -282,7 +307,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     opts = parseInstallArgs(argv);
   } catch (err) {
     if (!(err instanceof UsageError)) throw err;
-    stderr.write(`${err.message}\n${INSTALL_USAGE}\n`);
+    const { user, home } = whoami(env);
+    emitRefusal({ json: argv.includes('--json'), version: packageVersion(), user, home, name: 'usage', detail: err.message, fix: INSTALL_USAGE, stdout, stderr });
     return 2;
   }
   if (opts.help) {
@@ -291,15 +317,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   }
   const title = opts.uninstall ? 'zcode-mcp uninstaller' : 'zcode-mcp installer';
   if (!opts.dryRun && !opts.yes) {
+    const { user, home } = whoami(env);
+    const refuse = (detail, fix) => emitRefusal({ json: opts.json, version: packageVersion(), user, home, name: 'confirm', detail, fix, stdout, stderr });
     if (!(stdin.isTTY && stderr.isTTY)) {
-      stderr.write('Not running in a terminal, so the installer cannot ask for confirmation: review the plan with --dry-run, then re-run with --yes. Nothing was changed.\n');
+      refuse('Not running in a terminal, so the installer cannot ask for confirmation. Nothing was changed.', 'Review the plan with --dry-run, then re-run with --yes.');
       return 2;
     }
     const plan = await execute({ ...opts, dryRun: true }, env);
     emit(`${title} (plan)`, plan, { json: false, stdout: stderr, stderr });
     if (!(await ask('Apply this plan? [y/N] ', { stdin, stderr }))) {
-      stderr.write('Aborted; nothing was changed.\n');
-      return 1;
+      refuse('Aborted at the confirmation; nothing was changed.', 'Re-run and answer y, or pass --yes.');
+      return 2;
     }
   }
   const report = await execute(opts, env);
@@ -307,6 +335,6 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   return report.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

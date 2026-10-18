@@ -1,8 +1,8 @@
 // Where things live: Claude Code home, Claude Desktop config, the `claude` CLI,
 // an installed zcode-delegate plugin, and runtime paths that may vanish.
-import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 
 export const PLUGIN_NAME = 'zcode-delegate';
 
@@ -59,6 +59,49 @@ export function findOnPath(cmd, env) {
     } catch { /* next */ }
   }
   return null;
+}
+
+/** Claude Code's user-scope config file (holds user-scope MCP servers). */
+export function userConfigFile(env) {
+  return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : join(homeOf(env), '.claude.json');
+}
+
+/**
+ * The node to register: the `node` on PATH when it is the same binary as the running
+ * one (process.execPath is symlink-resolved, e.g. a version-pinned Homebrew Cellar
+ * path that `brew upgrade` deletes), else process.execPath.
+ */
+export function chooseNode(env, execPath = process.execPath) {
+  const p = findOnPath('node', env);
+  try {
+    if (p && realpathSync(p) === realpathSync(execPath)) return p;
+  } catch { /* fall back */ }
+  return execPath;
+}
+
+/**
+ * A registered server vs this installation's server script: 'ours' (node + the same
+ * script, whatever node path or env), 'elsewhere' (node + another zcode-mcp
+ * src/mcp-server.mjs) or 'foreign'. args: the first argument (or args space-joined).
+ */
+export function classifyServer(command, args, server) {
+  if (!command || !/^node(\.exe)?$/i.test(basename(command))) return 'foreign';
+  if (args === server) return 'ours';
+  return /\/src\/mcp-server\.mjs$/.test(String(args || '')) ? 'elsewhere' : 'foreign';
+}
+
+const SECRET_OPT = /key|token|secret|password|auth/i;
+
+/** Masks the values of secret-looking options in a space-joined argument string. */
+export function redactArgs(args) {
+  const parts = String(args || '').split(' ').filter((x) => x !== '');
+  return parts.map((a, i) => {
+    const eq = a.indexOf('=');
+    if (a.startsWith('-') && eq > 0 && SECRET_OPT.test(a.slice(0, eq))) return `${a.slice(0, eq)}=***`;
+    const prev = parts[i - 1];
+    if (prev && prev.startsWith('-') && !prev.includes('=') && SECRET_OPT.test(prev) && !a.startsWith('-')) return '***';
+    return a;
+  }).join(' ');
 }
 
 export function whoami(env) {

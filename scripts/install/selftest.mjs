@@ -55,12 +55,13 @@ export function providerKeys(env) {
 }
 
 const isApiKey = (accessType) => /api-?key/i.test(String(accessType || ''));
+const accessKind = (t) => (isApiKey(t) ? 'api-key' : t ? 'account-login' : 'unknown');
 
 export function providerTable(providers, keys) {
   return (providers || []).map((p) => ({
     id: p.id,
     enabled: p.enabled,
-    access: isApiKey(p.accessType) ? 'api-key' : 'account-login',
+    access: accessKind(p.accessType),
     accessType: p.accessType,
     apiType: p.apiType,
     baseUrl: p.baseUrl,
@@ -140,10 +141,18 @@ export function evaluateSession(session, { probe, keys = new Map(), providerFile
       fixes.push(`${providerFile} is not valid JSON: restore it from its .bak backup or let ZCode rewrite it (ZCode settings).`);
     }
   }
+  // The key may live elsewhere (credentials.json, a ZCode UI rule): a passed probe is the
+  // ground truth, so a missing inline key fails only without a passing probe.
+  const probePassed = probe && p.modelProbe && p.modelProbe.ok === true;
+  const notes = [];
   for (const r of table) {
     if (r.enabled && r.access === 'api-key' && r.keyPresent === false) {
-      problems.push(`provider ${r.id}: no API key in the config`);
-      fixes.push(`Provider "${r.id}" uses an API key but none is set: ${SETUP_HELPER}.`);
+      if (probePassed) {
+        notes.push(`Provider "${r.id}" has no inline key in the config, but the model probe passed, so ZCode finds its key elsewhere: no action needed.`);
+      } else {
+        problems.push(`provider ${r.id}: no API key in the config`);
+        fixes.push(`Provider "${r.id}" uses an API key but none is set in the config (and no passing model probe shows that ZCode finds one elsewhere): ${SETUP_HELPER}.`);
+      }
     }
   }
   const summary = table.length
@@ -151,7 +160,7 @@ export function evaluateSession(session, { probe, keys = new Map(), providerFile
     : 'no personal provider rules (ZCode\'s built-in login is used)';
   steps.push(problems.length
     ? { name: 'selftest:providers', ok: false, detail: `${problems.join('; ')} | ${summary}`, fix: fixes.join(' ') }
-    : { name: 'selftest:providers', ok: true, detail: summary });
+    : { name: 'selftest:providers', ok: true, detail: summary, ...(notes.length ? { fix: notes.join(' ') } : {}) });
 
   if (!probe) {
     steps.push({ name: 'selftest:probe', ok: true, detail: 'skipped (--no-probe): no model request was made' });

@@ -91,7 +91,14 @@ const state = () => (existsSync(t.state) ? JSON.parse(readFileSync(t.state, 'utf
 const step = (report, name) => report.steps.find((s) => s.name === name);
 const skillPath = () => join(t.claudeHome, 'skills', 'zcode-delegate', 'SKILL.md');
 const agentPath = () => join(t.claudeHome, 'agents', 'zcode-worker.md');
-const want = { command: process.execPath, args: [SERVER] };
+// I-2: the registered node is the PATH entry (t.nodeBin/node) when it is the running binary.
+const nodePath = () => join(t.nodeBin, 'node');
+const want = () => ({ command: nodePath(), args: [SERVER] });
+// Pre-existing registrations: the fake's state plus the config file the real CLI would have.
+function seed(st) {
+  writeFileSync(t.state, JSON.stringify(st));
+  writeFileSync(join(t.claudeHome, '.claude.json'), '{}\n');
+}
 
 test('dry-run: reports the plan, writes nothing, one JSON document on stdout', async () => {
   const r = await install(['--dry-run', '--json', '--target', 'all']);
@@ -105,6 +112,8 @@ test('dry-run: reports the plan, writes nothing, one JSON document on stdout', a
   assert(!claudeCalls().some((a) => a[1] === 'add'), 'no claude mcp add');
   assert(!existsSync(t.desktop));
   assert(!existsSync(skillPath()));
+  assert(!existsSync(join(t.claudeHome, '.claude.json')), 'no `claude` call created its config in a dry run');
+  assert(r.report.files.some((f) => f.path === join(t.claudeHome, '.claude.json') && f.action === 'would-write'));
   assert(!r.report.steps.some((s) => s.name.startsWith('selftest:')), 'no self-test in a dry run');
 });
 
@@ -113,12 +122,12 @@ test('install all targets, self-test with the model probe, then an idempotent re
   assert.equal(r.code, 0, `${r.stdout}\n${r.stderr}`);
   assert.equal(r.report.ok, true);
   const regEnv = { ZCODE_BIN: fakeBin, ZCODE_APPSERVER_BIN: t.appserver, ZCODE_MCP_HOME: t.mcpHome };
-  assert.deepEqual(state().user.zcode, { ...want, env: regEnv });
-  assert.deepEqual(JSON.parse(readFileSync(t.desktop, 'utf8')), { mcpServers: { zcode: { ...want, env: regEnv } } });
+  assert.deepEqual(state().user.zcode, { ...want(), env: regEnv });
+  assert.deepEqual(JSON.parse(readFileSync(t.desktop, 'utf8')), { mcpServers: { zcode: { ...want(), env: regEnv } } });
   assert.equal(readFileSync(skillPath(), 'utf8'), readFileSync(join(root, 'skills', 'zcode-delegate', 'SKILL.md'), 'utf8'));
   assert.equal(readFileSync(agentPath(), 'utf8'), readFileSync(join(root, 'claude', 'agents', 'zcode-worker.md'), 'utf8'));
   assert.deepEqual(r.report.registered.map((x) => [x.target, x.status]), [['claude-code', 'added'], ['claude-desktop', 'added']]);
-  for (const p of [t.desktop, skillPath(), agentPath()]) assert(r.report.files.some((f) => f.path === p && f.action === 'written'), p);
+  for (const p of [t.desktop, skillPath(), agentPath(), join(t.claudeHome, '.claude.json')]) assert(r.report.files.some((f) => f.path === p && f.action === 'written'), p);
   assert.equal(step(r.report, 'selftest:probe').ok, true);
   assert.match(step(r.report, 'selftest:probe').detail, /glm-test\/small/);
   assert.match(step(r.report, 'preflight:user').detail, new RegExp(t.home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -130,32 +139,34 @@ test('install all targets, self-test with the model probe, then an idempotent re
   assert.deepEqual(again.report.registered.map((x) => x.status), ['unchanged', 'unchanged']);
   assert.equal(claudeCalls().filter((a) => a[1] === 'add').length, 1, 'claude mcp add ran once');
   assert(again.report.files.every((f) => f.action === 'unchanged'), JSON.stringify(again.report.files));
+  assert.match(step(r.report, 'preflight:node').detail, new RegExp(`at ${nodePath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   assert.deepEqual(readdirSync(dirname(t.desktop)), ['claude_desktop_config.json'], 'no backup when nothing changed');
 });
 
 test('a different server under the same name stops the run unless --force', async () => {
-  writeFileSync(t.state, JSON.stringify({ user: { zcode: { command: 'python3', args: ['/other/server.py'], env: {} } } }));
+  seed({ user: { zcode: { command: 'python3', args: ['/other/server.py', '--api-key', 'sk-SENTINEL-1'], env: {} } } });
   const r = await install(['--yes', '--json', '--target', 'claude-code', '--no-probe']);
   assert.equal(r.code, 1);
   const s = step(r.report, 'register:claude-code');
   assert.equal(s.ok, false);
-  assert.match(s.detail, /python3/);
+  assert.match(s.detail, /python3 \/other\/server\.py --api-key \*\*\*/);
+  assert(!(r.stdout + r.stderr).includes('sk-SENTINEL-1'), 'a foreign server\'s secret args are masked');
   assert.match(s.fix, /--force/);
   assert.equal(state().user.zcode.command, 'python3', 'left alone');
 
   const f = await install(['--yes', '--json', '--target', 'claude-code', '--no-probe', '--force']);
   assert.equal(f.code, 0, f.stderr);
   assert.equal(f.report.registered[0].status, 'replaced');
-  assert.equal(state().user.zcode.command, process.execPath);
+  assert.equal(state().user.zcode.command, nodePath());
 });
 
 test('project scope: a user-scope server of the same name is not touched; re-run and uninstall stay in scope', async () => {
-  writeFileSync(t.state, JSON.stringify({ user: { zcode: { command: 'python3', args: ['/other.py'], env: {} } } }));
+  seed({ user: { zcode: { command: 'python3', args: ['/other.py'], env: {} } } });
   const r = await install(['--yes', '--json', '--target', 'claude-code', '--scope', 'project', '--no-probe']);
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.report.registered[0].status, 'added');
   assert.match(step(r.report, 'register:claude-code').detail, /also exists in the user scope/);
-  assert.equal(state().project.zcode.command, process.execPath);
+  assert.equal(state().project.zcode.command, nodePath());
   assert.deepEqual([...new Set(claudeCwds())], [realpathSync(t.cwd)], 'project scope: claude runs in the project dir');
   assert(existsSync(join(t.cwd, '.claude', 'skills', 'zcode-delegate', 'SKILL.md')));
   assert(existsSync(join(t.cwd, '.claude', 'agents', 'zcode-worker.md')));
@@ -187,7 +198,7 @@ test('Claude Desktop: other servers and keys survive, a backup is written first;
   const after = JSON.parse(readFileSync(t.desktop, 'utf8'));
   assert.equal(after.theme, 'dark');
   assert.deepEqual(after.mcpServers.other, before.mcpServers.other);
-  assert.equal(after.mcpServers.zcode.command, process.execPath);
+  assert.equal(after.mcpServers.zcode.command, nodePath());
   const backups = readdirSync(dirname(t.desktop)).filter((f) => /\.bak-\d{8}-\d{6}$/.test(f));
   assert.equal(backups.length, 1);
   assert.deepEqual(JSON.parse(readFileSync(join(dirname(t.desktop), backups[0]), 'utf8')), before);
@@ -202,7 +213,7 @@ test('Claude Desktop: other servers and keys survive, a backup is written first;
 
 test('uninstall removes exactly what the installer added and keeps backups', async () => {
   writeFileSync(t.desktop, JSON.stringify({ mcpServers: { other: { command: 'x' } } }));
-  writeFileSync(t.state, JSON.stringify({ user: { keep: { command: 'k', args: [], env: {} } } }));
+  seed({ user: { keep: { command: 'k', args: [], env: {} } } });
   assert.equal((await install(['--yes', '--json', '--target', 'all', '--no-probe'])).code, 0);
   const u = await install(['--uninstall', '--yes', '--json', '--target', 'all']);
   assert.equal(u.code, 0, u.stderr);
@@ -306,7 +317,9 @@ test('--copy-to registers the copy; --name renames the agent tools', async () =>
   const r = await install(['--yes', '--json', '--target', 'claude-code', '--no-probe', '--copy-to', dest, '--name', 'zc2']);
   assert.equal(r.code, 0, r.stderr);
   assert(existsSync(join(dest, 'src', 'mcp-server.mjs')) && existsSync(join(dest, 'package.json')));
-  assert.deepEqual(state().user.zc2.args, [join(realpathSync(dest), 'src', 'mcp-server.mjs')], 'registered by its real path');
+  // dest lies under /var/folders (a symlink to /private/var): the server must still start (C-1).
+  assert.deepEqual(state().user.zc2.args, [join(dest, 'src', 'mcp-server.mjs')]);
+  assert(existsSync(join(dest, '.zcode-mcp-runtime')));
   const agent = readFileSync(agentPath(), 'utf8');
   assert.match(agent, /mcp__zc2__zcode_run/);
   assert.doesNotMatch(agent, /mcp__zcode__/);
@@ -338,4 +351,69 @@ test('doctor: static checks without probe pass; a failing probe exits 1; install
   assert.match(human.stdout, /PASS/);
   assert.match(human.stdout, new RegExp(`user .* home ${t.home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   assert.equal((await run(DOCTOR, ['--bogus'])).code, 2);
+});
+
+test('uninstall removes our registration even when the env (or node path) differs from the install', async () => {
+  assert.equal((await install(['--yes', '--json', '--target', 'all', '--no-probe'])).code, 0);
+  const u = await install(['--uninstall', '--yes', '--json', '--target', 'all'], { ZCODE_BIN: '', ZCODE_APPSERVER_BIN: '', ZCODE_MCP_HOME: '' });
+  assert.equal(u.code, 0, u.stderr);
+  assert.deepEqual(u.report.registered.map((x) => x.status), ['removed', 'removed']);
+  assert.deepEqual(state().user, {});
+  assert.deepEqual(JSON.parse(readFileSync(t.desktop, 'utf8')).mcpServers, {});
+  assert(u.report.nextSteps.some((n) => /disappears/.test(n)));
+});
+
+test('uninstall from another location reports failure and keeps the server', async () => {
+  const other = join(t.base, 'old-clone', 'src', 'mcp-server.mjs');
+  seed({ user: { zcode: { command: 'node', args: [other], env: {} } } });
+  writeFileSync(t.desktop, JSON.stringify({ mcpServers: { zcode: { command: 'node', args: [other] } } }));
+  const u = await install(['--uninstall', '--yes', '--json', '--target', 'all']);
+  assert.equal(u.code, 1);
+  assert.deepEqual(u.report.registered.map((x) => x.status), ['elsewhere', 'elsewhere']);
+  assert.equal(step(u.report, 'register:claude-code').ok, false);
+  assert(!u.report.nextSteps.some((n) => /disappears/.test(n)));
+  assert.equal(state().user.zcode.args[0], other);
+});
+
+test('install updates our own earlier registration (other env / node path) without --force', async () => {
+  seed({ user: { zcode: { command: '/old/node/bin/node', args: [SERVER], env: { ZCODE_BIN: '/old' } } } });
+  writeFileSync(t.desktop, JSON.stringify({ mcpServers: { zcode: { command: '/old/node/bin/node', args: [SERVER] } } }));
+  const r = await install(['--yes', '--json', '--target', 'all', '--no-probe']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.report.registered.map((x) => x.status), ['updated', 'updated']);
+  assert.equal(state().user.zcode.command, nodePath());
+  assert.equal(JSON.parse(readFileSync(t.desktop, 'utf8')).mcpServers.zcode.command, nodePath());
+});
+
+test('--copy-to refuses a non-empty foreign directory; replaces an earlier copy; --force overrides', async () => {
+  const dest = join(t.base, 'myapp');
+  mkdirSync(join(dest, 'src'), { recursive: true });
+  writeFileSync(join(dest, 'package.json'), '{"name":"myapp"}');
+  const r = await install(['--yes', '--json', '--target', 'claude-code', '--no-probe', '--copy-to', dest]);
+  assert.equal(r.code, 1);
+  assert.match(step(r.report, 'copy-runtime').detail, /not a zcode-mcp runtime copy/);
+  assert.equal(readFileSync(join(dest, 'package.json'), 'utf8'), '{"name":"myapp"}');
+  assert(!claudeCalls().some((a) => a[1] === 'add'));
+
+  const copy = join(t.base, 'stable');
+  assert.equal((await install(['--yes', '--json', '--target', 'claude-code', '--no-probe', '--copy-to', copy])).code, 0);
+  writeFileSync(join(copy, 'src', 'stale.mjs'), '');
+  const again = await install(['--yes', '--json', '--target', 'claude-code', '--no-probe', '--copy-to', copy]);
+  assert.equal(again.code, 0, again.stderr);
+  assert(!existsSync(join(copy, 'src', 'stale.mjs')), 'stale files of an earlier copy are gone');
+
+  const forced = await install(['--yes', '--json', '--target', 'claude-desktop', '--no-probe', '--copy-to', dest, '--force']);
+  assert.equal(forced.code, 0, forced.stderr);
+});
+
+test('--json refusals (usage error, no terminal) still print one JSON document', async () => {
+  for (const args of [['--json', '--target', 'grok'], ['--json', '--target', 'claude-code']]) {
+    const r = await install(args);
+    assert.equal(r.code, 2);
+    assert.equal(r.report.ok, false);
+    assert.deepEqual(Object.keys(r.report), REPORT_KEYS);
+  }
+  const d = await run(DOCTOR, ['--json', '--bogus']);
+  assert.equal(d.code, 2);
+  assert.equal(JSON.parse(d.stdout).steps[0].name, 'usage');
 });

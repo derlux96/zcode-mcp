@@ -3,11 +3,11 @@
 // self-test evaluation and its fix texts.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseInstallArgs, parseDoctorArgs, UsageError } from '../scripts/install/args.mjs';
 import { mergeDesktopConfig, removeDesktopEntry, backupPath, freeBackupPath, writeAtomic } from '../scripts/install/desktop.mjs';
-import { claudeHome, desktopConfigPath, tempPathWarning, pluginInstalled, findOnPath } from '../scripts/install/context.mjs';
+import { claudeHome, desktopConfigPath, tempPathWarning, pluginInstalled, findOnPath, chooseNode, classifyServer, redactArgs, userConfigFile } from '../scripts/install/context.mjs';
 import { parseMcpGet, renderAgent } from '../scripts/install/claude-code.mjs';
 import { evaluateSession, parseCheckText, providerTable, cleanEnv, forwardedEnv, REPORT_KEYS } from '../scripts/install/selftest.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
@@ -80,23 +80,34 @@ test('desktop merge: a different server under the name is a conflict unless forc
   assert.deepEqual(JSON.parse(f.text).mcpServers.zcode, ENTRY);
 });
 
+test('desktop merge: our own server with another node path or env is updated without --force', () => {
+  const before = JSON.stringify({ mcpServers: { zcode: { command: '/opt/homebrew/Cellar/node/22/bin/node', args: ENTRY.args, env: { ZCODE_BIN: '/old' } } } });
+  const r = mergeDesktopConfig(before, 'zcode', ENTRY);
+  assert.equal(r.status, 'updated');
+  assert.deepEqual(JSON.parse(r.text).mcpServers.zcode, ENTRY);
+});
+
 test('desktop merge: refuses invalid JSON and non-object shapes', () => {
   assert.throws(() => mergeDesktopConfig('{ "mcpServers": ', 'zcode', ENTRY), /not valid JSON/);
   assert.throws(() => mergeDesktopConfig('[]', 'zcode', ENTRY), /not a JSON object/);
   assert.throws(() => mergeDesktopConfig('{"mcpServers": []}', 'zcode', ENTRY), /mcpServers/);
 });
 
-test('desktop remove: only our own entry', () => {
-  const ours = JSON.stringify({ a: 1, mcpServers: { zcode: ENTRY, other: { command: 'x' } } });
-  const r = removeDesktopEntry(ours, 'zcode', ENTRY);
+const SRV = ENTRY.args[0];
+
+test('desktop remove: our server by command + script path, whatever its env or node path', () => {
+  const ours = JSON.stringify({ a: 1, mcpServers: { zcode: { command: '/opt/homebrew/Cellar/node/24.1/bin/node', args: [SRV], env: { ZCODE_BIN: '/x' } }, other: { command: 'x' } } });
+  const r = removeDesktopEntry(ours, 'zcode', SRV);
   assert.equal(r.status, 'removed');
   assert.deepEqual(JSON.parse(r.text), { a: 1, mcpServers: { other: { command: 'x' } } });
-  assert.equal(removeDesktopEntry(r.text, 'zcode', ENTRY).status, 'absent');
+  assert.equal(removeDesktopEntry(r.text, 'zcode', SRV).status, 'absent');
   const foreign = JSON.stringify({ mcpServers: { zcode: { command: 'python' } } });
-  assert.equal(removeDesktopEntry(foreign, 'zcode', ENTRY).status, 'foreign');
-  assert.equal(removeDesktopEntry(foreign, 'zcode', ENTRY, { force: true }).status, 'removed');
-  assert.equal(removeDesktopEntry(null, 'zcode', ENTRY).status, 'absent');
-  assert.throws(() => removeDesktopEntry('nope', 'zcode', ENTRY), /not valid JSON/);
+  assert.equal(removeDesktopEntry(foreign, 'zcode', SRV).status, 'foreign');
+  assert.equal(removeDesktopEntry(foreign, 'zcode', SRV, { force: true }).status, 'removed');
+  const elsewhere = JSON.stringify({ mcpServers: { zcode: { command: 'node', args: ['/old/clone/src/mcp-server.mjs'] } } });
+  assert.equal(removeDesktopEntry(elsewhere, 'zcode', SRV).status, 'elsewhere');
+  assert.equal(removeDesktopEntry(null, 'zcode', SRV).status, 'absent');
+  assert.throws(() => removeDesktopEntry('nope', 'zcode', SRV), /not valid JSON/);
 });
 
 test('desktop backup name carries a sortable timestamp', () => {
@@ -161,6 +172,36 @@ test('findOnPath finds executables only', () => {
   assert.equal(findOnPath('claude', { PATH: `/nonexistent:${d}` }), join(d, 'claude'));
   assert.equal(findOnPath('noexec', { PATH: d }), null);
   assert.equal(findOnPath('claude', { PATH: '' }), null);
+});
+
+test('chooseNode prefers the PATH node when it is the same binary (keeps Homebrew paths stable)', () => {
+  const d = tmp('zcode-inst-node-');
+  symlinkSync(process.execPath, join(d, 'node'));
+  assert.equal(chooseNode({ PATH: d }), join(d, 'node'));
+  const other = tmp('zcode-inst-node2-');
+  writeFileSync(join(other, 'node'), '#!/bin/sh\n', { mode: 0o755 });
+  assert.equal(chooseNode({ PATH: other }), process.execPath);
+  assert.equal(chooseNode({ PATH: '' }), process.execPath);
+});
+
+test('classifyServer: ours by node + script path; another zcode-mcp; foreign', () => {
+  assert.equal(classifyServer('/usr/local/bin/node', '/a/src/mcp-server.mjs', '/a/src/mcp-server.mjs'), 'ours');
+  assert.equal(classifyServer('/opt/homebrew/Cellar/node/24/bin/node', '/a/src/mcp-server.mjs', '/a/src/mcp-server.mjs'), 'ours');
+  assert.equal(classifyServer('node', '/b/src/mcp-server.mjs', '/a/src/mcp-server.mjs'), 'elsewhere');
+  assert.equal(classifyServer('python3', '/a/src/mcp-server.mjs', '/a/src/mcp-server.mjs'), 'foreign');
+  assert.equal(classifyServer('node', '/a/other.mjs', '/a/src/mcp-server.mjs'), 'foreign');
+  assert.equal(classifyServer(null, null, '/a/src/mcp-server.mjs'), 'foreign');
+});
+
+test('redactArgs masks values of secret-looking options', () => {
+  assert.equal(redactArgs('/srv.py --api-key xyz --port 1 --token=abc'), '/srv.py --api-key *** --port 1 --token=***');
+  assert.equal(redactArgs('/a/b.mjs'), '/a/b.mjs');
+  assert.equal(redactArgs(null), '');
+});
+
+test('userConfigFile: <CLAUDE_CONFIG_DIR>/.claude.json, else ~/.claude.json', () => {
+  assert.equal(userConfigFile({ HOME: '/h' }), '/h/.claude.json');
+  assert.equal(userConfigFile({ HOME: '/h', CLAUDE_CONFIG_DIR: '/c' }), '/c/.claude.json');
 });
 
 // ---------- claude mcp get / agent ----------
@@ -247,14 +288,25 @@ test('evaluate: enabled API-key provider without a key -> guided helper', () => 
   assert.match(st.fix, /hidden/);
 });
 
+test('evaluate: a missing inline key is only a note when the probe passed', () => {
+  const providers = [{ id: 'zai', enabled: true, baseUrl: 'https://a/v4', apiType: 'openai', accessType: 'zhipu-coding-plan-api-key' }];
+  const st = step(evaluateSession(session({ ...PAYLOAD, providers, modelProbe: { ok: true, durationMs: 1, model: 'p/m' } }), { probe: true, keys: new Map([['zai', false]]) }), 'selftest:providers');
+  assert.equal(st.ok, true);
+  assert.match(st.fix, /probe passed/);
+  const failed = step(evaluateSession(session({ ...PAYLOAD, providers, modelProbe: { ok: false, durationMs: 1, model: 'p/m', errorKind: 'auth', error: '401' } }), { probe: true, keys: new Map([['zai', false]]) }), 'selftest:providers');
+  assert.equal(failed.ok, false);
+});
+
 test('providerTable: access kind and key presence only', () => {
   const rows = providerTable([
     { id: 'zai', enabled: true, baseUrl: 'https://a', apiType: 'openai', accessType: 'zhipu-coding-plan-api-key' },
     { id: 'acct', enabled: true, baseUrl: null, apiType: null, accessType: 'oauth' },
+    { id: 'n', enabled: false, baseUrl: null, apiType: null, accessType: null },
   ], new Map([['zai', true]]));
   assert.deepEqual(rows, [
     { id: 'zai', enabled: true, access: 'api-key', accessType: 'zhipu-coding-plan-api-key', apiType: 'openai', baseUrl: 'https://a', keyPresent: true },
     { id: 'acct', enabled: true, access: 'account-login', accessType: 'oauth', apiType: null, baseUrl: null, keyPresent: null },
+    { id: 'n', enabled: false, access: 'unknown', accessType: null, apiType: null, baseUrl: null, keyPresent: null },
   ]);
 });
 

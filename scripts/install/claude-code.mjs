@@ -2,6 +2,7 @@
 // the user-level agent text.
 import { spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
+import { classifyServer } from './context.mjs';
 
 /** Parses `claude mcp get <name>` -> { scope, command, args, env } (args as printed: space-joined). */
 export function parseMcpGet(out) {
@@ -40,8 +41,9 @@ function claude(bin, args, run) {
 
 /**
  * Compares the registration of `name` in `scope` with { command, args: [server], env }.
- * -> { state: absent|same|different, found?, otherScope? } (a server of that name in
- * another scope counts as absent here and is reported as otherScope).
+ * -> { state: absent|same|outdated|different, kind?, found?, otherScope? }. outdated:
+ * our script with another node path or env; kind: classifyServer (ours|elsewhere|foreign).
+ * A server of that name in another scope counts as absent here (reported as otherScope).
  */
 export function registrationState(bin, name, scope, want, run) {
   const r = claude(bin, ['mcp', 'get', name], run);
@@ -49,7 +51,8 @@ export function registrationState(bin, name, scope, want, run) {
   const found = parseMcpGet(r.stdout);
   if (found.scope && found.scope !== scope) return { state: 'absent', otherScope: found.scope };
   const same = found.command === want.command && found.args === want.args.join(' ') && isDeepStrictEqual(found.env, want.env);
-  return { state: same ? 'same' : 'different', found };
+  const kind = classifyServer(found.command, found.args, want.args[0]);
+  return { state: same ? 'same' : kind === 'ours' ? 'outdated' : 'different', kind, found };
 }
 
 export function addArgs(name, scope, want) {

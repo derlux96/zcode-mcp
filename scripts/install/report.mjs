@@ -33,3 +33,15 @@ export function emit(title, report, { json, stdout = process.stdout, stderr = pr
     stdout.write(text);
   }
 }
+
+/**
+ * Exit-2 situations (usage error, confirmation needed or declined): with --json one
+ * JSON document with ok:false and a single failed step; the message always on stderr.
+ */
+export function emitRefusal({ json, version, user, home, name, detail, fix, stdout = process.stdout, stderr = process.stderr }) {
+  stderr.write(`${detail}\n${fix ? `${fix}\n` : ''}`);
+  if (json) {
+    const report = { ok: false, version, user, home, steps: [{ name, ok: false, detail, ...(fix ? { fix } : {}) }], registered: [], files: [], nextSteps: [] };
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  }
+}

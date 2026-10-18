@@ -5,13 +5,16 @@
 // Usage: node scripts/doctor.mjs [--no-probe] [--json]   (npm run doctor)
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMain } from '../src/is-main.mjs';
 import { parseDoctorArgs, DOCTOR_USAGE, UsageError } from './install/args.mjs';
 import { whoami } from './install/context.mjs';
 import { cleanEnv, forwardedEnv, runSelfTest } from './install/selftest.mjs';
-import { emit } from './install/report.mjs';
+import { emit, emitRefusal } from './install/report.mjs';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+
+export const packageVersion = () => JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
 
 export function nodeStep(node = process.execPath, version = process.versions.node) {
   const major = Number(version.split('.')[0]);
@@ -31,7 +34,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     opts = parseDoctorArgs(argv);
   } catch (err) {
     if (!(err instanceof UsageError)) throw err;
-    stderr.write(`${err.message}\n${DOCTOR_USAGE}\n`);
+    const { user, home } = whoami(env);
+    emitRefusal({ json: argv.includes('--json'), version: packageVersion(), user, home, name: 'usage', detail: err.message, fix: DOCTOR_USAGE, stdout, stderr });
     return 2;
   }
   if (opts.help) {
@@ -39,7 +43,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
     return 0;
   }
   const { user, home } = whoami(env);
-  const version = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
+  const version = packageVersion();
   const node = process.execPath;
   const server = join(repoRoot, 'src', 'mcp-server.mjs');
   const steps = [userStep(env), nodeStep(node)];
@@ -54,6 +58,6 @@ export async function main(argv, { env = process.env, stdout = process.stdout, s
   return ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

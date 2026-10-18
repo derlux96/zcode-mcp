@@ -3,6 +3,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { existsSync, renameSync, writeFileSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { classifyServer } from './context.mjs';
 
 function parse(text) {
   let cfg;
@@ -20,24 +21,34 @@ function parse(text) {
 
 const render = (cfg) => `${JSON.stringify(cfg, null, 2)}\n`;
 
-/** text: current file content or null (missing) -> { status: added|unchanged|conflict|replaced, text }. */
+const kindOf = (current, server) => classifyServer(current && current.command, Array.isArray(current && current.args) ? current.args.join(' ') : null, server);
+
+/**
+ * text: current file content or null (missing) -> { status: added|unchanged|updated|conflict|replaced, text }.
+ * updated: our own server (same script) with another node path or env is brought up to date.
+ */
 export function mergeDesktopConfig(text, name, entry, { force = false } = {}) {
   const cfg = text === null ? {} : parse(text);
   const servers = cfg.mcpServers || {};
   const current = servers[name];
   if (current !== undefined && isDeepStrictEqual(current, entry)) return { status: 'unchanged', text };
-  if (current !== undefined && !force) return { status: 'conflict', text };
+  const ours = current !== undefined && kindOf(current, entry.args[0]) === 'ours';
+  if (current !== undefined && !ours && !force) return { status: 'conflict', text };
   cfg.mcpServers = { ...servers, [name]: entry };
-  return { status: current === undefined ? 'added' : 'replaced', text: render(cfg) };
+  return { status: current === undefined ? 'added' : ours ? 'updated' : 'replaced', text: render(cfg) };
 }
 
-/** -> { status: removed|absent|foreign, text } (foreign: a different server; removed only with force). */
-export function removeDesktopEntry(text, name, entry, { force = false } = {}) {
+/**
+ * Removes mcpServers[name] when it runs `server` with node (any node path or env).
+ * -> { status: removed|absent|foreign|elsewhere, text } (foreign/elsewhere are removed only with force).
+ */
+export function removeDesktopEntry(text, name, server, { force = false } = {}) {
   if (text === null) return { status: 'absent', text };
   const cfg = parse(text);
   const current = cfg.mcpServers && cfg.mcpServers[name];
   if (current === undefined) return { status: 'absent', text };
-  if (!isDeepStrictEqual(current, entry) && !force) return { status: 'foreign', text };
+  const kind = kindOf(current, server);
+  if (kind !== 'ours' && !force) return { status: kind, text };
   const { [name]: _gone, ...rest } = cfg.mcpServers;
   cfg.mcpServers = rest;
   return { status: 'removed', text: render(cfg) };
