@@ -1,0 +1,17 @@
+{
+  "name": "zcode-delegate",
+  "version": "1.2.0",
+  "description": "Delegate coding tasks from Claude Code to a locally installed ZCode agent as background jobs (zcode_run/status/result/cancel), with a delegation skill and the zcode-worker agent.",
+  "author": { "name": "derlux" },
+  "homepage": "https://github.com/derlux96/zcode-mcp",
+  "repository": "https://github.com/derlux96/zcode-mcp",
+  "license": "MIT",
+  "keywords": ["zcode", "delegation", "coding-agent", "orchestration", "mcp"],
+  "mcpServers": {
+    "zcode": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/src/mcp-server.mjs"]
+    }
+  },
+  "agents": ["./claude/agents/zcode-worker.md"]
+}
