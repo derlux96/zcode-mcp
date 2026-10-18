@@ -417,3 +417,14 @@ test('--json refusals (usage error, no terminal) still print one JSON document',
   assert.equal(d.code, 2);
   assert.equal(JSON.parse(d.stdout).steps[0].name, 'usage');
 });
+
+test('the documented `npm run -s doctor -- --json` prints exactly one JSON document', async () => {
+  const r = await new Promise((resolve) => {
+    const child = spawn('npm', ['run', '-s', 'doctor', '--', '--json', '--no-probe'], { cwd: root, env: { ...env(), PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.on('close', (code) => resolve({ code, stdout }));
+  });
+  assert.equal(r.code, 0);
+  assert.equal(JSON.parse(r.stdout).ok, true);
+});

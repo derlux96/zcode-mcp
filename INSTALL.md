@@ -40,8 +40,10 @@ Claude Desktop by hand (absolute paths):
 ## Check
 
 ```bash
-npm run doctor              # user/home, ZCode binary + version, providers (key presence only), model probe
-npm run doctor -- --no-probe --json
+npm run doctor                          # user/home, ZCode binary + version, providers (key presence only), model probe
+node scripts/doctor.mjs --no-probe --json   # machine-readable (npm run without -s prints a banner first)
 ```
+
+Plugin users (no clone): ask Claude to call `zcode_check` with `probe_model: true`.
 
 Every FAIL line comes with the fix. Exit code 0 = everything works.

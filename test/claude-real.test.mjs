@@ -58,6 +58,12 @@ test('plugin route: marketplace add, install, server connected, uninstall', { sk
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /Skills \(1\)\s+zcode-delegate/);
   assert.match(r.out, /MCP servers \(1\)\s+zcode/);
+  r = claude(['plugin', 'list', '--json']);
+  const listed = JSON.parse(r.out).find((p) => p.id === 'zcode-delegate@zcode-mcp');
+  assert(listed && listed.enabled, r.out);
+  // The manifest's agents path (the Claude agent) shadows the Grok/Cursor agents/ folder.
+  assert((listed.notes || []).some((n) => /Default agents\/ folder is ignored/.test(n)), r.out);
+  assert(!(listed.errors || []).length, r.out);
   r = claude(['mcp', 'list']);
   assert.match(r.out, /plugin:zcode-delegate:zcode: node .*\/src\/mcp-server\.mjs - ✔ Connected/, r.out);
   r = claude(['plugin', 'uninstall', 'zcode-delegate@zcode-mcp']);
@@ -78,7 +84,7 @@ test('script route: install.mjs --target claude-code registers a connected serve
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /Scope: User config/);
   assert.match(r.out, /Status: ✔ Connected/);
-  assert(r.out.includes(`Command: ${process.execPath}`), r.out);
+  assert(r.out.includes(`Command: ${report.registered[0].command}`) && /\/node$/.test(report.registered[0].command), r.out);
   assert(r.out.includes(`Args: ${join(root, 'src', 'mcp-server.mjs')}`), r.out);
   const un = spawnSync(process.execPath, [join(root, 'scripts', 'install.mjs'), '--target', 'claude-code', '--yes', '--json', '--uninstall'], { cwd, env, encoding: 'utf8', timeout: 180000 });
   assert.equal(un.status, 0, `${un.stdout}\n${un.stderr}`);
