@@ -1,7 +1,7 @@
 {
   "name": "zcode-delegate",
-  "version": "1.1.0",
-  "description": "Delegate coding tasks from Grok or Cursor to a locally installed ZCode agent as background jobs (zcode_run/status/result/cancel), via ZCode's app-server protocol or its official headless CLI.",
+  "version": "1.2.0",
+  "description": "MCP server that lets any MCP client (Claude Code, Claude Desktop, Cursor, Grok, ...) delegate coding tasks to a locally installed ZCode agent as background jobs (zcode_run/status/result/cancel), via ZCode's app-server protocol or its official headless CLI.",
   "type": "module",
   "private": true,
   "engines": { "node": ">=18" },
@@ -10,6 +10,8 @@
     "test:client": "node scripts/test-client.mjs",
     "smoke": "node scripts/smoke-real.mjs",
     "soak": "node scripts/soak-real.mjs",
-    "faults": "node scripts/faults-real.mjs"
+    "faults": "node scripts/faults-real.mjs",
+    "install:claude": "node scripts/install.mjs",
+    "doctor": "node scripts/doctor.mjs"
   }
 }

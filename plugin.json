@@ -1,7 +1,7 @@
 {
   "name": "zcode-delegate",
-  "version": "1.1.0",
-  "description": "Delegate coding tasks from Grok or Cursor to a locally installed ZCode agent via its official headless CLI.",
+  "version": "1.2.0",
+  "description": "Delegate coding tasks from Grok, Cursor or any MCP client to a locally installed ZCode agent as background jobs, via ZCode's app-server protocol or its official headless CLI.",
   "author": { "name": "derlux" },
   "homepage": "https://github.com/derlux96/zcode-mcp",
   "keywords": ["zcode", "delegation", "coding-agent", "orchestration"]

@@ -1,8 +1,90 @@
-# zcode-delegate (grok-zcode-plugin)
+# zcode-delegate — ZCode as an MCP server
 
-Delegate coding tasks from **Grok** or **Cursor** to a locally installed **ZCode** agent.
-Grok stays the orchestrator (spec, verification); ZCode executes (edit files, run tests)
-as background jobs, through its app-server protocol or its official headless CLI. Zero npm dependencies — the MCP server is plain Node.
+A universal MCP server (stdio) that lets **any MCP client** delegate coding tasks to a locally
+installed **ZCode** agent: Claude Code, Claude Desktop, Cursor, Grok, or anything else that can
+start a stdio MCP server. The client stays the orchestrator (spec, verification); ZCode executes
+(edit files, run tests) as detached background jobs, through its app-server protocol or its
+official headless CLI. Zero npm dependencies — the server is plain Node.
+
+The project started as a Grok-only plugin (`grok-zcode-plugin`); the server itself never depended
+on Grok and is now packaged for several clients.
+
+## How it works
+
+1. The client calls `zcode_run` with a task and a directory. The server starts a detached job
+   runner, which drives ZCode, and answers within `wait_ms` with the result or a `job_id`.
+2. The client follows a longer job with `zcode_status` (waits for a change of state) and fetches
+   the text with `zcode_result`; `zcode_cancel` stops it.
+3. Jobs survive a restart of the MCP server or the client; state lives in `~/.zcode-mcp`.
+4. The result lists the changed files and a diff stat; ZCode's own output follows a marker line
+   and is treated as untrusted data.
+
+## Supported clients
+
+| Client | Install | Extras |
+|---|---|---|
+| Claude Code | plugin (2 commands) or `node scripts/install.mjs` | skill `zcode-delegate`, agent `zcode-worker` |
+| Claude Desktop | `node scripts/install.mjs --target claude-desktop` or the config by hand | tools only |
+| Grok | this repo as a plugin (`plugin.json`, `.mcp.json`, `agents/`, `skills/`) | skill, agent |
+| Cursor | this repo as a plugin, or an `mcpServers` entry (below) | skill, agent with the plugin files |
+| Any other MCP client | an `mcpServers` entry (below) | tools only |
+
+## Install
+
+Requirements first: Node.js ≥ 18 and ZCode installed and logged in (details under
+[Requirements](#requirements)).
+
+**Claude Code (plugin, 2 commands):**
+
+```bash
+claude plugin marketplace add derlux96/zcode-mcp
+claude plugin install zcode-delegate@zcode-mcp
+```
+
+MCP server + skill `zcode-delegate` + agent `zcode-worker`; `claude mcp list` then shows
+`plugin:zcode-delegate:zcode: … - ✔ Connected`.
+
+**Script (Claude Code and/or Claude Desktop, 1 command, from a permanent clone):**
+
+```bash
+node scripts/install.mjs --yes      # --dry-run first to see the plan; npm run install:claude -- --yes
+```
+
+It registers the server (`claude mcp add --scope user zcode -- <node> <server>` / the Claude Desktop
+config, backup first), copies the skill and agent, and self-tests the registered command including
+one tiny model request (`--no-probe` skips it). `--uninstall` removes what it added.
+
+> **Claude Desktop: quit it completely (⌘Q, not just the window) before installing.** A running
+> Claude Desktop writes its in-memory copy of `claude_desktop_config.json` back on exit and so
+> drops the new `zcode` entry. Reopen it afterwards.
+
+**Claude Desktop by hand** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+(same rule: Desktop quit while you edit):
+
+```json
+{ "mcpServers": { "zcode": { "command": "/usr/local/bin/node", "args": ["/path/to/zcode-mcp/src/mcp-server.mjs"] } } }
+```
+
+**Grok / Cursor:** install this repo as a plugin (`plugin.json`, `.mcp.json`, `agents/`, `skills/`).
+
+**Any other MCP client** (Cursor `~/.cursor/mcp.json`, and most clients with an `mcpServers`
+config): start `node` with the absolute path of `src/mcp-server.mjs` from a permanent clone. Use
+absolute paths, since GUI clients often start servers without your shell's `PATH`:
+
+```json
+{ "mcpServers": { "zcode": { "command": "/usr/local/bin/node", "args": ["/path/to/zcode-mcp/src/mcp-server.mjs"] } } }
+```
+
+The tools may then appear with a client-specific prefix (`mcp__zcode__zcode_run` in Claude Code).
+Without the skill, point the model at [`skills/zcode-delegate/SKILL.md`](skills/zcode-delegate/SKILL.md)
+for the delegation workflow.
+
+**Check:** `npm run doctor` (user/home examined, ZCode binary + version, provider table with key
+presence only, baseUrl sanity, model probe; every FAIL with its fix; `--json`, `--no-probe`). From
+any client: ask it to call `zcode_check` with `probe_model: true`.
+
+Details: [INSTALL.md](INSTALL.md). Setup done by an AI model: [llms-install.md](llms-install.md)
+(preconditions, route choice, verification, failure table, hard rules).
 
 ## Requirements
 
@@ -13,11 +95,12 @@ as background jobs, through its app-server protocol or its official headless CLI
   for the spawned CLI (the CLI cannot locate its builtin provider config from a fresh shell);
   an explicitly pre-set value is never overridden.
 
-## What the plugin provides
+## What the server provides
 
 - **MCP server** (stdio) with six tools (table below)
 - **Skill** `zcode-delegate`: when and how to delegate (paths, prompt quality, job workflow, verification loop)
-- **Agent** `zcode-worker`: a delegation-engineer subagent for Grok
+- **Agent** `zcode-worker`: a delegation-engineer subagent (Grok/Cursor: `agents/zcode-worker.md` with the
+  bare tool names; Claude: `claude/agents/zcode-worker.md` with the `mcp__…` names plus Read, Grep, Glob — no shell, no editing tools)
 
 | Tool | Purpose |
 |---|---|
@@ -227,6 +310,7 @@ node scripts/test-client.mjs --e2e    # + three real ZCode tasks (needs login, s
 npm run smoke -- --real               # real smoke matrix: 6 tasks x 3 paths, effect oracles, latency p50/p95
 npm run soak -- --real                # one 20-40 min real job, MCP server killed and restarted mid-run
 npm run faults -- --real              # real fault injection; --only <scenario> runs one
+CLAUDE_REAL=1 node --test test/claude-real.test.mjs   # real `claude` CLI: plugin validate/install, script route (temp CLAUDE_CONFIG_DIR, no model calls)
 ```
 
 The real suites (`smoke`, `soak`, `faults`) refuse to run without `--real` (exit 2), accept
@@ -249,7 +333,7 @@ npx @modelcontextprotocol/inspector node src/mcp-server.mjs
 
 1. Requirements: Node ≥ 18, ZCode desktop app installed and logged in on macOS
    (or any machine with `ZCODE_BIN` pointing at `zcode.cjs`).
-2. Install this plugin, then run the health check:
+2. Install the server in the client under review (see [Install](#install)), then run the health check:
    - Prompt: `Check the ZCode installation` → expected tool call `zcode_check`,
      result contains `"ok": true` and version `0.16.9` or newer.
 3. Single delegation in any small git repo:

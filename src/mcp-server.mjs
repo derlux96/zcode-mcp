@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmdirSync, unlinkSync, writeFileSync } from 'nod
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './is-main.mjs';
 import { createProtocol, PARSE_ERROR } from './protocol.mjs';
 import { discoverZCode, ZCodeNotFoundError } from './discover.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
@@ -669,5 +669,4 @@ export function main() {
   });
 }
 
-const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (isDirectRun) main();
+if (isMain(import.meta.url)) main();

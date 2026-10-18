@@ -1,0 +1,15 @@
+{
+  "name": "zcode-mcp",
+  "owner": { "name": "derlux" },
+  "metadata": {
+    "description": "zcode-delegate: run coding tasks on a locally installed ZCode agent from Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "zcode-delegate",
+      "source": "./",
+      "description": "MCP server (six zcode_* tools), skill zcode-delegate and agent zcode-worker for delegating coding tasks to ZCode.",
+      "version": "1.2.0"
+    }
+  ]
+}

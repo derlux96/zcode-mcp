@@ -8,6 +8,11 @@ description: Delegate coding tasks (multi-file changes, refactors, test suites, 
 You are the orchestrator: you write the specification and verify the result. ZCode executes.
 Answer trivial questions yourself — do not spawn a ZCode task for anything a single file read cannot justify.
 
+**Tool names.** This skill uses the short names (`zcode_check`, `zcode_run`, `zcode_status`,
+`zcode_result`, `zcode_cancel`, `zcode_sessions`). Your client may prefix them: in Claude Code
+`zcode_run` is `mcp__plugin_zcode-delegate_zcode__zcode_run` (plugin install) or
+`mcp__zcode__zcode_run` (script install, server name `zcode`); Grok and Cursor use the short names.
+
 ## 1. Pre-flight
 
 On the first delegation on a machine, call `zcode_check`. If it reports a missing binary,
