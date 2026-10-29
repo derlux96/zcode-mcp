@@ -7,7 +7,8 @@ import { makeTempDir, makeGitRepo, removeDir, fakeBin, safeSignal } from './help
 import { createJobDir, readStatus, readResult } from '../src/jobstore.mjs';
 import { captureBaseline } from '../src/changes.mjs';
 import { SessionStore } from '../src/state.mjs';
-import { runJob, describeEvent } from '../src/job-runner.mjs';
+import { runJob, describeEvent, STOP_GRACE_MS, DEFAULT_INPUT_TIMEOUT_MS, INPUT_TIMEOUT_ANSWER } from '../src/job-runner.mjs';
+import { writeInboxEntry, readAck } from '../src/inbox.mjs';
 import { runTaskWithModel, AppServerError } from '../src/appserver.mjs';
 
 const fakeAppServer = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
@@ -25,6 +26,8 @@ before(() => {
 afterEach(() => {
   delete process.env.FAKE_APPSERVER_MODE;
   delete process.env.FAKE_ZCODE_MODE;
+  delete process.env.FAKE_APPSERVER_LOG;
+  delete process.env.FAKE_APPSERVER_UNSUPPORTED;
 });
 
 after(() => {
@@ -408,4 +411,211 @@ test('secrets in the model output are redacted in result.json and output.log', a
   const log = readFileSync(join(dir, 'output.log'), 'utf8');
   assert.ok(log.includes('[REDACTED]'));
   assert.ok(!log.includes('sk-abc123def456ghi789jkl'));
+});
+
+// --- job control: inbox, graceful cancel, needs_input ---
+
+function logged(log) {
+  try {
+    return readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+// Status once onControl has fired (capabilities are written then).
+const controlReady = (dir) => waitFor(() => (readStatus(dir)?.capabilities ? readStatus(dir) : null));
+
+test('job-control constants', () => {
+  assert.equal(STOP_GRACE_MS, 10000);
+  assert.equal(DEFAULT_INPUT_TIMEOUT_MS, 1800000);
+  assert.equal(INPUT_TIMEOUT_ANSWER, 'No answer available, decide yourself and continue');
+});
+
+test('an inbox entry on a running protocol job is sent as a steer and acked accepted', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await controlReady(dir);
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'use port 8080' });
+  const t0 = Date.now();
+  const ack = await waitFor(() => readAck(dir, seq), 2000);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(ack.status, 'accepted');
+  await done;
+  assert.equal(readResult(dir).state, 'completed');
+  const cmd = logged(log).find((m) => m.method === 'v4/command');
+  assert.ok(cmd, 'a steer was sent');
+  assert.equal(cmd.params.payload.text, 'use port 8080');
+  assert.equal(readStatus(dir).capabilities.steer, true);
+});
+
+test('a question parks the job in needs_input; an inbox entry answers it', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const patches = [];
+  const done = runJob(dir, { heartbeatMs: 50, onStatus: (_s, patch) => patches.push(patch) });
+  const st = await waitFor(() => (readStatus(dir)?.state === 'needs_input' ? readStatus(dir) : null));
+  assert.equal(st.question, 'Which port?');
+  const deadline = Date.parse(st.inputDeadline);
+  assert.ok(Number.isFinite(deadline));
+  assert.ok(deadline > Date.now() + DEFAULT_INPUT_TIMEOUT_MS - 60000, 'default input timeout');
+  assert.equal(st.capabilities.userInput, true);
+  const seq = writeInboxEntry(dir, { kind: 'send', text: '8080' });
+  const ack = await waitFor(() => readAck(dir, seq), 2000);
+  assert.equal(ack.status, 'accepted');
+  await done;
+  const back = patches.find((p) => p.state === 'running' && 'question' in p);
+  assert.deepEqual({ question: back.question, inputDeadline: back.inputDeadline }, { question: null, inputDeadline: null });
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.match(res.output, /8080/);
+  const fin = readStatus(dir);
+  assert.equal(fin.question, null);
+  assert.equal(fin.inputDeadline, null);
+});
+
+test('an unanswered question is answered with the input-timeout text after input_timeout_ms', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const { dir } = mkJob({ cwd: tempCwd(), input_timeout_ms: 300 });
+  const states = [];
+  await runJob(dir, { heartbeatMs: 50, onStatus: (_s, patch) => { if (patch.state) states.push(patch.state); } });
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.ok(res.output.includes(INPUT_TIMEOUT_ANSWER));
+  assert.ok(states.includes('needs_input'));
+});
+
+test('the status question is one line and redacted', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  process.env.FAKE_APPSERVER_ASK_QUESTION = JSON.stringify('key sk-abc123def456ghi789jkl\nnext   line');
+  try {
+    const { dir } = mkJob({ cwd: tempCwd(), input_timeout_ms: 300 });
+    let question = null;
+    await runJob(dir, { heartbeatMs: 50, onStatus: (_s, patch) => { if (patch.state === 'needs_input') question = patch.question; } });
+    assert.equal(typeof question, 'string');
+    assert.ok(!question.includes('\n'));
+    assert.ok(!question.includes('sk-abc123def456ghi789jkl'));
+    assert.match(question, /\[REDACTED\] next line$/);
+  } finally {
+    delete process.env.FAKE_APPSERVER_ASK_QUESTION;
+  }
+});
+
+test('cancel on the protocol path sends session/stop first and ends cancelled with the session id', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await controlReady(dir);
+  await waitFor(() => logged(log).some((m) => m.method === 'session/send'));
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  assert.ok(logged(log).some((m) => m.method === 'session/stop'), 'session/stop was sent');
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.errorKind, 'cancelled');
+  assert.equal(res.sessionId, 'sess_fakeB1');
+  assert.equal(readStatus(dir).capabilities.stop, true);
+});
+
+test('cancel without session/stop support falls back to the kill at once', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  process.env.FAKE_APPSERVER_UNSUPPORTED = 'stop';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  const st = await controlReady(dir);
+  await new Promise((r) => setTimeout(r, 300)); // past session/send
+  const t0 = Date.now();
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  assert.ok(Date.now() - t0 < 3000, 'killed without the grace wait');
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.sessionId, 'sess_fakeB1');
+  assert.equal(readStatus(dir).capabilities.stop, false);
+  await waitFor(() => !alive(st.childPid), 2000);
+});
+
+test('a stop that does not end the turn is followed by the kill after the grace period', async () => {
+  // nosendack: session/stop is answered, but the unanswered session/send keeps
+  // the task waiting, so only the grace timer ends it.
+  process.env.FAKE_APPSERVER_MODE = 'nosendack';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd });
+  const done = runJob(dir, { heartbeatMs: 50, stopGraceMs: 600 });
+  await controlReady(dir);
+  await waitFor(() => logged(log).some((m) => m.method === 'session/send'));
+  const t0 = Date.now();
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  const took = Date.now() - t0;
+  assert.ok(took >= 600, `waited the grace period (${took} ms)`);
+  assert.ok(took < 5000, `then killed (${took} ms)`);
+  assert.ok(logged(log).some((m) => m.method === 'session/stop'));
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.sessionId, 'sess_fakeB1');
+  assert.equal(readStatus(dir).capabilities.stop, true);
+});
+
+test('cancel while needs_input ends the job cancelled', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await waitFor(() => readStatus(dir)?.state === 'needs_input');
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.sessionId, 'sess_fakeB1');
+  const st = readStatus(dir);
+  assert.equal(st.state, 'cancelled');
+});
+
+test('an inbox entry written before the session exists is handled only once control is up', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'early note' });
+  let ackedEarly = false;
+  const done = runJob(dir, {
+    heartbeatMs: 50,
+    onStatus: (s) => { if (!s.capabilities && readAck(dir, seq)) ackedEarly = true; },
+  });
+  const ack = await waitFor(() => readAck(dir, seq), 5000);
+  assert.equal(ack.status, 'accepted');
+  await done;
+  assert.equal(ackedEarly, false);
+  assert.equal(readResult(dir).state, 'completed');
+});
+
+test('entries still pending when the job ends are acked rejected finished', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'die';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'too late' });
+  await runJob(dir);
+  assert.equal(readResult(dir).state, 'failed');
+  const ack = readAck(dir, seq);
+  assert.equal(ack.status, 'rejected');
+  assert.equal(ack.reason, 'finished');
+});
+
+test('without steer support an inbox entry is acked not_supported', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  process.env.FAKE_APPSERVER_UNSUPPORTED = 'steer';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await controlReady(dir);
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'hello' });
+  const ack = await waitFor(() => readAck(dir, seq), 2000);
+  assert.equal(ack.status, 'not_supported');
+  await done;
+  assert.equal(readStatus(dir).capabilities.steer, false);
 });
