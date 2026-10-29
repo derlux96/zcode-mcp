@@ -222,7 +222,7 @@ function createReaper({ reapFn, now, waitMs = REAP_WAIT_MS }) {
         const onAbort = () => done(false);
         const timer = setTimeout(() => done(false), waitMs);
         timer.unref();
-        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        if (signal) signal.addEventListener('abort', onAbort);
         pass.then(() => done(true));
       });
     },
@@ -280,13 +280,9 @@ function buildCheckHandler(reaper, probe = {}) {
       throw error;
     }
     const version = await runZCodeArgs(binPath, ['version'], { cwd: process.cwd(), timeoutMs: 15000 });
-    let doctor = null;
-    try {
-      const d = await runZCodeArgs(binPath, ['doctor'], { cwd: process.cwd(), timeoutMs: 15000 });
-      doctor = { ok: d.code === 0, excerpt: d.stdout.trim().slice(-500) };
-    } catch (e) {
-      doctor = { ok: false, excerpt: String(e.message).slice(0, 500) };
-    }
+    // runZCodeArgs never rejects for a spawn failure (it resolves with code null).
+    const d = await runZCodeArgs(binPath, ['doctor'], { cwd: process.cwd(), timeoutMs: 15000 });
+    const doctor = { ok: d.code === 0, excerpt: d.stdout.trim().slice(-500) };
     const ok = version.code === 0;
     const jobs = listJobs();
     const providers = checkProviderConfig();
