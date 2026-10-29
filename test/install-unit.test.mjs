@@ -232,7 +232,7 @@ test('renderAgent rewrites the user-level tool prefix for a custom server name',
 
 // ---------- self-test evaluation ----------
 
-const TOOLS = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel'].map((name) => ({ name }));
+const TOOLS = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel', 'zcode_send'].map((name) => ({ name }));
 const PAYLOAD = { ok: true, binPath: '/z/zcode.cjs', version: 'zcode 0.16.9', jobs: { dir: '/j', writable: true }, providers: [], warnings: [] };
 const session = (payload = PAYLOAD, extra = {}) => ({ serverInfo: { name: 'zcode-delegate', version: '1.2.0' }, tools: TOOLS, check: { isError: false, text: JSON.stringify(payload, null, 2) }, ...extra });
 const step = (steps, name) => steps.find((s) => s.name === name);

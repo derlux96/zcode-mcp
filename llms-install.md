@@ -104,7 +104,7 @@ install, are written into the registration's env. Windows/Linux Desktop paths
 ## 4. Verification
 
 The installer ends with a self-test: it starts the registered command exactly like Claude
-(absolute node + server path, clean env), runs MCP `initialize`, `tools/list` (six tools) and
+(absolute node + server path, clean env), runs MCP `initialize`, `tools/list` (seven tools) and
 `zcode_check` with `probe_model: true` (**one tiny real model request**, up to ~75 s; skip it with
 `--no-probe`). The doctor runs the same checks any time (use `node …`, or `npm run -s`: plain `npm run` prints its
 own banner on stdout before the JSON):

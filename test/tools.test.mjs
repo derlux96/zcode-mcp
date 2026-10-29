@@ -86,10 +86,10 @@ after(() => {
   for (const d of temps) removeDir(d);
 });
 
-test('exposes exactly the six spec tools with object schemas', async () => {
+test('exposes exactly the seven spec tools with object schemas', async () => {
   const reply = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = reply.result.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']);
+  assert.deepEqual(names, ['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_send', 'zcode_sessions', 'zcode_status']);
   for (const t of reply.result.tools) {
     assert.equal(t.inputSchema.type, 'object');
     assert.ok(t.description.length > 20);
@@ -1011,4 +1011,55 @@ test('a pass in flight for more than 5 minutes no longer blocks a new one', asyn
   assert.equal(pending.length, 2, 'the late settle did not clear the newer pass');
   pending[1]({ lost: [], deleted: [], killed: [] });
   await flush();
+});
+
+// --- Task 8: zcode_send, needs_input rendering ---
+
+test('zcode_send schema requires job_id and text; zcode_run documents input_timeout_ms', async () => {
+  const reply = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  const send = reply.result.tools.find((t) => t.name === 'zcode_send');
+  assert.deepEqual(send.inputSchema.required, ['job_id', 'text']);
+  assert.equal(send.inputSchema.properties.text.type, 'string');
+  assert.match(send.description, /needs_input/);
+  const run = reply.result.tools.find((t) => t.name === 'zcode_run');
+  assert.match(run.inputSchema.properties.input_timeout_ms.description, /1800000/);
+  const cancel = reply.result.tools.find((t) => t.name === 'zcode_cancel');
+  assert.match(cancel.description, /graceful/i);
+});
+
+test('a needs_input job renders state, question, deadline and the zcode_send hint', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 0 });
+  const id = jobIdOf(textOf(reply));
+  await waitFor(() => getJob(id)?.state === 'needs_input');
+  const text = textOf(await call('zcode_status', { job_id: id }));
+  assert.match(text, /^status: needs_input$/m);
+  assert.match(text, /^question: Which port\?$/m);
+  assert.match(text, /^input_deadline: \d{4}-\d\d-\d\dT/m);
+  assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
+  const sent = await call('zcode_send', { job_id: id, text: '8080' });
+  assert.notEqual(sent.result.isError, true);
+  assert.match(textOf(sent), /^send: accepted$/m);
+  assert.ok(textOf(sent).includes(`job_id: ${id}`));
+  assert.match(textOf(sent), /^status: \S+$/m);
+});
+
+test('zcode_send on a running protocol job is accepted', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 0 });
+  const id = jobIdOf(textOf(reply));
+  await waitFor(() => getJob(id)?.state === 'running');
+  const sent = await call('zcode_send', { job_id: id, text: 'please also add tests' });
+  assert.match(textOf(sent), /^send: (accepted|queued)$/m);
+});
+
+test('zcode_send errors: unknown job, bad arguments, queued hint, rejected is isError', async () => {
+  let r = await call('zcode_send', { job_id: 'job_00000000-0000-0000-0000-000000000000', text: 'hi' });
+  assert.equal(r.result.isError, true);
+  assert.match(textOf(r), /Unknown job/);
+  r = await call('zcode_send', { job_id: 5, text: 'hi' });
+  assert.equal(r.result.isError, true);
+  r = await call('zcode_send', { job_id: 'job_x', text: 5 });
+  assert.equal(r.result.isError, true);
+  assert.match(textOf(r), /text must be a string/);
 });

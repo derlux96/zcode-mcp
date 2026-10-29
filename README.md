@@ -14,7 +14,7 @@ on Grok and is now packaged for several clients.
 1. The client calls `zcode_run` with a task and a directory. The server starts a detached job
    runner, which drives ZCode, and answers within `wait_ms` with the result or a `job_id`.
 2. The client follows a longer job with `zcode_status` (waits for a change of state) and fetches
-   the text with `zcode_result`; `zcode_cancel` stops it.
+   the text with `zcode_result`; `zcode_cancel` stops it and `zcode_send` talks to it.
 3. Jobs survive a restart of the MCP server or the client; state lives in `~/.zcode-mcp`.
 4. The result lists the changed files and a diff stat; ZCode's own output follows a marker line
    and is treated as untrusted data.
@@ -97,7 +97,7 @@ Details: [INSTALL.md](INSTALL.md). Setup done by an AI model: [llms-install.md](
 
 ## What the server provides
 
-- **MCP server** (stdio) with six tools (table below)
+- **MCP server** (stdio) with seven tools (table below)
 - **Skill** `zcode-delegate`: when and how to delegate (paths, prompt quality, job workflow, verification loop)
 - **Agent** `zcode-worker`: a delegation-engineer subagent (Grok/Cursor: `agents/zcode-worker.md` with the
   bare tool names; Claude: `claude/agents/zcode-worker.md` with the `mcp__…` names plus Read, Grep, Glob — no shell, no editing tools)
@@ -108,7 +108,8 @@ Details: [INSTALL.md](INSTALL.md). Setup done by an AI model: [llms-install.md](
 | `zcode_run` | Starts one task as a background **job** and answers within `wait_ms` of the request (default 30000, max 300000, `0` = return the `job_id` as soon as the job is started; job start-up counts towards it). Finished in time: the full result text with `job_id`; otherwise `status: running` + `job_id` (not an error). |
 | `zcode_status` | With `job_id` (+ optional `wait_ms`, max 120000, waits for a change of state; heartbeats and progress do not end the wait): state, elapsed time, last activity, warnings, files changed so far, progress lines; a finished job shows its full result. Without `job_id`: all jobs (newest first) and the open worktrees. |
 | `zcode_result` | The result of a job, repeatable; for a running job its current status. |
-| `zcode_cancel` | Stops a running job (ZCode and its children, SIGTERM then SIGKILL) and returns its final state with the changes so far (not rolled back). A finished job is returned unchanged with `already finished`. |
+| `zcode_cancel` | Stops a running job (protocol path: ZCode is asked to stop first, up to 10 s; then ZCode and its children get SIGTERM, then SIGKILL) and returns its final state with the changes so far (not rolled back). A finished job is returned unchanged with `already finished`. |
+| `zcode_send` | Sends `text` to a running protocol-path job: answers ZCode's question while the job is `needs_input`, otherwise steers the running turn. Answers `send: accepted`, `rejected`, `not_supported` (the last two are errors) or `queued` (delivered later). |
 | `zcode_sessions` | ZCode sessions that ran through this server (`sess_…` ids are resumable). |
 
 Cancelling a waiting `zcode_run`/`zcode_status` call (MCP `notifications/cancelled`) only ends
@@ -134,6 +135,22 @@ offer is replaced by its default and reported (`[notice] reasoning_level ... usi
 At most 3 jobs run at once and one job per directory; a refused start names the
 `blocking_job_id`. Errors before the start (invalid arguments, unwritable job directory)
 create no job.
+
+### Job control (protocol path)
+
+- **Steering and answers (`zcode_send`)**: `zcode_send {job_id, text}` steers a running job with a
+  short message. When ZCode asks the user a question, the job goes to the non-terminal state
+  `needs_input`; `zcode_status` then shows `question:`, `input_deadline:` and the hint
+  `answer with zcode_send <job_id> "<text>"`. The text of that call is the answer. If nobody answers
+  within `input_timeout_ms` (`zcode_run`, default 1800000 = 30 min, max 21600000) ZCode is told
+  `No answer available, decide yourself and continue`. The server waits up to 5 s for the runner's
+  acknowledgement; later it answers `queued`. On the CLI path every message answers `not_supported`.
+- **Graceful cancel**: `zcode_cancel` first asks ZCode to stop its session (up to 10 s) and only then
+  kills the process group. The result keeps the `session_id`, so the session can be resumed.
+- **Usage**: a finished protocol job shows a `usage:` line (tokens in/out/reasoning/cache read, number
+  of model requests) when ZCode reports it.
+- **Redaction**: the question and everything ZCode sends reach the status and result text only as one
+  line with secrets redacted; your own `zcode_send` text is not echoed back.
 
 ### `zcode_check`: provider config and model probe
 

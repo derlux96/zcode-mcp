@@ -1,6 +1,6 @@
 ---
 name: zcode-delegate
-description: Delegate coding tasks (multi-file changes, refactors, test suites, implementations) to a locally installed ZCode agent via the zcode_run MCP tool and its job tools (zcode_status, zcode_result, zcode_cancel). Use when a task needs a real agent runtime that reads, edits, and tests code.
+description: Delegate coding tasks (multi-file changes, refactors, test suites, implementations) to a locally installed ZCode agent via the zcode_run MCP tool and its job tools (zcode_status, zcode_result, zcode_cancel, zcode_send). Use when a task needs a real agent runtime that reads, edits, and tests code.
 ---
 
 # ZCode Task Delegation
@@ -9,7 +9,7 @@ You are the orchestrator: you write the specification and verify the result. ZCo
 Answer trivial questions yourself — do not spawn a ZCode task for anything a single file read cannot justify.
 
 **Tool names.** This skill uses the short names (`zcode_check`, `zcode_run`, `zcode_status`,
-`zcode_result`, `zcode_cancel`, `zcode_sessions`). Your client may prefix them: in Claude Code
+`zcode_result`, `zcode_cancel`, `zcode_send`, `zcode_sessions`). Your client may prefix them: in Claude Code
 `zcode_run` is `mcp__plugin_zcode-delegate_zcode__zcode_run` (plugin install) or
 `mcp__zcode__zcode_run` (script install, server name `zcode`); Grok and Cursor use the short names.
 
@@ -45,7 +45,8 @@ below your client's request timeout (60 s in many MCP clients):
      files changed so far and progress lines. Never busy-loop: always pass a `wait_ms` (e.g.
      30000, below your client's request timeout) instead of calling it back to back.
    - `zcode_result {job_id}` — the final text once the job is finished (repeatable).
-   - `zcode_cancel {job_id}` — stops ZCode and its children; changes made so far stay on disk.
+   - `zcode_cancel {job_id}` — stops ZCode and its children (protocol path: graceful stop first, the session stays resumable); changes made so far stay on disk.
+   - `zcode_send {job_id, text}` — protocol path only. When the status is `needs_input` (a `question:` and an `input_deadline:` are shown) the text answers ZCode's question; otherwise it steers the running turn. Use it for a short correction instead of cancelling and restarting.
    - `zcode_status` without `job_id` lists all jobs and the open worktrees.
 3. Cancelling your own tool call only ends the wait; the job keeps running. Jobs also survive a
    restart of the MCP server — fetch them again by `job_id`.

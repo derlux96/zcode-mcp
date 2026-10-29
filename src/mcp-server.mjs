@@ -9,7 +9,7 @@ import { discoverZCode, ZCodeNotFoundError } from './discover.mjs';
 import { SessionStore, defaultStatePath } from './state.mjs';
 import { getModelCatalog, resolveBin } from './appserver.mjs';
 import { runZCodeArgs, MODES, DEFAULT_IDLE_TIMEOUT_MS, MAX_TIMEOUT_MS, MAX_TRANSIENT_RETRIES, OUTPUT_CAP } from './runner.mjs';
-import { startJob, waitJob, getJob, cancelJob, listJobs, collectChanges, formatCatalog, REASONING_LEVELS } from './jobs.mjs';
+import { startJob, waitJob, getJob, cancelJob, sendToJob, listJobs, collectChanges, formatCatalog, REASONING_LEVELS } from './jobs.mjs';
 import { TERMINAL_STATES, jobsRoot } from './jobstore.mjs';
 import { reap } from './reaper.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
@@ -96,6 +96,12 @@ const toolSchemas = {
           maximum: MAX_TRANSIENT_RETRIES,
           description: `Protocol path only: how often a turn that failed with a temporary provider error (HTTP 429/5xx, overload, rate limit, network) is continued in the same session after a wait (30 s, 60 s, 2, 5, 10, 15 min, ±10 %; a numeric retry-after is honoured). Default 6, max ${MAX_TRANSIENT_RETRIES}, 0 disables it. Balance errors (Z.ai 1113, insufficient balance) are retried at most twice. Auth, model and configuration errors are never retried. Waits count against timeout_ms. Rejected on the CLI path, which cannot continue a session (rerun with resume instead).`,
         },
+        input_timeout_ms: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_TIMEOUT_MS,
+          description: `Protocol path only: how long a question from ZCode (status needs_input) waits for an answer via zcode_send. Default 1800000 (30 min), max ${MAX_TIMEOUT_MS}. After that ZCode is told to decide itself and continue. Rejected on the CLI path, which cannot ask questions.`,
+        },
       },
       required: ['prompt', 'cwd'],
       additionalProperties: false,
@@ -135,10 +141,24 @@ const toolSchemas = {
       additionalProperties: false,
     },
   },
+  zcode_send: {
+    name: 'zcode_send',
+    description:
+      'Send a message to a running protocol-path job: while the job waits for an answer (status needs_input) the text answers ZCode\'s question, otherwise it steers the running turn. Returns accepted, rejected, not_supported, or queued (delivered later).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Job id (job_...) returned by zcode_run.' },
+        text: { type: 'string', description: 'The answer or steering message for ZCode.' },
+      },
+      required: ['job_id', 'text'],
+      additionalProperties: false,
+    },
+  },
   zcode_cancel: {
     name: 'zcode_cancel',
     description:
-      'Stop a running zcode_run job (ZCode and its child processes) and return its final state with the changes made so far; changes are not rolled back. A job that already finished is left as it is and its result is returned with the line "already finished".',
+      'Stop a running zcode_run job and return its final state with the changes made so far; changes are not rolled back. On the protocol path the stop is graceful first (ZCode is asked to stop, up to 10 s) before the process group is killed, and the result keeps the session id so the session can be resumed. A job that already finished is left as it is and its result is returned with the line "already finished".',
     inputSchema: {
       type: 'object',
       properties: { job_id: { type: 'string', description: 'Job id (job_...) returned by zcode_run.' } },
@@ -461,7 +481,13 @@ function runningResult(view, changes) {
   const s = view.status || {};
   const id = view.jobId;
   const started = Date.parse(s.startedAt) || Date.parse(view.job.createdAt);
-  const lines = ['status: running', `job_id: ${id}`];
+  const needsInput = view.state === 'needs_input';
+  // Only needs_input is named; every other live state (starting, running) stays `running`.
+  const lines = [`status: ${needsInput ? 'needs_input' : 'running'}`, `job_id: ${id}`];
+  if (needsInput) {
+    if (s.question) lines.push(`question: ${oneLine(s.question)}`);
+    if (s.inputDeadline) lines.push(`input_deadline: ${oneLine(s.inputDeadline)}`);
+  }
   if (Number.isFinite(started)) lines.push(`elapsed: ${seconds(Date.now() - started)}s`);
   const activity = Date.parse(s.lastActivityAt);
   if (Number.isFinite(activity)) lines.push(`last_activity: ${seconds(Date.now() - activity)}s ago`);
@@ -470,7 +496,8 @@ function runningResult(view, changes) {
   if (view.warnings.length) lines.push(`warnings: ${oneLine(view.warnings.join(', '))}`);
   if (changes) lines.push(`changed_files: ${changes.available ? fileList(changes.changedFiles) : '(unavailable)'}`);
   if (Array.isArray(s.progress) && s.progress.length) lines.push('progress:', ...s.progress.map((l) => oneLine(l)));
-  lines.push(`use zcode_status ${id} to follow it, zcode_result ${id} when it is finished, zcode_cancel ${id} to stop it`);
+  if (needsInput) lines.push(`answer with zcode_send ${id} "<text>"`);
+  else lines.push(`use zcode_status ${id} to follow it, zcode_result ${id} when it is finished, zcode_cancel ${id} to stop it`);
   return text(lines.join('\n'));
 }
 
@@ -600,6 +627,22 @@ function buildCancelHandler(reaper) {
   };
 }
 
+function buildSendHandler() {
+  return async (args = {}, ctx = {}) => {
+    if (typeof args.job_id !== 'string') return badJobId();
+    if (typeof args.text !== 'string') return failText('Invalid arguments: text must be a string');
+    const r = await sendToJob(args.job_id, args.text, { signal: ctx.signal });
+    if (!r.ok) return failText(r.error);
+    const lines = [`send: ${r.status}`];
+    if (r.reason) lines.push(`reason: ${oneLine(r.reason)}`);
+    lines.push(`job_id: ${r.view.jobId}`, `status: ${oneLine(r.view.state)}`);
+    if (r.status === 'queued') lines.push(`the message will be delivered when the job is ready; check zcode_status ${r.view.jobId}`);
+    const result = text(lines.join('\n'));
+    if (r.status === 'rejected' || r.status === 'not_supported') result.isError = true;
+    return result;
+  };
+}
+
 // Every tool call kicks a (throttled) reaper pass without waiting for it.
 function withReap(tool, reaper) {
   return { ...tool, handler: (args, ctx) => { reaper.soon(); return tool.handler(args, ctx); } };
@@ -620,6 +663,7 @@ export function buildTools({
     { ...toolSchemas.zcode_sessions, handler: buildSessionsHandler(store) },
     { ...toolSchemas.zcode_status, handler: buildStatusHandler(reaper) },
     { ...toolSchemas.zcode_result, handler: buildResultHandler(reaper) },
+    { ...toolSchemas.zcode_send, handler: buildSendHandler() },
     { ...toolSchemas.zcode_cancel, handler: buildCancelHandler(reaper) },
   ].map((t) => withReap(t, reaper));
 }
