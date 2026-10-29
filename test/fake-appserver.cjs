@@ -153,6 +153,20 @@
 // ones are held like with FAKE_APPSERVER_NO_DRAIN.
 // FAKE_APPSERVER_CAS_STALE=n: the first n CAS commands answer stale whatever
 // their baseRevision.
+// FAKE_APPSERVER_CAS_FRESH=1: a CAS command with any numeric baseRevision is
+// never stale.
+// FAKE_APPSERVER_DRAIN_SKIP=n: the first n guide items are held (never
+// drained), later ones are drained (out-of-order drains).
+// FAKE_APPSERVER_DRAIN_TWICE=1: every turn.steerDrained is sent twice.
+// FAKE_APPSERVER_DRAIN_PAYLOAD: JSON value sent as the payload of every
+// turn.steerDrained instead of {drainedInputs:[...]} (null: no payload).
+// FAKE_APPSERVER_STEER_ACK_DELAY_MS: delays every sendText answer (the item's
+// drain can then arrive before its ack).
+// FAKE_APPSERVER_SENDTEXT_NO_REVISION=1: sendText answers carry no
+// revisionAtDecision.
+//
+// FAKE_APPSERVER_MODEL_SETTINGS: JSON value sent as settings.model of the
+// session/create response instead of the catalog and current model.
 //
 // Trap enforcement: server-initiated requests must be answered with their
 // documented result within 2 s or this process FAILS the connection
@@ -268,6 +282,7 @@ let drainTimer = null;
 let drainTurns = 0;
 let inputs = 0;
 let forcedStale = Number(process.env.FAKE_APPSERVER_CAS_STALE) || 0;
+let drainSkip = Number(process.env.FAKE_APPSERVER_DRAIN_SKIP) || 0;
 let drainsLeft = process.env.FAKE_APPSERVER_NO_DRAIN === '1' ? 0
   : process.env.FAKE_APPSERVER_DRAIN_LIMIT !== undefined ? Number(process.env.FAKE_APPSERVER_DRAIN_LIMIT) : Infinity;
 
@@ -395,8 +410,8 @@ function sendCreateResponse(req) {
       },
       settings: {
         mode: { current: 'build' },
-        model: MODE === 'no-model'
-          ? { available: [] }
+        model: process.env.FAKE_APPSERVER_MODEL_SETTINGS !== undefined ? JSON.parse(process.env.FAKE_APPSERVER_MODEL_SETTINGS)
+          : MODE === 'no-model' ? { available: [] }
           : {
               available: CATALOG,
               current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
@@ -630,7 +645,10 @@ function flushDrains() {
   for (const text of texts) {
     revision += 1;
     guided.push(text);
-    steerEvent('turn.steerDrained', { drainedInputs: [{ pendingInputId: `pi_${revision}`, messageId: `msg_${revision}`, text, delivery: 'guide' }] });
+    const payload = process.env.FAKE_APPSERVER_DRAIN_PAYLOAD !== undefined ? JSON.parse(process.env.FAKE_APPSERVER_DRAIN_PAYLOAD)
+      : { drainedInputs: [{ pendingInputId: `pi_${revision}`, messageId: `msg_${revision}`, text, delivery: 'guide' }] };
+    steerEvent('turn.steerDrained', payload);
+    if (process.env.FAKE_APPSERVER_DRAIN_TWICE === '1') steerEvent('turn.steerDrained', payload);
   }
 }
 
@@ -649,7 +667,14 @@ function handleCommand(req) {
   const p = req.params || {};
   const payload = p.payload && typeof p.payload === 'object' ? p.payload : {};
   const unsupported = () => send({ id: req.id, error: { code: -32601, message: `Method not found: v4/command ${p.type}` } });
-  const answer = (result) => send({ id: req.id, result: { ...result, revisionAtDecision: revision } });
+  const answer = (result) => {
+    const msg = { id: req.id, result: { ...result, revisionAtDecision: revision } };
+    if (p.type !== 'sendText') return send(msg);
+    if (process.env.FAKE_APPSERVER_SENDTEXT_NO_REVISION === '1') delete msg.result.revisionAtDecision;
+    const delay = Number(process.env.FAKE_APPSERVER_STEER_ACK_DELAY_MS) || 0;
+    if (delay > 0) setTimeout(() => send(msg), delay);
+    else send(msg);
+  };
   const accept = (result = {}) => { revision += 1; answer({ status: 'accepted', ...result }); };
   if (p.type === 'sendText') {
     const text = typeof payload.text === 'string' ? payload.text : '';
@@ -670,7 +695,10 @@ function handleCommand(req) {
     accept({ result: { type: 'inputAccepted', delivery: 'queue', inputId } });
     steerEvent('turn.steerQueued', { text, delivery: requested === 'guide' ? 'guide' : 'queue' });
     if (requested === 'guide') {
-      if (drainsLeft > 0) {
+      if (drainSkip > 0) {
+        drainSkip -= 1;
+        heldTexts.push(text);
+      } else if (drainsLeft > 0) {
         drainsLeft -= 1;
         undrained.push(text);
         if (!drainTimer) drainTimer = setTimeout(flushDrains, 10);
@@ -688,7 +716,7 @@ function handleCommand(req) {
     if (typeof p.baseRevision !== 'number') {
       return answer({ status: 'rejected', reasonCode: 'proto.invalidPayload', message: 'CAS commands require baseRevision and baseLogEpoch' });
     }
-    if (forcedStale > 0 || p.baseRevision !== revision) {
+    if (forcedStale > 0 || (p.baseRevision !== revision && process.env.FAKE_APPSERVER_CAS_FRESH !== '1')) {
       if (forcedStale > 0) forcedStale -= 1;
       return answer({ status: 'stale', reasonCode: 'proto.staleRevision' });
     }

@@ -15,6 +15,7 @@ import {
   DEFAULT_TASK_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   buildUserInputAnswer,
+  buildUserInputDecline,
   describeUserInputQuestion,
 } from '../src/appserver.mjs';
 import { DEFAULT_TIMEOUT_MS } from '../src/runner.mjs';
@@ -113,12 +114,87 @@ test('slowhang: the turn wait times out and rejects', async () => {
     try {
       await assert.rejects(
         runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', providerId: 'glm-test', modelId: 'small', timeoutMs: 400 }),
-        /timed out/i,
+        (err) => {
+          assert.match(err.message, /timed out/i);
+          assert.equal(err.startup, undefined, 'after session/send: not a startup error');
+          assert.equal(err.sessionId, 'sess_fakeB1');
+          return true;
+        },
       );
     } finally {
       removeDir(cwd);
     }
   });
+});
+
+// --- argument checks, startup errors, model choice ---
+
+test('runTaskWithModel checks its arguments before spawning anything', async () => {
+  const cwd = makeTempDir();
+  try {
+    const cases = [
+      [{ prompt: '  ' }, 'prompt must be a non-empty string'],
+      [{ providerId: 'p' }, 'modelId must be a non-empty string'],
+      [{ providerId: ' ', modelId: 'm' }, 'providerId must be a non-empty string'],
+      [{ providerId: 'p', modelId: ' ' }, 'modelId must be a non-empty string'],
+      [{ cwd: 'relative' }, 'cwd must be an absolute path'],
+      [{ cwd: '/nowhere/at/all' }, 'cwd does not exist or is not a directory: /nowhere/at/all'],
+      [{ reasoningLevel: ' ' }, 'reasoningLevel must be a non-empty string'],
+    ];
+    for (const [args, message] of cases) {
+      await assert.rejects(runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 5000, ...args }), { name: 'TypeError', message });
+    }
+  } finally {
+    removeDir(cwd);
+  }
+});
+
+test('errors before session/send carry startup: true (not no-model); no sessionId before session/create', async () => {
+  const cwd = makeTempDir();
+  try {
+    await withMode('die', () => assert.rejects(runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 5000 }), (err) => {
+      assert.ok(err instanceof AppServerError);
+      assert.equal(err.startup, true);
+      assert.equal('sessionId' in err, false);
+      return true;
+    }));
+    await withMode('no-model', () => assert.rejects(runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 5000 }), (err) => {
+      assert.equal(err.code, 'no-model');
+      assert.equal(err.startup, undefined, 'retrying cannot help');
+      assert.equal(err.sessionId, 'sess_fakeB1');
+      return true;
+    }));
+    const refused = new AppServerError('spawn refused');
+    await assert.rejects(runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', onSpawn: () => { throw refused; } }), (err) => {
+      assert.equal(err, refused);
+      assert.equal(err.startup, true);
+      return true;
+    });
+  } finally {
+    removeDir(cwd);
+  }
+});
+
+test('without providerId/modelId: the session current model, else the first catalog entry', async () => {
+  const ref = (providerId, modelId) => ({ ref: { providerId, modelId } });
+  const picked = async (settings) => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'rx.log');
+    Object.assign(process.env, { FAKE_APPSERVER_MODE: 'ok', FAKE_APPSERVER_LOG: log, FAKE_APPSERVER_MODEL_SETTINGS: JSON.stringify(settings) });
+    try {
+      const res = await runTaskWithModel({ binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 5000 }).catch((err) => err);
+      if (res instanceof Error) return res.code;
+      const { providerId, modelId } = readLog(log).find((m) => m.method === 'session/send').params.modelSelection;
+      return `${providerId}/${modelId}`;
+    } finally {
+      for (const k of ['FAKE_APPSERVER_MODE', 'FAKE_APPSERVER_LOG', 'FAKE_APPSERVER_MODEL_SETTINGS']) delete process.env[k];
+      removeDir(cwd);
+    }
+  };
+  assert.equal(await picked({ current: { providerId: 'cur', modelId: 'm' }, available: [ref('p0', 'm0'), ref('p1', 'm1')] }), 'cur/m');
+  assert.equal(await picked({ available: [ref('p0', 'm0')] }), 'p0/m0');
+  assert.equal(await picked({ current: { providerId: 'cur' }, available: [ref('p0', 'm0'), ref('p1', 'm1')] }), 'p0/m0', 'an incomplete current model is skipped');
+  assert.equal(await picked({ current: { modelId: 'm' }, available: [{ ref: { providerId: 'p0' } }] }), 'no-model', 'an incomplete first entry is no model');
 });
 
 // --- the bidirectional server-request trap ---
@@ -425,8 +501,8 @@ test('getModelCatalog rejects cleanly when the child dies', async () => {
 });
 
 test('getModelCatalog validates cwd like runTaskWithModel', async () => {
-  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: 'relative' }), TypeError);
-  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: '/nowhere/at/all' }), TypeError);
+  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: 'relative' }), { name: 'TypeError', message: 'cwd must be an absolute path' });
+  await assert.rejects(getModelCatalog({ binPath: fakeBin, cwd: '/nowhere/at/all' }), { name: 'TypeError', message: 'cwd does not exist or is not a directory: /nowhere/at/all' });
 });
 
 // --- helpers and defaults ---
@@ -563,6 +639,20 @@ test('describeUserInputQuestion: one line per question with options, joined with
   assert.equal(describeUserInputQuestion({ input: { questions: [{ question: 'In?', options: [{ label: 'x' }] }] } }), 'In? [options: x]');
   // params.questions wins over params.input.questions
   assert.equal(describeUserInputQuestion({ questions: [askQ('Top?')], input: { questions: [askQ('In?')] } }), 'Top?');
+});
+
+test('describeUserInputQuestion: option labels are strings, else label, else value; empty ones are left out', () => {
+  assert.equal(describeUserInputQuestion({ questions: [{ question: 'Q?', options: ['s', null, { value: 'v' }, { label: 'l', value: 'x' }, {}, { label: '' }, 7] }] }), 'Q? [options: s | v | l]');
+  assert.equal(describeUserInputQuestion({ questions: [{ question: 'Q?', options: [null, {}, ''] }] }), 'Q?');
+  // empty question entries are skipped; an empty params.questions falls back to params.input.questions
+  assert.equal(describeUserInputQuestion({ questions: [null, askQ('A?')] }), 'A?');
+  assert.equal(describeUserInputQuestion({ questions: [], input: { questions: [askQ('In?')] } }), 'In?');
+});
+
+test('buildUserInputDecline: the reason only when it is a non-empty string', () => {
+  assert.deepEqual(buildUserInputDecline('busy'), { action: 'decline', reason: 'busy' });
+  assert.deepEqual(buildUserInputDecline(''), { action: 'decline' });
+  assert.deepEqual(buildUserInputDecline(undefined), { action: 'decline' });
 });
 
 test('describeUserInputQuestion: without questions falls back to question / prompt / message', () => {
@@ -974,6 +1064,82 @@ test('a held steer is not delivered after a stop; it is reported as undelivered'
   assert.deepEqual(res.undeliveredSteers, ['never mind']);
   assert.deepEqual(steerTypes(log), ['sendText']);
   assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
+});
+
+// --- how turn.steerDrained events mark steers delivered ---
+
+test('a turn.steerDrained without drainedInputs marks the oldest open steer', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('hint'); },
+    { autoDrainWaitMs: 300 }, { FAKE_APPSERVER_DRAIN_PAYLOAD: 'null' });
+  assert.equal(res.response, 'fake model task done\nsteered: hint');
+  assert.deepEqual(steerTypes(log), ['sendText'], 'no follow-up');
+});
+
+test('drains are matched by text: a later steer drained first leaves the earlier one held', async () => {
+  const { res } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    return [await c.steer('first'), await c.steer('second')];
+  }, {}, { FAKE_APPSERVER_DRAIN_SKIP: '1', FAKE_APPSERVER_AUTODRAIN_REJECT: '1' });
+  assert.equal(res.response, 'fake startNow turn: first');
+});
+
+test('a repeated drain of a delivered steer is not counted for a later steer', async () => {
+  const { res } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    const a = await c.steer('early');
+    await sleep(100);
+    return [a, await c.steer('late')];
+  }, {}, { FAKE_APPSERVER_DRAIN_TWICE: '1', FAKE_APPSERVER_DRAIN_LIMIT: '1' });
+  assert.equal(res.response, 'fake follow-up turn: late');
+});
+
+test('a drain that arrives before its steer is acked is credited to that steer only', async () => {
+  const { res } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    return [await c.steer('early'), await c.steer('late')];
+  }, {}, { FAKE_APPSERVER_STEER_ACK_DELAY_MS: '100', FAKE_APPSERVER_DRAIN_LIMIT: '1', FAKE_APPSERVER_AUTODRAIN_REJECT: '1' });
+  assert.equal(res.response, 'fake startNow turn: late');
+});
+
+test('CAS before any known revision sends baseRevision 0; an accepted CAS is not repeated', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('hint'); },
+    {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_SENDTEXT_NO_REVISION: '1', FAKE_APPSERVER_CAS_FRESH: '1' });
+  assert.equal(res.response, 'fake follow-up turn: hint');
+  assert.deepEqual(steerTypes(log), ['sendText', 'setAutoDrain']);
+  assert.equal(casOf(log, 'setAutoDrain')[0].baseRevision, 0);
+});
+
+test('a stop while a late steer is unacknowledged: stopped, the steer reported undelivered', async () => {
+  let ctl;
+  const { res, log } = await runWithControl('ask', (c) => { ctl = c; }, {
+    onUserInput: () => { queueMicrotask(() => { ctl.steer('late'); ctl.answer('8080'); }); },
+    onEvent: (e) => { if (e.type === 'turn.completed') setTimeout(() => { ctl.stop(); }, 50); },
+  }, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_STEER_ACK_DELAY_MS: '500' });
+  assert.equal(res.ok, true);
+  assert.equal(res.stopped, true);
+  assert.deepEqual(res.undeliveredSteers, ['late']);
+  assert.deepEqual(steerTypes(log), ['sendText']);
+});
+
+test('a stop during the auto-drain wait ends the task stopped, without another turn', async () => {
+  let ctl;
+  const { res, log } = await runWithControl('chatty', async (c) => { ctl = c; await sleep(200); return c.steer('hint'); }, {
+    autoDrainWaitMs: 1500,
+    onEvent: (e) => { if (e.type === 'turn.completed') setTimeout(() => { ctl.stop(); }, 300); },
+  }, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_AUTODRAIN_NOOP: '1' });
+  assert.equal(res.ok, true);
+  assert.equal(res.stopped, true);
+  assert.deepEqual(steerTypes(log), ['sendText', 'setAutoDrain', 'setAutoDrain']);
+  assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
+});
+
+test('the task deadline caps the auto-drain wait', async () => {
+  const t0 = Date.now();
+  const { res } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('hint'); },
+    { timeoutMs: 3000, autoDrainWaitMs: 20000 }, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_AUTODRAIN_NOOP: '1' });
+  assert.equal(res.code, 'turn_timeout');
+  assert.match(res.message, /timed out after 3000 ms/);
+  assert.ok(Date.now() - t0 < 8000, 'not the 20 s auto-drain wait');
 });
 
 test('fake CAS rules: no baseRevision is rejected invalidPayload, a stale one answers the current revision', async () => {

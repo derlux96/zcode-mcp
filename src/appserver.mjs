@@ -120,11 +120,12 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
 
 // The questions of an interaction/requestUserInput (ZCode 0.17.0 AskUserQuestion:
 // params.questions, mirrored in params.input.questions); [] when there are none.
+// Empty entries are dropped; the callers only read string fields of the rest.
 function userInputQuestions(params) {
   if (!params || typeof params !== 'object') return [];
   const top = Array.isArray(params.questions) ? params.questions : null;
-  const nested = params.input && typeof params.input === 'object' && Array.isArray(params.input.questions) ? params.input.questions : null;
-  return (top && top.length ? top : nested || top || []).filter((q) => q && typeof q === 'object');
+  const nested = params.input && Array.isArray(params.input.questions) ? params.input.questions : null;
+  return (top && top.length ? top : nested || []).filter(Boolean);
 }
 
 /**
@@ -155,13 +156,13 @@ export function describeUserInputQuestion(params) {
   const lines = userInputQuestions(params).map((q) => {
     const text = typeof q.question === 'string' ? q.question : '';
     const labels = (Array.isArray(q.options) ? q.options : [])
-      .map((o) => (typeof o === 'string' ? o : o && typeof o === 'object' ? (typeof o.label === 'string' ? o.label : typeof o.value === 'string' ? o.value : null) : null))
+      .map((o) => (typeof o === 'string' ? o : o && (typeof o.label === 'string' ? o.label : o.value)))
       .filter((l) => typeof l === 'string' && l !== '');
     return [text, labels.length ? `[options: ${labels.join(' | ')}]` : ''].filter(Boolean).join(' ');
   }).filter(Boolean);
   if (lines.length) return lines.join(' / ');
   const p = params && typeof params === 'object' ? params : {};
-  return [p.question, p.prompt, p.message].find((v) => typeof v === 'string') ?? '';
+  return [p.question, p.prompt, p.message].find((v) => typeof v === 'string') || '';
 }
 
 // Client options beyond the basics:
@@ -654,6 +655,20 @@ function retryOptions(transientRetry) {
   };
 }
 
+// cwd must be an absolute path to an existing directory (TypeError otherwise).
+function checkCwd(cwd) {
+  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
+    throw new TypeError('cwd must be an absolute path');
+  }
+  let isDir = false;
+  try {
+    isDir = statSync(cwd).isDirectory();
+  } catch {
+    // reported below
+  }
+  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+}
+
 /**
  * One-shot mode B task: create a session with an explicit model selection,
  * run the prompt to turn completion, and tear the server down.
@@ -751,7 +766,7 @@ export async function runTaskWithModel({
   idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
-  killGroup = false,
+  killGroup,
   onSpawn,
   onEvent,
   onUserInput,
@@ -771,16 +786,7 @@ export async function runTaskWithModel({
   if (explicitModel && (typeof modelId !== 'string' || modelId.trim() === '')) {
     throw new TypeError('modelId must be a non-empty string');
   }
-  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
-    throw new TypeError('cwd must be an absolute path');
-  }
-  let isDir = false;
-  try {
-    isDir = statSync(cwd).isDirectory();
-  } catch {
-    // reported below
-  }
-  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+  checkCwd(cwd);
   if (typeof reasoningLevel !== 'string' || reasoningLevel.trim() === '') {
     throw new TypeError('reasoningLevel must be a non-empty string');
   }
@@ -899,9 +905,9 @@ export async function runTaskWithModel({
     return steers.filter((e) => !e.delivered);
   }
 
+  // No credit can be left here: a credit is only kept while no steer is open.
   function markDelivered(list) {
     for (const e of list) e.delivered = true;
-    drainCredit = 0;
   }
 
   // Answers the oldest parked requestUserInput with build(params).
@@ -983,7 +989,7 @@ export async function runTaskWithModel({
         await client.waitForEvent('turn.started', { timeoutMs: left, since: cursor });
         return { startedAt: cursor, content: null };
       } catch (err) {
-        if (!(err instanceof AppServerError && err.code === 'turn_timeout')) throw err;
+        if (err.code !== 'turn_timeout') throw err; // waitForEvent rejects with AppServerErrors only
       }
     }
     if (stopRequested) return { startedAt: null, content: joined };
@@ -1067,7 +1073,7 @@ export async function runTaskWithModel({
       try {
         event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: left, idleTimeoutMs, since: cursor });
       } catch (err) {
-        throw err instanceof AppServerError && err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
+        throw err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
       }
       usage = addUsage(usage, event.payload && event.payload.usage);
       // stopped: a session/stop was sent before this terminal event arrived; the
@@ -1131,10 +1137,12 @@ export async function runTaskWithModel({
   } catch (err) {
     const out = signal && signal.aborted ? aborted() : err;
     if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
-    if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
-    if (retries.length && out && typeof out === 'object') out.retries = retries;
-    if (out && typeof out === 'object') out.usage = usage;
-    if (out && typeof out === 'object') out.stopped = stopRequested;
+    if (out && typeof out === 'object') {
+      if (sessionId) out.sessionId = sessionId;
+      if (retries.length) out.retries = retries;
+      out.usage = usage;
+      out.stopped = stopRequested;
+    }
     throw out;
   } finally {
     await client.close();
@@ -1154,16 +1162,7 @@ export async function getModelCatalog({
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
 } = {}) {
-  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
-    throw new TypeError('cwd must be an absolute path');
-  }
-  let isDir = false;
-  try {
-    isDir = statSync(cwd).isDirectory();
-  } catch {
-    // reported below
-  }
-  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+  checkCwd(cwd);
 
   const client = new AppServerClient({ binPath, cwd, spawnFn });
   try {
