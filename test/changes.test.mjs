@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { captureBaseline, changesSince } from '../src/changes.mjs';
 import { makeGitRepo, makeTempDir, removeDir, run } from './helpers.mjs';
@@ -171,3 +171,77 @@ test('missing baseline gitRoot is unavailable', () => {
   removeDir(dir);
   assert.equal(changesSince(process.cwd(), base).available, false);
 });
+
+test('a one-character path is reported', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'x'), 'x\n');
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['?? x']);
+}));
+
+const LINES = Array.from({ length: 40 }, (_, i) => `line ${i}\n`).join('');
+
+function withCopyRepo(fn) {
+  return withRepo((dir) => {
+    writeFileSync(join(dir, 'a.txt'), LINES);
+    run(dir, 'git', ['add', 'a.txt']);
+    run(dir, 'git', ['commit', '-qm', 'a']);
+    run(dir, 'git', ['config', 'status.renames', 'copies']);
+    return fn(dir);
+  });
+}
+
+test('a copy staged in the index yields the copy once, not its origin path', withCopyRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'b.txt'), LINES);
+  writeFileSync(join(dir, 'a.txt'), `${LINES}more\n`);
+  run(dir, 'git', ['add', 'a.txt', 'b.txt']);
+  assert.deepEqual([...changesSince(dir, base).changedFiles].sort(), ['C b.txt', 'M a.txt']);
+}));
+
+test('a rename in the work tree yields the new path once', withCopyRepo((dir) => {
+  const base = captureBaseline(dir);
+  renameSync(join(dir, 'a.txt'), join(dir, 'c.txt'));
+  run(dir, 'git', ['add', '-N', 'c.txt']);
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['R c.txt']);
+}));
+
+test('a copy in the work tree yields the copy once, not its origin path', withCopyRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'e.txt'), LINES);
+  run(dir, 'git', ['add', '-N', 'e.txt']);
+  writeFileSync(join(dir, 'a.txt'), `${LINES}more\n`);
+  assert.deepEqual([...changesSince(dir, base).changedFiles].sort(), ['C e.txt', 'M a.txt']);
+}));
+
+test('a pre-existing untracked file changed by the job keeps its ?? status', withRepo((dir) => {
+  writeFileSync(join(dir, 'u.txt'), 'user\n');
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'u.txt'), 'job\n');
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['?? u.txt']);
+}));
+
+test('switching to an unborn branch keeps the report available', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  run(dir, 'git', ['checkout', '-q', '--orphan', 'fresh']);
+  const r = changesSince(dir, base);
+  assert.equal(r.available, true);
+  assert.deepEqual(r.changedFiles, ['A README.md']);
+}));
+
+test('a file committed and then deleted by the job is reported as D', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'n.txt'), 'n\n');
+  run(dir, 'git', ['add', 'n.txt']);
+  run(dir, 'git', ['commit', '-qm', 'n']);
+  rmSync(join(dir, 'n.txt'));
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['D n.txt']);
+}));
+
+test('a file committed and then untracked by the job is reported as ??', withRepo((dir) => {
+  const base = captureBaseline(dir);
+  writeFileSync(join(dir, 'n.txt'), 'n\n');
+  run(dir, 'git', ['add', 'n.txt']);
+  run(dir, 'git', ['commit', '-qm', 'n']);
+  run(dir, 'git', ['rm', '-q', '--cached', 'n.txt']);
+  assert.deepEqual(changesSince(dir, base).changedFiles, ['?? n.txt']);
+}));
