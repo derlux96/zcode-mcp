@@ -117,37 +117,60 @@ function finish(client, extra = {}) {
   return { ...sum, response: truncateText(sum.terminal && sum.terminal.response, 2000), ...extra };
 }
 
-/**
- * Steer probe (ZCode 0.17.0 follow-up routing): setFollowupMode {mode:'guide'}
- * first, then the sendText steer; after the first terminal event, when the
- * steer was queued but never drained, setAutoDrain {autoDrain:true} and record
- * whether ZCode ran a second turn. Every command result is recorded raw. The
- * payload field names of setFollowupMode / setAutoDrain are inferred from the
- * bundle and are what this probe confirms.
- */
-export async function probeSteer(cwd, o) {
-  let s;
-  const command = (sessionId, type, payload) => ({
-    commandId: `probe-${type}-${Date.now()}`,
-    clientId: 'zcode-delegate',
-    sessionId,
-    type,
-    payload,
-    issuedAt: Date.now(),
-  });
-  const request = async (params) => {
+export const STEER_MARKER = 'PINEAPPLE';
+export const DRAIN_MARKER = 'BANANA';
+
+// v4/command helpers for one probe session: every answer's revisionAtDecision
+// is kept, CAS commands go out with it as top-level baseRevision and a stale
+// answer is retried once with the revision it carries.
+function v4Commands(s) {
+  let lastRevision = 0;
+  let seq = 0;
+  const request = async (type, payload, baseRevision) => {
+    const params = {
+      commandId: `probe-${type}-${Date.now()}-${++seq}`,
+      clientId: 'zcode-delegate',
+      sessionId: s.sessionId,
+      ...(baseRevision === undefined ? {} : { baseRevision }),
+      type,
+      payload,
+      issuedAt: Date.now(),
+    };
     try {
-      return await s.client.request('v4/command', params);
+      const r = await s.client.request('v4/command', params);
+      if (r && typeof r.revisionAtDecision === 'number') lastRevision = r.revisionAtDecision;
+      return r;
     } catch (e) {
       return { error: errInfo(e) };
     }
   };
+  const cas = async (type, payload) => {
+    const attempts = [];
+    let baseRevision = lastRevision;
+    for (let i = 0; i < 2; i++) {
+      const result = await request(type, payload, baseRevision);
+      attempts.push({ baseRevision, result });
+      if (!(result && result.status === 'stale' && typeof result.revisionAtDecision === 'number')) break;
+      baseRevision = result.revisionAtDecision;
+    }
+    return { result: attempts[attempts.length - 1].result, attempts };
+  };
+  return { request, cas };
+}
+
+/**
+ * Steer probe (ZCode 0.17.0): a sendText {text, requestedDelivery:'guide'}
+ * during a slow counting turn, asking for a marker word. Records the raw ack,
+ * whether turn.steerDrained arrived and whether the marker reached the answer.
+ */
+export async function probeSteer(cwd, o) {
+  let s;
   try {
     s = await startSession(cwd);
-    await s.send('Count slowly from 1 to 50, one number per line, one line per second.');
+    const { request } = v4Commands(s);
+    await s.send('Count slowly from 1 to 30, one number per line, one line per second.');
     await sleep(o.steerAfterMs);
-    const followupModeResult = await request(command(s.sessionId, 'setFollowupMode', { mode: 'guide' }));
-    const steerResult = await request(command(s.sessionId, 'sendText', { text: 'stop at 10', delivery: { requested: 'guide' } }));
+    const steerResult = await request('sendText', { text: `After the number 20 write the word ${STEER_MARKER} once.`, requestedDelivery: 'guide' });
     let waitError = null;
     try {
       await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
@@ -155,32 +178,63 @@ export async function probeSteer(cwd, o) {
       waitError = errInfo(e);
     }
     await sleep(300);
-    const first = finish(s.client, { followupModeResult, v4CommandResult: steerResult, ...(waitError ? { waitError } : {}) });
-    let autoDrain = null;
-    if (first.steerQueued && !first.steerDrained) {
-      const cursor = s.client.eventOrdinal;
-      const from = s.client.events.length;
-      const result = await request(command(s.sessionId, 'setAutoDrain', { autoDrain: true }));
-      let secondTurn = false;
-      let drainWaitError = null;
-      try {
-        await s.client.waitForEvent('turn.started', { timeoutMs: o.autoDrainWaitMs, since: cursor });
-        secondTurn = true;
-        await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs, since: cursor });
-      } catch (e) {
-        drainWaitError = errInfo(e);
-      }
-      await sleep(300);
-      const sum = summarizeProbeEvents(s.client.events.slice(from));
-      autoDrain = {
-        result,
-        secondTurn,
-        ...sum,
-        response: truncateText(sum.terminal && sum.terminal.response, 2000),
-        ...(drainWaitError ? { waitError: drainWaitError } : {}),
-      };
+    const out = finish(s.client, { v4CommandResult: steerResult, ...(waitError ? { waitError } : {}) });
+    return { ...out, markerInAnswer: answerReachedOutput(out.response, STEER_MARKER) };
+  } catch (e) {
+    return { error: errInfo(e) };
+  } finally {
+    if (s) await s.client.close();
+  }
+}
+
+/**
+ * Auto-drain probe: a sendText with the default delivery ('queue') during a
+ * short turn is held when the turn ends (autoDrain false). Then CAS
+ * setAutoDrain {autoDrain:true} with baseRevision from the last ack (stale:
+ * retried once) and records whether ZCode starts a second turn.
+ */
+export async function probeAutoDrain(cwd, o) {
+  let s;
+  try {
+    s = await startSession(cwd);
+    const { request, cas } = v4Commands(s);
+    await s.send('Count from 1 to 10, one number per line.');
+    await sleep(o.queueAfterMs);
+    const queueResult = await request('sendText', { text: `Reply with only the word ${DRAIN_MARKER}.` });
+    let waitError = null;
+    try {
+      await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
+    } catch (e) {
+      waitError = errInfo(e);
     }
-    return { ...first, autoDrain };
+    await sleep(300);
+    const first = finish(s.client, { v4CommandResult: queueResult, ...(waitError ? { waitError } : {}) });
+    const cursor = s.client.eventOrdinal;
+    const from = s.client.events.length;
+    const { result, attempts } = await cas('setAutoDrain', { autoDrain: true });
+    let secondTurn = false;
+    let drainWaitError = null;
+    try {
+      await s.client.waitForEvent('turn.started', { timeoutMs: o.autoDrainWaitMs, since: cursor });
+      secondTurn = true;
+      await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs, since: cursor });
+    } catch (e) {
+      drainWaitError = errInfo(e);
+    }
+    await sleep(300);
+    const sum = summarizeProbeEvents(s.client.events.slice(from));
+    const response = truncateText(sum.terminal && sum.terminal.response, 2000);
+    return {
+      first,
+      result,
+      attempts,
+      staleRetried: attempts.length > 1,
+      secondTurn,
+      ...sum,
+      response,
+      markerInAnswer: answerReachedOutput(response, DRAIN_MARKER),
+      ...(drainWaitError ? { waitError: drainWaitError } : {}),
+    };
   } catch (e) {
     return { error: errInfo(e) };
   } finally {
@@ -263,11 +317,11 @@ async function probeUserInput(cwd, o) {
   return { requestUserInput, workedShape, attempts, ...lastFacts };
 }
 
-/** Runs the steer, stop and user-input probes sequentially, each in a fresh session. */
+/** Runs the steer, auto-drain, stop and user-input probes sequentially, each in a fresh session. */
 export async function runControlProbes(cwd, opts = {}) {
-  const o = { turnTimeoutMs: 180000, idleTimeoutMs: 90000, steerAfterMs: 3000, stopAfterMs: 3000, autoDrainWaitMs: 10000, ...opts };
+  const o = { turnTimeoutMs: 180000, idleTimeoutMs: 90000, steerAfterMs: 3000, queueAfterMs: 300, stopAfterMs: 3000, autoDrainWaitMs: 10000, ...opts };
   const out = {};
-  for (const [name, fn] of [['steer', probeSteer], ['stop', probeStop], ['userInput', probeUserInput]]) {
+  for (const [name, fn] of [['steer', probeSteer], ['autoDrain', probeAutoDrain], ['stop', probeStop], ['userInput', probeUserInput]]) {
     try {
       out[name] = await fn(cwd, o);
     } catch (e) {
