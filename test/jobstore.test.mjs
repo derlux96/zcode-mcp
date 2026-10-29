@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, chownSync, mkdtempSync, rmSync, readdirSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   stateHome, jobsRoot, newJobId, createJobDir, writeJsonAtomic, readJson,
   readStatus, patchStatus, readResult, writeResult, listJobDirs, TERMINAL_STATES,
-  isJobId, jobDir, ensurePrivateDir,
+  isJobId, jobDir, ensurePrivateDir, compareJobIds,
 } from '../src/jobstore.mjs';
 
 function withHome(fn) {
@@ -167,3 +167,37 @@ test('STOP_GRACE_MS lives in jobstore; jobs.mjs does not import job-runner.mjs (
   const src = readFileSync(new URL('../src/jobs.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(src, /from '\.\/job-runner\.mjs'/);
 });
+
+test('listJobDirs orders ids with the same time by their random part, malformed ids first', withHome(() => {
+  ensurePrivateDir(jobsRoot());
+  for (const n of ['job_k_00000f', 'job_k_0000a0', 'job_k_000001', 'job_', 'job_k_00000f2']) mkdirSync(join(jobsRoot(), n));
+  assert.deepEqual(listJobDirs().map((d) => d.split('/').pop()), ['job_', 'job_k_000001', 'job_k_00000f', 'job_k_00000f2', 'job_k_0000a0']);
+}));
+
+test('compareJobIds: time first, then the random part; equal ids compare 0', () => {
+  assert.ok(compareJobIds('job_zz_ffffff', 'job_100_000000') < 0);
+  assert.ok(compareJobIds('job_k_000001', 'job_k_00000f') < 0);
+  assert.ok(compareJobIds('job_k_00000f', 'job_k_000001') > 0);
+  assert.equal(compareJobIds('job_k_00000f', 'job_k_00000f'), 0);
+  assert.ok(compareJobIds('job_', 'job_1_000000') < 0);
+  assert.ok(compareJobIds('job__zzzzzz', 'job_1_000000') < 0);
+  assert.equal(compareJobIds('job_', 'job_x'), compareJobIds('job_', 'job_x'));
+});
+
+test('writeJsonAtomic removes its temp file when the rename fails', withHome((home) => {
+  const target = join(home, 'is-a-dir');
+  mkdirSync(join(target, 'child'), { recursive: true });
+  assert.throws(() => writeJsonAtomic(target, { a: 1 }));
+  assert.deepEqual(readdirSync(home).filter((n) => n.endsWith('.tmp')), []);
+}));
+
+test('ensurePrivateDir leaves a directory owned by someone else alone', {
+  skip: process.getuid?.() !== 0 && 'needs root to create a foreign-owned directory',
+}, withHome((home) => {
+  const d = join(home, 'foreign');
+  mkdirSync(d, { mode: 0o755 });
+  chmodSync(d, 0o755);
+  chownSync(d, 65534, 65534);
+  ensurePrivateDir(d);
+  assert.equal(statSync(d).mode & 0o777, 0o755);
+}));
