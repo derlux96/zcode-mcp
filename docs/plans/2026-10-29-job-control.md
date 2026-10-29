@@ -151,7 +151,7 @@
 
 **Files:**
 - Modify: `src/jobs.mjs` (`cancelJob`, new `sendToJob`)
-- Modify: `src/protocol.mjs` (`validateRunArgs`: `input_timeout_ms`)
+- Modify: `src/runner.mjs` (`validateRunArgs`: `input_timeout_ms`)
 - Modify: `src/jobs.mjs` `validateStart` (reject `input_timeout_ms` on CLI path)
 - Test: `test/jobs.test.mjs`
 
