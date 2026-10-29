@@ -9,7 +9,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { redactText } from './redact.mjs';
-import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES } from './jobstore.mjs';
+import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES, STOP_GRACE_MS } from './jobstore.mjs';
 import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
 import { classifyError } from './errorkind.mjs';
@@ -31,8 +31,8 @@ const IDENTITY_RETRY_DELAY_MS = 100;
 const ACTIVITY_WRITE_MS = 1000;
 const PROGRESS_LINES = 5;
 const RETRY_REASON_MAX = 200;
-// Graceful cancel: after session/stop the turn gets this long to end before the group is killed.
-export const STOP_GRACE_MS = 10000;
+// STOP_GRACE_MS lives in jobstore.mjs (leaf module, no jobs <-> job-runner cycle); re-exported here.
+export { STOP_GRACE_MS };
 // A parked user-input request is answered with INPUT_TIMEOUT_ANSWER after this long.
 export const DEFAULT_INPUT_TIMEOUT_MS = 1800000;
 export const INPUT_TIMEOUT_ANSWER = 'No answer available, decide yourself and continue';

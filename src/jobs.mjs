@@ -8,7 +8,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   TERMINAL_STATES, stateHome, jobsRoot, createJobDir, readJson, readStatus, readResult,
-  patchStatus, writeResult, listJobDirs, isJobId, jobDir, ensurePrivateDir,
+  patchStatus, writeResult, listJobDirs, isJobId, jobDir, ensurePrivateDir, STOP_GRACE_MS,
 } from './jobstore.mjs';
 import { acquireCwdLock, releaseCwdLock } from './locks.mjs';
 import {
@@ -21,7 +21,6 @@ import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktre
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
 import { writeInboxEntry, waitAck } from './inbox.mjs';
-import { STOP_GRACE_MS } from './job-runner.mjs';
 
 export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const MAX_RUNNING_JOBS = 3;

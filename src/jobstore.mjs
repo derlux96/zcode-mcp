@@ -10,6 +10,9 @@ import {
   readdirSync, rmSync, statSync, chmodSync,
 } from 'node:fs';
 
+// Graceful cancel: after session/stop the turn gets this long to end before the group is killed.
+export const STOP_GRACE_MS = 10000;
+
 export const TERMINAL_STATES = ['completed', 'failed', 'timeout', 'cancelled', 'lost'];
 
 export function stateHome() {

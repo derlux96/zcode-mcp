@@ -157,3 +157,13 @@ test('createJobDir tightens existing home and jobs dirs to 0700', withHome(() =>
   const { dir } = createJobDir({});
   for (const d of [stateHome(), jobsRoot(), dir]) assert.equal(statSync(d).mode & 0o777, 0o700, d);
 }));
+
+test('STOP_GRACE_MS lives in jobstore; jobs.mjs does not import job-runner.mjs (no cycle)', async () => {
+  const store = await import('../src/jobstore.mjs');
+  const runner = await import('../src/job-runner.mjs');
+  assert.equal(store.STOP_GRACE_MS, 10000);
+  assert.equal(runner.STOP_GRACE_MS, store.STOP_GRACE_MS);
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/jobs.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /from '\.\/job-runner\.mjs'/);
+});
