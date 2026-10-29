@@ -117,25 +117,37 @@ function finish(client, extra = {}) {
   return { ...sum, response: truncateText(sum.terminal && sum.terminal.response, 2000), ...extra };
 }
 
-async function probeSteer(cwd, o) {
+/**
+ * Steer probe (ZCode 0.17.0 follow-up routing): setFollowupMode {mode:'guide'}
+ * first, then the sendText steer; after the first terminal event, when the
+ * steer was queued but never drained, setAutoDrain {autoDrain:true} and record
+ * whether ZCode ran a second turn. Every command result is recorded raw. The
+ * payload field names of setFollowupMode / setAutoDrain are inferred from the
+ * bundle and are what this probe confirms.
+ */
+export async function probeSteer(cwd, o) {
   let s;
+  const command = (sessionId, type, payload) => ({
+    commandId: `probe-${type}-${Date.now()}`,
+    clientId: 'zcode-delegate',
+    sessionId,
+    type,
+    payload,
+    issuedAt: Date.now(),
+  });
+  const request = async (params) => {
+    try {
+      return await s.client.request('v4/command', params);
+    } catch (e) {
+      return { error: errInfo(e) };
+    }
+  };
   try {
     s = await startSession(cwd);
     await s.send('Count slowly from 1 to 50, one number per line, one line per second.');
     await sleep(o.steerAfterMs);
-    let steerResult;
-    try {
-      steerResult = await s.client.request('v4/command', {
-        commandId: `probe-steer-${Date.now()}`,
-        clientId: 'zcode-delegate',
-        sessionId: s.sessionId,
-        type: 'sendText',
-        payload: { text: 'stop at 10', delivery: { requested: 'guide' } },
-        issuedAt: Date.now(),
-      });
-    } catch (e) {
-      steerResult = { error: errInfo(e) };
-    }
+    const followupModeResult = await request(command(s.sessionId, 'setFollowupMode', { mode: 'guide' }));
+    const steerResult = await request(command(s.sessionId, 'sendText', { text: 'stop at 10', delivery: { requested: 'guide' } }));
     let waitError = null;
     try {
       await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
@@ -143,7 +155,32 @@ async function probeSteer(cwd, o) {
       waitError = errInfo(e);
     }
     await sleep(300);
-    return finish(s.client, { v4CommandResult: steerResult, ...(waitError ? { waitError } : {}) });
+    const first = finish(s.client, { followupModeResult, v4CommandResult: steerResult, ...(waitError ? { waitError } : {}) });
+    let autoDrain = null;
+    if (first.steerQueued && !first.steerDrained) {
+      const cursor = s.client.eventOrdinal;
+      const from = s.client.events.length;
+      const result = await request(command(s.sessionId, 'setAutoDrain', { autoDrain: true }));
+      let secondTurn = false;
+      let drainWaitError = null;
+      try {
+        await s.client.waitForEvent('turn.started', { timeoutMs: o.autoDrainWaitMs, since: cursor });
+        secondTurn = true;
+        await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs, since: cursor });
+      } catch (e) {
+        drainWaitError = errInfo(e);
+      }
+      await sleep(300);
+      const sum = summarizeProbeEvents(s.client.events.slice(from));
+      autoDrain = {
+        result,
+        secondTurn,
+        ...sum,
+        response: truncateText(sum.terminal && sum.terminal.response, 2000),
+        ...(drainWaitError ? { waitError: drainWaitError } : {}),
+      };
+    }
+    return { ...first, autoDrain };
   } catch (e) {
     return { error: errInfo(e) };
   } finally {
@@ -228,7 +265,7 @@ async function probeUserInput(cwd, o) {
 
 /** Runs the steer, stop and user-input probes sequentially, each in a fresh session. */
 export async function runControlProbes(cwd, opts = {}) {
-  const o = { turnTimeoutMs: 180000, idleTimeoutMs: 90000, steerAfterMs: 3000, stopAfterMs: 3000, ...opts };
+  const o = { turnTimeoutMs: 180000, idleTimeoutMs: 90000, steerAfterMs: 3000, stopAfterMs: 3000, autoDrainWaitMs: 10000, ...opts };
   const out = {};
   for (const [name, fn] of [['steer', probeSteer], ['stop', probeStop], ['userInput', probeUserInput]]) {
     try {

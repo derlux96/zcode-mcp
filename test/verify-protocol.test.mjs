@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzeEvents, answerShapes, summarizeProbeEvents, truncateText, answerReachedOutput, runControlProbes, startSession } from '../scripts/verify-protocol.mjs';
+import { analyzeEvents, answerShapes, summarizeProbeEvents, truncateText, answerReachedOutput, runControlProbes, startSession, probeSteer } from '../scripts/verify-protocol.mjs';
 
 test('analyzeEvents: unique sorted types, max gap, denied tools', () => {
   const r = analyzeEvents([
@@ -113,4 +113,53 @@ test('startSession: closes the spawned app-server when setup fails', { timeout: 
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
+});
+
+async function withFakeEnv(env, fn) {
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const fake = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'fake-appserver.cjs');
+  const all = { ZCODE_APPSERVER_BIN: fake, ...env };
+  const saved = Object.fromEntries(Object.keys(all).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, all);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+const probeOpts = { turnTimeoutMs: 8000, idleTimeoutMs: 8000, steerAfterMs: 200, autoDrainWaitMs: 2000 };
+
+test('probeSteer: setFollowupMode guide first, then the steer is drained mid-turn (no auto-drain)', { timeout: 30000 }, async () => {
+  const r = await withFakeEnv({ FAKE_APPSERVER_MODE: 'chatty' }, () => probeSteer(process.cwd(), probeOpts));
+  assert.deepEqual(r.followupModeResult, { status: 'accepted' });
+  assert.deepEqual(r.v4CommandResult, { status: 'accepted', result: { type: 'inputAccepted', delivery: 'guide' } });
+  assert.equal(r.steerQueued, true);
+  assert.equal(r.steerDrained, true);
+  assert.equal(r.autoDrain, null);
+  assert.match(r.response, /steered: stop at 10/);
+});
+
+test('probeSteer: a queued, undrained steer is followed by setAutoDrain and the second turn is recorded', { timeout: 30000 }, async () => {
+  const r = await withFakeEnv({ FAKE_APPSERVER_MODE: 'chatty', FAKE_APPSERVER_UNSUPPORTED: 'followup' }, () => probeSteer(process.cwd(), probeOpts));
+  assert.equal(r.followupModeResult.error.code, -32601);
+  assert.equal(r.v4CommandResult.result.delivery, 'queue');
+  assert.equal(r.steerQueued, true);
+  assert.equal(r.steerDrained, false);
+  assert.deepEqual(r.autoDrain.result, { status: 'accepted' });
+  assert.equal(r.autoDrain.secondTurn, true);
+  assert.ok(r.autoDrain.types.includes('turn.started'));
+  assert.equal(r.autoDrain.terminal.type, 'turn.completed');
+  assert.equal(r.autoDrain.response, 'fake follow-up turn: stop at 10');
+});
+
+test('probeSteer: setAutoDrain that starts no turn records secondTurn false', { timeout: 30000 }, async () => {
+  const r = await withFakeEnv({ FAKE_APPSERVER_MODE: 'chatty', FAKE_APPSERVER_UNSUPPORTED: 'followup', FAKE_APPSERVER_AUTODRAIN_NOOP: '1' },
+    () => probeSteer(process.cwd(), { ...probeOpts, autoDrainWaitMs: 300 }));
+  assert.deepEqual(r.autoDrain.result, { status: 'accepted' });
+  assert.equal(r.autoDrain.secondTurn, false);
+  assert.equal(r.autoDrain.terminal, null);
 });
