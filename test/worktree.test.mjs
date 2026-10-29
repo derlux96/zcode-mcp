@@ -14,6 +14,45 @@ test('assertGitRepo passes in a repo and throws outside', async () => {
   removeDir(plain);
 });
 
+test('a failing git call names its subcommand and carries git\'s message', async () => {
+  const plain = makeTempDir();
+  try {
+    await assert.rejects(assertGitRepo(plain), /^Error: git rev-parse failed: .*not a git repository/i);
+  } finally {
+    removeDir(plain);
+  }
+});
+
+test('createWorktree appends the exclude entry on its own line, without blank lines', async () => {
+  for (const [before, after] of [
+    ['', '.zcode-worktrees/\n'],
+    ['*.log\n', '*.log\n.zcode-worktrees/\n'],
+    ['*.log', '*.log\n.zcode-worktrees/\n'],
+  ]) {
+    const repo = makeGitRepo();
+    try {
+      const excludePath = join(repo, '.git', 'info', 'exclude');
+      writeFileSync(excludePath, before);
+      await createWorktree(repo);
+      assert.equal(readFileSync(excludePath, 'utf8'), after, `exclude starting as ${JSON.stringify(before)}`);
+    } finally {
+      removeDir(repo);
+    }
+  }
+});
+
+test('removeWorktree tries both steps and rethrows the first failure', async () => {
+  const repo = makeGitRepo();
+  try {
+    await assert.rejects(
+      removeWorktree(repo, { dir: join(repo, 'no-such-worktree'), branch: 'zcode/no-such-branch' }),
+      /git worktree failed/,
+    );
+  } finally {
+    removeDir(repo);
+  }
+});
+
 test('newWorktreeSlug is timestamp + 6 hex chars', () => {
   assert.match(newWorktreeSlug(), /^[0-9a-z]+-[0-9a-f]{6}$/);
 });

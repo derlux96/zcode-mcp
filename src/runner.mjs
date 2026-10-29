@@ -201,7 +201,7 @@ export async function runZCodeArgs(binPath, cliArgs, {
     const onAbort = () => stop('cancelled');
     if (signal) {
       if (signal.aborted) onAbort();
-      else signal.addEventListener('abort', onAbort, { once: true });
+      else signal.addEventListener('abort', onAbort);
     }
     let pipeTimer = null;
     const cleanup = () => {
@@ -229,10 +229,8 @@ export async function runZCodeArgs(binPath, cliArgs, {
     });
     // On 'exit' (not 'close'): a leftover that inherited stdout/stderr keeps the
     // pipes open, so 'close' would only come once the sweep has ended it.
-    let exitCode = null;
     let sweep = Promise.resolve(false);
-    child.on('exit', (code) => {
-      exitCode = code;
+    child.on('exit', () => {
       exited = true;
       // The sweep can last a while: a cancel/idle/total timer firing in it must not
       // report a ZCode that already exited as cancelled/timeout.
@@ -256,7 +254,7 @@ export async function runZCodeArgs(binPath, cliArgs, {
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
-        code: code ?? exitCode,
+        code,
         timedOut,
         timeoutKind,
         sessionId: extractSessionId(stdout),
