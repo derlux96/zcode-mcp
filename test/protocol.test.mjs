@@ -123,3 +123,51 @@ test('a cancelled call whose handler throws emits no response either', async () 
   // The finished call is no longer tracked: a late cancel for the same id is a no-op.
   assert.equal(await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 11 } }), null);
 });
+
+test('messages that are not JSON-RPC 2.0 get Invalid Request when they carry an id, else nothing', async () => {
+  const p = makeProto();
+  const bad = await p.handleMessage({ jsonrpc: '1.0', id: 7, method: 'ping' });
+  assert.deepEqual(bad.error, { code: -32600, message: 'Invalid Request' });
+  assert.equal(bad.id, 7);
+  assert.equal(await p.handleMessage({ jsonrpc: '1.0', method: 'ping' }), null);
+  assert.equal(await p.handleMessage(null), null);
+  assert.equal(await p.handleMessage(5), null);
+});
+
+test('unknown tool error names the tool; a call without params names undefined', async () => {
+  const p = makeProto();
+  const r = await p.handleMessage({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'nope' } });
+  assert.deepEqual(r.error, { code: -32602, message: 'Unknown tool: nope' });
+  const r2 = await p.handleMessage({ jsonrpc: '2.0', id: 9, method: 'tools/call' });
+  assert.deepEqual(r2.error, { code: -32602, message: 'Unknown tool: undefined' });
+});
+
+test('a thrown non-Error or message-less error still becomes -32603 with a readable message', async () => {
+  const throwing = (v) => ({ name: 't', description: '', inputSchema: { type: 'object' }, handler: async () => { throw v; } });
+  const r1 = await createProtocol({ tools: [throwing(null)] }).handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 't' } });
+  assert.deepEqual(r1.error, { code: -32603, message: 'null' });
+  const r2 = await createProtocol({ tools: [throwing(new Error(''))] }).handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 't' } });
+  assert.deepEqual(r2.error, { code: -32603, message: 'Error' });
+});
+
+test('a finished call does not drop a newer in-flight call that reuses its id', async () => {
+  let releaseFirst;
+  let calls = 0;
+  const slow = {
+    name: 's', description: '', inputSchema: { type: 'object' },
+    handler: (args, { signal }) => new Promise((resolve) => {
+      calls += 1;
+      if (calls === 1) releaseFirst = () => resolve({ content: [] });
+      else signal.addEventListener('abort', () => resolve({ content: [] }));
+    }),
+  };
+  const p = createProtocol({ tools: [slow] });
+  const first = p.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 's' } });
+  await new Promise((r) => setImmediate(r));
+  const second = p.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 's' } });
+  await new Promise((r) => setImmediate(r));
+  releaseFirst();
+  assert.ok(await first);
+  await p.handleMessage({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1 } });
+  assert.equal(await second, null);
+});

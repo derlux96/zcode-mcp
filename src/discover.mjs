@@ -33,7 +33,7 @@ export function discoverZCode({ env = process.env, macosPath = MACOS_PATH } = {}
   checked.push(macosPath);
   if (existsSync(macosPath)) return macosPath;
   const fromPath = whichZcode();
-  if (fromPath && existsSync(fromPath)) return fromPath;
+  if (fromPath) return fromPath;
   checked.push('which zcode → not found');
   throw new ZCodeNotFoundError([
     ...checked,

@@ -21,7 +21,7 @@ test('isMain compares real paths', () => {
   assert.equal(isMain(url, real), true);
   assert.equal(isMain(url, join(link, 'src', 'is-main.mjs')), true);
   assert.equal(isMain(url, join(root, 'src', 'mcp-server.mjs')), false);
-  assert.equal(isMain(url, undefined), false);
+  assert.equal(isMain(url, ''), false);
   assert.equal(isMain(url, join(base, 'missing.mjs')), false);
 });
 
