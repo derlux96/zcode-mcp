@@ -10,6 +10,8 @@
 //     {nativeSearchEnhancementsEnabled:false} or session/create hangs
 //     (15 s server-side timeout). Unknown server requests are answered
 //     with {id, result:{}} so they can never wedge a session.
+//   - interaction/requestUserInput (AskUserQuestion) answers follow ZCode's
+//     strict schema {action, content?, reason?} (verified on 0.17.0)
 //   - session/create takes workspace:{workspacePath,workspaceKey} (both
 //     required; no top-level cwd key)
 //   - session/subscribe gates session/event delivery
@@ -116,9 +118,50 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
   return { level: fallback, substitution: { requested, used: fallback } };
 }
 
-/** Wire shape of an answer to interaction/requestUserInput (single place to fix). */
+// The questions of an interaction/requestUserInput (ZCode 0.17.0 AskUserQuestion:
+// params.questions, mirrored in params.input.questions); [] when there are none.
+function userInputQuestions(params) {
+  if (!params || typeof params !== 'object') return [];
+  const top = Array.isArray(params.questions) ? params.questions : null;
+  const nested = params.input && typeof params.input === 'object' && Array.isArray(params.input.questions) ? params.input.questions : null;
+  return (top && top.length ? top : nested || top || []).filter((q) => q && typeof q === 'object');
+}
+
+/**
+ * Wire shape of an answer to interaction/requestUserInput (single place to fix).
+ * ZCode 0.17.0 validates it against a strict schema {action, content?, reason?}
+ * and AskUserQuestion reads content.answers[q.question] (then content.answer_<i>,
+ * then content.answer for a single question): the text answers every question.
+ */
 export function buildUserInputAnswer(params, text) {
-  return { requestId: params && params.requestId, answer: text };
+  const keyed = userInputQuestions(params).filter((q) => typeof q.question === 'string');
+  if (!keyed.length) return { action: 'accept', content: { answer: text } };
+  const answers = {};
+  for (const q of keyed) answers[q.question] = text;
+  return { action: 'accept', content: { answers } };
+}
+
+/** Answer that declines an interaction/requestUserInput (the model is told it was declined and continues). */
+export function buildUserInputDecline(reason) {
+  return typeof reason === 'string' && reason !== '' ? { action: 'decline', reason } : { action: 'decline' };
+}
+
+/**
+ * The question of an interaction/requestUserInput as shown to users: one line
+ * per question "<question> [options: a | b]" joined with " / "; without
+ * questions the first string among params.question / prompt / message, else ''.
+ */
+export function describeUserInputQuestion(params) {
+  const lines = userInputQuestions(params).map((q) => {
+    const text = typeof q.question === 'string' ? q.question : '';
+    const labels = (Array.isArray(q.options) ? q.options : [])
+      .map((o) => (typeof o === 'string' ? o : o && typeof o === 'object' ? (typeof o.label === 'string' ? o.label : typeof o.value === 'string' ? o.value : null) : null))
+      .filter((l) => typeof l === 'string' && l !== '');
+    return [text, labels.length ? `[options: ${labels.join(' | ')}]` : ''].filter(Boolean).join(' ');
+  }).filter(Boolean);
+  if (lines.length) return lines.join(' / ');
+  const p = params && typeof params === 'object' ? params : {};
+  return [p.question, p.prompt, p.message].find((v) => typeof v === 'string') ?? '';
 }
 
 // Client options beyond the basics:
@@ -130,7 +173,7 @@ export function buildUserInputAnswer(params, text) {
 //   onUserInput  ({ requestId, protocolId, question, params }) => void, called when
 //              ZCode asks interaction/requestUserInput; the request is parked
 //              (no reply) until client.respond(protocolId, result). Without
-//              the hook it is answered {} immediately.
+//              the hook it is answered {action:'cancel'} immediately.
 //   signal     AbortSignal; aborting closes the client (kills the child)
 export class AppServerClient {
   constructor({
@@ -318,8 +361,8 @@ export class AppServerClient {
     if (msg.method === 'interaction/requestUserInput' && this._onUserInput) {
       const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
       this._parkedInput.set(msg.id, { protocolId: msg.id, params });
-      // First string among question/prompt/message; anything else is '' (never "[object Object]").
-      const question = [params.question, params.prompt, params.message].find((v) => typeof v === 'string') ?? '';
+      // Never "[object Object]": only string texts are shown.
+      const question = describeUserInputQuestion(params);
       try {
         this._onUserInput({ requestId: params.requestId, protocolId: msg.id, question, params });
       } catch { /* a failing observer must not wedge the protocol */ }
@@ -327,6 +370,9 @@ export class AppServerClient {
     }
     if (msg.method === 'session/requestRuntimePreferences') {
       result = { nativeSearchEnhancementsEnabled: false };
+    } else if (msg.method === 'interaction/requestUserInput') {
+      // Nobody can answer: a valid cancel (ZCode's answer schema is strict; {} fails it).
+      result = { action: 'cancel' };
     }
     this._send({ id: msg.id, result });
   }
@@ -658,7 +704,7 @@ function retryOptions(transientRetry) {
  * The control is only useful while the task runs: after the client is closed,
  * stop() answers 'not_supported', steer() {status:'rejected', reason:'closed'}
  * and answer() rejected 'no_question'. onUserInput is passed to the client
- * (parking interaction/requestUserInput); without it questions are answered {}.
+ * (parking interaction/requestUserInput); without it questions are answered {action:'cancel'}.
  * When a failed turn is retried, parked questions are dropped unanswered and
  * onUserInputAbandoned() is called (the asking attempt has ended).
  * timeoutMs > 0 is a deadline for the whole task from the first send: every

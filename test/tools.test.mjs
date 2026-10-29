@@ -1034,7 +1034,7 @@ test('a needs_input job renders state, question, deadline and the zcode_send hin
   await waitFor(() => getJob(id)?.state === 'needs_input');
   const text = textOf(await call('zcode_status', { job_id: id }));
   assert.match(text, /^status: needs_input$/m);
-  assert.match(text, /^question: Which port\?$/m);
+  assert.match(text, /^question: Which port\? \[options: 3000 \(Recommended\) \| 8080\]$/m);
   assert.match(text, /^input_deadline: \d{4}-\d\d-\d\dT/m);
   assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
   const sent = await call('zcode_send', { job_id: id, text: '8080' });
@@ -1073,7 +1073,7 @@ test('zcode_run returns as soon as the job needs input instead of waiting out wa
   const id = jobIdOf(text);
   assert.ok(took < 10000, `returned early (${took} ms)`);
   assert.match(text, /^status: needs_input$/m);
-  assert.match(text, /^question: Which port\?$/m);
+  assert.match(text, /^question: Which port\? \[options: 3000 \(Recommended\) \| 8080\]$/m);
   assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
   await call('zcode_send', { job_id: id, text: '8080' });
 });

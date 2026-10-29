@@ -459,7 +459,7 @@ test('a question parks the job in needs_input; an inbox entry answers it', async
   const patches = [];
   const done = runJob(dir, { heartbeatMs: 50, onStatus: (_s, patch) => patches.push(patch) });
   const st = await waitFor(() => (readStatus(dir)?.state === 'needs_input' ? readStatus(dir) : null));
-  assert.equal(st.question, 'Which port?');
+  assert.equal(st.question, 'Which port? [options: 3000 (Recommended) | 8080]');
   const deadline = Date.parse(st.inputDeadline);
   assert.ok(Number.isFinite(deadline));
   assert.ok(deadline > Date.now() + DEFAULT_INPUT_TIMEOUT_MS - 60000, 'default input timeout');
@@ -472,7 +472,7 @@ test('a question parks the job in needs_input; an inbox entry answers it', async
   assert.deepEqual({ question: back.question, inputDeadline: back.inputDeadline }, { question: null, inputDeadline: null });
   const res = readResult(dir);
   assert.equal(res.state, 'completed');
-  assert.match(res.output, /8080/);
+  assert.equal(res.output, 'answers: {"Which port?":"8080"}');
   const fin = readStatus(dir);
   assert.equal(fin.question, null);
   assert.equal(fin.inputDeadline, null);
@@ -499,7 +499,7 @@ test('the status question is one line and redacted', async () => {
     assert.equal(typeof question, 'string');
     assert.ok(!question.includes('\n'));
     assert.ok(!question.includes('sk-abc123def456ghi789jkl'));
-    assert.match(question, /\[REDACTED\] next line$/);
+    assert.match(question, /\[REDACTED\] next line \[options: 3000 \(Recommended\) \| 8080\]$/);
   } finally {
     delete process.env.FAKE_APPSERVER_ASK_QUESTION;
   }

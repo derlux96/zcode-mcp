@@ -35,11 +35,23 @@
 //             input (child-death path; nothing is answered)
 //   ask       acks send, then sends interaction/browserList (trapped: must be
 //             answered {} within 2 s) and interaction/requestUserInput
-//             (id 'server-ask', question 'Which port?', NOT trapped: the client
-//             may park it), and completes the turn with response
-//             "answer: " + JSON.stringify(<result of the requestUserInput answer>)
+//             (id 'server-ask', NOT trapped: the client may park it) with the
+//             real ZCode 0.17.0 AskUserQuestion params (see askParams below:
+//             one question 'Which port?', options '3000 (Recommended)' and
+//             '8080', in both params.questions and params.input.questions).
+//             The answer is validated against ZCode's STRICT zod schema
+//             {action:'accept'|'decline'|'cancel', content?:object, reason?:string}
+//             (no other keys): an invalid answer completes the turn with
+//             "permission request failed: <answer JSON>". A valid one is mapped
+//             the way AskUserQuestion does it: action !== 'accept' -> response
+//             "AskUserQuestion was <cancelled|declined>" (+ ": <reason>" when
+//             given); accept -> for each question q (index i) the value
+//             content.answers?.[q.question] ?? content['answer_'+i] ??
+//             (one question ? content.answer : undefined), a string (trimmed) or
+//             a string[] (joined ', '); response "answers: " + JSON.stringify(
+//             {[q.question]: value}) (questions without a value are left out)
 //   ask-fail-then-hang  first send: parks interaction/requestUserInput (id
-//             'server-ask-1', question 'Which port?', not trapped), then ends the
+//             'server-ask-1', same params as ask, not trapped), then ends the
 //             turn after 300 ms in a transient turn.failed (HTTP 429) without
 //             waiting for the answer; later sends are acked and hang silently
 //             (a pending question must end with the failed attempt)
@@ -77,8 +89,10 @@
 // FAKE_APPSERVER_RESPONSE: JSON string used as the turn.completed response of
 // the non-scripted modes (ok, chatty, tools, flood) instead of the default.
 //
-// FAKE_APPSERVER_ASK_QUESTION: JSON value used as the question of mode ask's
-// requestUserInput instead of 'Which port?' (non-string question tests).
+// FAKE_APPSERVER_ASK_QUESTION: JSON value used as the question text of mode
+// ask's requestUserInput instead of 'Which port?' (non-string question tests).
+// FAKE_APPSERVER_ASK_NO_QUESTIONS=1: the requestUserInput carries no questions
+// (neither params.questions nor params.input.questions) — only the prompt.
 //
 // Job control:
 //   session/stop  answers {}; if a turn is in flight (any mode, including
@@ -203,7 +217,7 @@ function answerArrived(msg) {
     if (askReq) {
       const r = askReq;
       askReq = null;
-      emitTurn(r, null, `answer: ${JSON.stringify(msg.result ?? null)}`);
+      emitTurn(r, null, askUserQuestionResponse(askParams(), msg.result));
     }
     return true;
   }
@@ -222,6 +236,71 @@ function answerArrived(msg) {
     else sendCreateResponse(req);
   }
   return true;
+}
+
+// --- AskUserQuestion (ZCode 0.17.0, verified on the owner's Mac) ---
+
+// The real interaction/requestUserInput params of the AskUserQuestion tool.
+function askParams() {
+  const question = process.env.FAKE_APPSERVER_ASK_QUESTION ? JSON.parse(process.env.FAKE_APPSERVER_ASK_QUESTION) : 'Which port?';
+  const base = {
+    requestId: 'perm_fake1',
+    sessionId: SESSION_ID,
+    turnId: 'turn_fake1',
+    toolCallId: 'call_ask1',
+    toolName: 'AskUserQuestion',
+    schema: { toolName: 'AskUserQuestion' },
+    prompt: 'Tool AskUserQuestion requires user interaction',
+  };
+  if (process.env.FAKE_APPSERVER_ASK_NO_QUESTIONS === '1') return base;
+  return {
+    ...base,
+    input: {
+      questions: [{
+        question,
+        header: 'Port',
+        options: [{ label: '3000 (Recommended)', description: 'the default dev port' }, { label: '8080', description: 'the alternative' }],
+        multiSelect: false,
+      }],
+    },
+    questions: [{
+      question,
+      header: 'Port',
+      multiSelect: false,
+      options: [{ label: '3000 (Recommended)', value: '3000 (Recommended)', description: 'the default dev port' }, { label: '8080', value: '8080', description: 'the alternative' }],
+    }],
+  };
+}
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+// ZCode's strict zod schema for the answer: {action, content?, reason?}, nothing else.
+function validUserInputAnswer(r) {
+  if (!isPlainObject(r)) return false;
+  if (Object.keys(r).some((k) => !['action', 'content', 'reason'].includes(k))) return false;
+  if (!['accept', 'decline', 'cancel'].includes(r.action)) return false;
+  if (r.content !== undefined && !isPlainObject(r.content)) return false;
+  if (r.reason !== undefined && typeof r.reason !== 'string') return false;
+  return true;
+}
+
+// The turn response AskUserQuestion's mapping of the answer leads to.
+function askUserQuestionResponse(params, r) {
+  if (!validUserInputAnswer(r)) return `permission request failed: ${JSON.stringify(r ?? null)}`;
+  if (r.action !== 'accept') {
+    const word = r.action === 'cancel' ? 'cancelled' : 'declined';
+    return `AskUserQuestion was ${word}${r.reason ? `: ${r.reason}` : ''}`;
+  }
+  const content = r.content || {};
+  const qs = Array.isArray(params.questions) ? params.questions : [];
+  const answers = {};
+  qs.forEach((q, i) => {
+    const byQuestion = isPlainObject(content.answers) ? content.answers[q.question] : undefined;
+    const v = byQuestion ?? content[`answer_${i}`] ?? (qs.length === 1 ? content.answer : undefined);
+    if (typeof v === 'string') answers[q.question] = v.trim();
+    else if (Array.isArray(v)) answers[q.question] = v.join(', ');
+  });
+  return `answers: ${JSON.stringify(answers)}`;
 }
 
 // --- request handlers ---
@@ -349,15 +428,14 @@ function handleSend(req) {
   }
   if (MODE === 'ask-fail-then-hang') {
     if (n > 1) return;
-    send({ id: 'server-ask-1', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question: 'Which port?' } });
+    send({ id: 'server-ask-1', method: 'interaction/requestUserInput', params: askParams() });
     setTimeout(() => emitTurn(req, { n, failure: plain(MSG_429) }), 300);
     return;
   }
   if (MODE === 'ask') {
     askReq = req;
     sendServerRequest('server-ask-browser', 'interaction/browserList', { sessionId: SESSION_ID }, isAnyResult);
-    const question = process.env.FAKE_APPSERVER_ASK_QUESTION ? JSON.parse(process.env.FAKE_APPSERVER_ASK_QUESTION) : 'Which port?';
-    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question } });
+    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: askParams() });
     return;
   }
   if (MODE === 'flood') {

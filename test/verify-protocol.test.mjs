@@ -26,20 +26,23 @@ test('analyzeEvents: real events carry `timestamp`, not `ts`', () => {
   assert.equal(r.maxGapMs, 500);
 });
 
-test('answerShapes: documented order, de-duplicated, capped at 4', () => {
-  const params = { requestId: 'r1' };
+test('answerShapes: buildUserInputAnswer first, then answer_0, then answer (ZCode 0.17.0 fallbacks)', () => {
+  const params = { requestId: 'perm_1', questions: [{ question: 'Which port?', options: [] }] };
   const shapes = answerShapes(params, '8080');
-  assert.equal(shapes.length, 4);
-  assert.deepEqual(shapes[0].result, { requestId: 'r1', answer: '8080' });
-  assert.deepEqual(shapes.slice(1).map((s) => s.result), [{ answer: '8080' }, { text: '8080' }, { response: { text: '8080' } }]);
-  assert.deepEqual(shapes.map((s) => s.name), ['buildUserInputAnswer', '{ answer }', '{ text }', '{ response: { text } }']);
+  assert.deepEqual(shapes.map((s) => s.result), [
+    { action: 'accept', content: { answers: { 'Which port?': '8080' } } },
+    { action: 'accept', content: { answer_0: '8080' } },
+    { action: 'accept', content: { answer: '8080' } },
+  ]);
+  assert.deepEqual(shapes.map((s) => s.name), ['buildUserInputAnswer', '{ content: { answer_0 } }', '{ content: { answer } }']);
+  assert.ok(shapes.length <= 4);
 });
 
 test('answerShapes: drops a shape identical to the first', () => {
-  // no requestId -> buildUserInputAnswer yields { requestId: undefined, answer } which JSON-equals { answer }
+  // no questions -> buildUserInputAnswer yields {action:'accept', content:{answer}}, equal to the third shape
   const shapes = answerShapes({}, 'x');
-  assert.equal(shapes.length, 3);
-  assert.deepEqual(shapes.map((s) => s.name), ['buildUserInputAnswer', '{ text }', '{ response: { text } }']);
+  assert.deepEqual(shapes.map((s) => s.name), ['buildUserInputAnswer', '{ content: { answer_0 } }']);
+  assert.deepEqual(shapes[0].result, { action: 'accept', content: { answer: 'x' } });
 });
 
 test('summarizeProbeEvents: terminal error, steer events', () => {

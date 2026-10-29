@@ -48,9 +48,9 @@ export function answerReachedOutput(output, answer) {
 export function answerShapes(params, text) {
   const all = [
     { name: 'buildUserInputAnswer', result: buildUserInputAnswer(params, text) },
-    { name: '{ answer }', result: { answer: text } },
-    { name: '{ text }', result: { text } },
-    { name: '{ response: { text } }', result: { response: { text } } },
+    // ZCode 0.17.0's AskUserQuestion fallbacks after content.answers[q.question]
+    { name: '{ content: { answer_0 } }', result: { action: 'accept', content: { answer_0: text } } },
+    { name: '{ content: { answer } }', result: { action: 'accept', content: { answer: text } } },
   ];
   const seen = new Set();
   const out = [];

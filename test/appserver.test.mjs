@@ -15,6 +15,7 @@ import {
   DEFAULT_TASK_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   buildUserInputAnswer,
+  describeUserInputQuestion,
 } from '../src/appserver.mjs';
 import { DEFAULT_TIMEOUT_MS } from '../src/runner.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
@@ -462,15 +463,15 @@ test('requestUserInput is parked, onUserInput fires once, respond() completes th
     try {
       const cursor = await askSession(client, cwd);
       const req = await got;
-      assert.equal(req.question, 'Which port?');
-      assert.equal(req.requestId, 'req_1');
+      assert.equal(req.question, 'Which port? [options: 3000 (Recommended) | 8080]');
+      assert.equal(req.requestId, 'perm_fake1');
       assert.equal(req.protocolId, 'server-ask');
       assert.equal(client.pendingUserInput, 1);
       client.respond(req.protocolId, buildUserInputAnswer(req.params, '8080'));
       assert.equal(client.pendingUserInput, 0);
       const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
       assert.equal(ev.type, 'turn.completed');
-      assert.match(ev.payload.response, /8080/);
+      assert.equal(ev.payload.response, 'answers: {"Which port?":"8080"}');
       assert.equal(asked.length, 1);
     } finally {
       await client.close();
@@ -500,7 +501,7 @@ test('a parked requestUserInput does not trip the idle timeout', async () => {
   });
 });
 
-test('without onUserInput, requestUserInput is answered {} and other unknown requests too', async () => {
+test('without onUserInput, requestUserInput is answered with a valid cancel (other unknown requests get {})', async () => {
   await withMode('ask', async () => {
     const cwd = makeTempDir();
     const client = new AppServerClient({ binPath: fakeBin, cwd });
@@ -508,7 +509,7 @@ test('without onUserInput, requestUserInput is answered {} and other unknown req
       const cursor = await askSession(client, cwd);
       const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
       assert.equal(ev.type, 'turn.completed');
-      assert.equal(ev.payload.response, 'answer: {}');
+      assert.equal(ev.payload.response, 'AskUserQuestion was cancelled');
       assert.equal(client.pendingUserInput, 0);
     } finally {
       await client.close();
@@ -529,6 +530,84 @@ test('mode ask: interaction/browserList is still answered {} (the 2 s trap would
       await new Promise((r) => setTimeout(r, 2300)); // past the trap window
       assert.equal(client.isRunning(), true);
       client.respond(req.protocolId, {});
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+// --- requestUserInput wire shapes (ZCode 0.17.0 AskUserQuestion) ---
+
+const askQ = (question, labels = []) => ({ question, header: 'H', multiSelect: false, options: labels.map((label) => ({ label, value: label, description: 'd' })) });
+
+test('buildUserInputAnswer: accept with content.answers keyed by every question text', () => {
+  assert.deepEqual(buildUserInputAnswer({ questions: [askQ('Which port?', ['3000', '8080'])] }, '8080'),
+    { action: 'accept', content: { answers: { 'Which port?': '8080' } } });
+  assert.deepEqual(buildUserInputAnswer({ questions: [askQ('A?'), askQ('B?')] }, 'x'),
+    { action: 'accept', content: { answers: { 'A?': 'x', 'B?': 'x' } } });
+});
+
+test('buildUserInputAnswer: falls back to params.input.questions, then to content.answer', () => {
+  assert.deepEqual(buildUserInputAnswer({ input: { questions: [{ question: 'Q?', options: [] }] } }, 'y'),
+    { action: 'accept', content: { answers: { 'Q?': 'y' } } });
+  assert.deepEqual(buildUserInputAnswer({ prompt: 'p' }, 'z'), { action: 'accept', content: { answer: 'z' } });
+  assert.deepEqual(buildUserInputAnswer(undefined, 'z'), { action: 'accept', content: { answer: 'z' } });
+  // questions without a string text cannot be keyed
+  assert.deepEqual(buildUserInputAnswer({ questions: [{ question: { t: 1 } }] }, 'z'), { action: 'accept', content: { answer: 'z' } });
+});
+
+test('describeUserInputQuestion: one line per question with options, joined with " / "', () => {
+  assert.equal(describeUserInputQuestion({ questions: [askQ('Which port?', ['3000 (Recommended)', '8080'])] }), 'Which port? [options: 3000 (Recommended) | 8080]');
+  assert.equal(describeUserInputQuestion({ questions: [askQ('A?', ['a', 'b', 'c']), askQ('B?')] }), 'A? [options: a | b | c] / B?');
+  assert.equal(describeUserInputQuestion({ input: { questions: [{ question: 'In?', options: [{ label: 'x' }] }] } }), 'In? [options: x]');
+  // params.questions wins over params.input.questions
+  assert.equal(describeUserInputQuestion({ questions: [askQ('Top?')], input: { questions: [askQ('In?')] } }), 'Top?');
+});
+
+test('describeUserInputQuestion: without questions falls back to question / prompt / message', () => {
+  assert.equal(describeUserInputQuestion({ question: 'q', prompt: 'p' }), 'q');
+  assert.equal(describeUserInputQuestion({ prompt: 'p', message: 'm' }), 'p');
+  assert.equal(describeUserInputQuestion({ message: 'm' }), 'm');
+  assert.equal(describeUserInputQuestion({ questions: [], prompt: 'p' }), 'p');
+  assert.equal(describeUserInputQuestion({ question: { x: 1 } }), '');
+  assert.equal(describeUserInputQuestion(null), '');
+});
+
+test('mode ask without questions: the prompt is the question and content.answer is valid', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    process.env.FAKE_APPSERVER_ASK_NO_QUESTIONS = '1';
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      const cursor = await askSession(client, cwd);
+      const req = await got;
+      assert.equal(req.question, 'Tool AskUserQuestion requires user interaction');
+      client.respond(req.protocolId, buildUserInputAnswer(req.params, '8080'));
+      const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
+      assert.equal(ev.payload.response, 'answers: {}');
+    } finally {
+      delete process.env.FAKE_APPSERVER_ASK_NO_QUESTIONS;
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('fake: the old {requestId, answer} shape fails ZCode\'s strict answer schema', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      const cursor = await askSession(client, cwd);
+      const req = await got;
+      client.respond(req.protocolId, { requestId: req.requestId, answer: '8080' });
+      const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
+      assert.match(ev.payload.response, /^permission request failed/);
     } finally {
       await client.close();
       removeDir(cwd);
@@ -561,7 +640,7 @@ test('respond() sends only for a parked id and reports whether it sent', async (
       await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
       const answers = readLog(log).filter((m) => m.method === undefined && (m.id === 'not-parked' || m.id === 'server-ask'));
       assert.deepEqual(answers.map((m) => m.id), ['server-ask']);
-      assert.equal(answers[0].result.answer, '1');
+      assert.deepEqual(answers[0].result, { action: 'accept', content: { answers: { 'Which port?': '1' } } });
     } finally {
       delete process.env.FAKE_APPSERVER_LOG;
       await client.close();
@@ -611,7 +690,7 @@ test('parked input is cleared when the client closes', async () => {
   });
 });
 
-test('a non-string question becomes an empty string, never "[object Object]"', async () => {
+test('a non-string question text is left out, never "[object Object]"', async () => {
   await withMode('ask', async () => {
     const cwd = makeTempDir();
     process.env.FAKE_APPSERVER_ASK_QUESTION = JSON.stringify({ text: 'Which port?' });
@@ -621,7 +700,8 @@ test('a non-string question becomes an empty string, never "[object Object]"', a
     try {
       await askSession(client, cwd);
       const req = await got;
-      assert.equal(req.question, '');
+      assert.equal(req.question, '[options: 3000 (Recommended) | 8080]');
+      assert.ok(!req.question.includes('[object Object]'));
       client.respond(req.protocolId, {});
     } finally {
       delete process.env.FAKE_APPSERVER_ASK_QUESTION;
@@ -757,8 +837,8 @@ test('answer() replies to the parked question via onUserInput and the turn compl
     onUserInput: (q) => { asked.push(q); queueMicrotask(() => { asked.push(ctl.answer('8080')); }); },
   });
   assert.equal(res.ok, true);
-  assert.equal(res.response, `answer: ${JSON.stringify({ requestId: 'req_1', answer: '8080' })}`);
-  assert.equal(asked[0].question, 'Which port?');
+  assert.equal(res.response, 'answers: {"Which port?":"8080"}');
+  assert.equal(asked[0].question, 'Which port? [options: 3000 (Recommended) | 8080]');
   assert.deepEqual(asked[1], { status: 'accepted' });
   assert.equal(control.capabilities.userInput, true);
 });
