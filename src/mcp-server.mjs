@@ -144,7 +144,7 @@ const toolSchemas = {
   zcode_send: {
     name: 'zcode_send',
     description:
-      'Send a message to a running protocol-path job: while the job waits for an answer (status needs_input) the text answers ZCode\'s question, otherwise it steers the running turn (if ZCode queues the text instead, it runs as a follow-up turn once the current turn ends). Returns accepted (with delivery guide or queue), rejected, not_supported, or queued (delivered later).',
+      'Send a message to a running protocol-path job: while the job waits for an answer (status needs_input) the text answers ZCode\'s question, otherwise it steers the running turn (ZCode works the text in at the turn\'s next step; if the turn ends first, it runs as a follow-up turn). Returns accepted (delivery guide), rejected, not_supported, or queued (delivered later).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -636,8 +636,7 @@ function buildSendHandler() {
     if (!r.ok) return failText(r.error);
     const lines = [`send: ${r.status}`];
     if (r.reason) lines.push(`reason: ${oneLine(r.reason)}`);
-    if (r.delivery === 'guide') lines.push('delivery: guide (into the running turn)');
-    else if (r.delivery === 'queue') lines.push('delivery: queue (ZCode runs it as a follow-up turn once the current turn ends)');
+    if (r.delivery === 'guide') lines.push('delivery: guide (into the running turn at its next step; a follow-up turn if the turn ends first)');
     lines.push(`job_id: ${r.view.jobId}`, `status: ${oneLine(r.view.state)}`);
     if (r.status === 'queued') lines.push(`the message will be delivered when the job is ready; check zcode_status ${r.view.jobId}`);
     const result = text(lines.join('\n'));

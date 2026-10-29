@@ -743,7 +743,7 @@ test('onControl is called once, after subscribe and before the first send', asyn
   const calls = [];
   const { log } = await runWithControl('ok', (c) => { calls.push(c); });
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].capabilities, { stop: null, steer: null, userInput: null, followupMode: null });
+  assert.deepEqual(calls[0].capabilities, { stop: null, steer: null, userInput: null });
   const methods = log.filter((m) => typeof m.method === 'string').map((m) => m.method);
   assert.deepEqual(methods, ['session/create', 'session/subscribe', 'session/send']);
 });
@@ -783,13 +783,13 @@ test('FAKE_APPSERVER_UNSUPPORTED=stop,steer: both answer not_supported and the c
   assert.deepEqual(driven.st1, { status: 'not_supported' });
   assert.equal(driven.s2, 'not_supported');
   assert.deepEqual(driven.st2, { status: 'not_supported' });
-  assert.deepEqual(control.capabilities, { stop: false, steer: false, userInput: null, followupMode: false });
-  // the second calls short-circuit without a request (the first steer tried setFollowupMode, then sendText)
+  assert.deepEqual(control.capabilities, { stop: false, steer: false, userInput: null });
+  // the second calls short-circuit without a request
   assert.equal(log.filter((m) => m.method === 'session/stop').length, 1);
-  assert.deepEqual(log.filter((m) => m.method === 'v4/command').map((m) => m.params.type), ['setFollowupMode', 'sendText']);
+  assert.deepEqual(log.filter((m) => m.method === 'v4/command').map((m) => m.params.type), ['sendText']);
 });
 
-test('steer() in chatty is accepted and sends the documented v4/command envelope', async () => {
+test('steer() in chatty: requestedDelivery guide, drained mid-turn, one turn and no follow-up', async () => {
   const { res, control, driven, log } = await runWithControl('chatty', async (c) => {
     await sleep(200);
     const a = await c.steer('use port 8080');
@@ -797,32 +797,30 @@ test('steer() in chatty is accepted and sends the documented v4/command envelope
     return [a, b];
   });
   assert.equal(res.ok, true);
+  // ZCode acks every accepted steer 'queue' (pending list); the requested delivery is reported
   assert.deepEqual(driven[0], { status: 'accepted', delivery: 'guide' });
   assert.deepEqual(driven[1], { status: 'accepted', delivery: 'guide' });
   assert.equal(control.capabilities.steer, true);
-  assert.equal(control.capabilities.followupMode, true);
-  // guided steers reach the running turn: no follow-up turn, no setAutoDrain
   assert.equal(res.response, 'fake model task done\nsteered: use port 8080 | and log it');
+  assert.equal(res.undeliveredSteers, undefined);
   const all = log.filter((m) => m.method === 'v4/command');
-  assert.deepEqual(all.map((m) => m.params.type), ['setFollowupMode', 'sendText', 'sendText']);
-  const mode = all[0].params;
-  assert.deepEqual(mode.payload, { mode: 'guide' });
-  assert.equal(mode.sessionId, 'sess_fakeB1');
-  assert.equal(mode.clientId, 'zcode-delegate');
-  assert.equal(typeof mode.issuedAt, 'number');
-  assert.equal(typeof mode.commandId, 'string');
+  assert.deepEqual(all.map((m) => m.params.type), ['sendText', 'sendText'], 'no setFollowupMode, no setAutoDrain');
   assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
-  const cmds = all.slice(1);
-  assert.ok(!cmds.some((c) => c.params.commandId === mode.commandId));
-  const p = cmds[0].params;
+  const p = all[0].params;
   assert.equal(p.type, 'sendText');
   assert.equal(p.sessionId, 'sess_fakeB1');
   assert.equal(p.clientId, 'zcode-delegate');
-  assert.equal(p.payload.text, 'use port 8080');
-  assert.equal(p.payload.delivery.requested, 'guide');
   assert.match(p.commandId, /^steer-sess_fakeB1-\d+/);
   assert.equal(typeof p.issuedAt, 'number');
-  assert.notEqual(cmds[0].params.commandId, cmds[1].params.commandId);
+  assert.notEqual(all[0].params.commandId, all[1].params.commandId);
+});
+
+test('regression: the steer wire payload is {text, requestedDelivery:guide} with no delivery.requested', async () => {
+  const { log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('use port 8080'); });
+  const p = log.find((m) => m.method === 'v4/command' && m.params.type === 'sendText').params;
+  assert.deepEqual(p.payload, { text: 'use port 8080', requestedDelivery: 'guide' });
+  assert.equal(p.payload.delivery, undefined);
+  assert.equal(p.baseRevision, undefined, 'sendText is no CAS command');
 });
 
 test('steer() with no turn in flight is rejected with the server reasonCode', async () => {
@@ -872,65 +870,140 @@ test('answer() replies to the parked question via onUserInput and the turn compl
   assert.equal(control.capabilities.userInput, true);
 });
 
-// --- steers ZCode queues instead of guiding (ZCode 0.17.0 followupMode 'queue') ---
+// --- steers the turn ended before draining (ZCode holds them, autoDrain false) ---
 
 const steerTypes = (log) => log.filter((m) => m.method === 'v4/command').map((m) => m.params.type);
+const casOf = (log, type) => log.filter((m) => m.method === 'v4/command' && m.params.type === type).map((m) => m.params);
 
-test('setFollowupMode unsupported: the steer is queued and setAutoDrain delivers it as a follow-up turn', async () => {
-  const { res, control, driven, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('use port 8080'); },
-    {}, { FAKE_APPSERVER_UNSUPPORTED: 'followup' });
-  assert.deepEqual(driven, { status: 'accepted', delivery: 'queue' });
-  assert.equal(control.capabilities.followupMode, false);
+test('a steer never drained: setAutoDrain with baseRevision (stale retry) runs it as a follow-up turn', async () => {
+  const { res, driven, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('use port 8080'); },
+    {}, { FAKE_APPSERVER_NO_DRAIN: '1' });
+  assert.deepEqual(driven, { status: 'accepted', delivery: 'guide' });
   assert.equal(res.ok, true);
   assert.equal(res.response, 'fake follow-up turn: use port 8080');
-  assert.deepEqual(steerTypes(log), ['setFollowupMode', 'sendText', 'setAutoDrain']);
-  assert.deepEqual(log.find((m) => m.params && m.params.type === 'setAutoDrain').params.payload, { autoDrain: true });
+  assert.equal(res.undeliveredSteers, undefined);
+  assert.deepEqual(steerTypes(log), ['sendText', 'setAutoDrain', 'setAutoDrain']);
+  const sendAck = log.find((m) => m.method === 'v4/command' && m.params.type === 'sendText');
+  assert.ok(sendAck);
+  const [first, second] = casOf(log, 'setAutoDrain');
+  assert.deepEqual(first.payload, { autoDrain: true });
+  // the sendText ack's revision (2: send + accepted steer), then the turn end made it stale
+  assert.equal(first.baseRevision, 2);
+  assert.equal(second.baseRevision, 3, 'retried once with the revisionAtDecision of the stale answer');
   assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
   assert.equal(res.usage.inputTokens, 200, 'usage of both turns is summed');
   assert.equal(res.usage.modelRequestCount, 2);
 });
 
-test('setAutoDrain unsupported too: the queued steers are sent as a new turn, joined by a blank line', async () => {
+test('setAutoDrain stale twice: falls back to sendText startNow + clearQueueAndSend', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('late note'); },
+    {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_CAS_STALE: '2' });
+  assert.equal(res.ok, true);
+  assert.equal(res.response, 'fake startNow turn: late note');
+  assert.deepEqual(steerTypes(log), ['sendText', 'setAutoDrain', 'setAutoDrain', 'sendText']);
+});
+
+test('setAutoDrain rejected: one sendText startNow + clearQueueAndSend carries the held steers', async () => {
   const { res, driven, log } = await runWithControl('chatty', async (c) => {
     await sleep(200);
     return [await c.steer('first'), await c.steer('second')];
-  }, {}, { FAKE_APPSERVER_UNSUPPORTED: 'followup,autodrain' });
-  assert.deepEqual(driven.map((d) => d.delivery), ['queue', 'queue']);
+  }, {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_AUTODRAIN_REJECT: '1' });
+  assert.deepEqual(driven.map((d) => d.status), ['accepted', 'accepted']);
+  assert.equal(res.ok, true);
+  assert.equal(res.response, 'fake startNow turn: first\n\nsecond');
+  // setAutoDrain twice: stale after the turn end, then the rejection
+  assert.deepEqual(steerTypes(log), ['sendText', 'sendText', 'setAutoDrain', 'setAutoDrain', 'sendText']);
+  const fallback = casOf(log, 'sendText')[2];
+  assert.deepEqual(fallback.payload, { text: 'first\n\nsecond', requestedDelivery: 'startNow', heldQueueDisposition: 'clearQueueAndSend' });
+  assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
+  assert.equal(res.usage.modelRequestCount, 2);
+});
+
+test('setAutoDrain unsupported: the clearQueueAndSend fallback is used the same way', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('hint'); },
+    {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_UNSUPPORTED: 'autodrain' });
+  assert.equal(res.ok, true);
+  assert.equal(res.response, 'fake startNow turn: hint');
+  assert.deepEqual(steerTypes(log), ['sendText', 'setAutoDrain', 'sendText'], 'method not found: no stale retry');
+});
+
+test('setAutoDrain and startNow both refused: the held steers go out as a session/send, joined by a blank line', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    return [await c.steer('first'), await c.steer('second')];
+  }, {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_UNSUPPORTED: 'autodrain', FAKE_APPSERVER_STARTNOW_REJECT: '1' });
   assert.equal(res.ok, true);
   const sends = log.filter((m) => m.method === 'session/send');
   assert.equal(sends.length, 2);
   assert.equal(sends[1].params.content, 'first\n\nsecond');
   assert.deepEqual(sends[1].params.modelSelection, sends[0].params.modelSelection);
-  assert.deepEqual(steerTypes(log), ['setFollowupMode', 'sendText', 'sendText', 'setAutoDrain']);
 });
 
-test('setAutoDrain accepted but no turn starts: falls back to session/send after the wait', async () => {
+test('setAutoDrain accepted but no turn starts: falls back to startNow after the wait', async () => {
   const t0 = Date.now();
   const { res, log } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('late note'); },
-    { autoDrainWaitMs: 300 }, { FAKE_APPSERVER_UNSUPPORTED: 'followup', FAKE_APPSERVER_AUTODRAIN_NOOP: '1' });
+    { autoDrainWaitMs: 300 }, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_AUTODRAIN_NOOP: '1' });
   assert.equal(res.ok, true);
-  const sends = log.filter((m) => m.method === 'session/send');
-  assert.equal(sends.length, 2);
-  assert.equal(sends[1].params.content, 'late note');
+  assert.equal(res.response, 'fake startNow turn: late note');
+  assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
   assert.ok(Date.now() - t0 < 8000);
 });
 
-test('a queued steer is not delivered after a stop; it is reported as undelivered', async () => {
+test('one steer drained, a later one held: only the held one is delivered as a follow-up', async () => {
+  const { res, log } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    const a = await c.steer('early');
+    await sleep(100);
+    const b = await c.steer('late');
+    return [a, b];
+  }, {}, { FAKE_APPSERVER_DRAIN_LIMIT: '1' });
+  assert.equal(res.ok, true);
+  assert.equal(res.response, 'fake follow-up turn: late');
+  assert.equal(casOf(log, 'setAutoDrain').length >= 1, true);
+});
+
+test('a held steer is not delivered after a stop; it is reported as undelivered', async () => {
   const { res, log } = await runWithControl('slowhang', async (c) => {
     await sleep(200);
     const st = await c.steer('never mind');
     await c.stop();
     return st;
-  }, {}, { FAKE_APPSERVER_UNSUPPORTED: 'followup', FAKE_APPSERVER_STOP_COMPLETES: '1' });
+  }, {}, { FAKE_APPSERVER_NO_DRAIN: '1', FAKE_APPSERVER_STOP_COMPLETES: '1' });
   assert.equal(res.ok, true);
   assert.equal(res.stopped, true);
   assert.deepEqual(res.undeliveredSteers, ['never mind']);
-  assert.ok(!steerTypes(log).includes('setAutoDrain'));
+  assert.deepEqual(steerTypes(log), ['sendText']);
   assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
 });
 
-test('a guided steer leaves nothing pending and the result has no undeliveredSteers', async () => {
-  const { res } = await runWithControl('chatty', async (c) => { await sleep(200); return c.steer('hint'); });
-  assert.equal(res.ok, true);
-  assert.equal(res.undeliveredSteers, undefined);
+test('fake CAS rules: no baseRevision is rejected invalidPayload, a stale one answers the current revision', async () => {
+  await withMode('slowhang', async () => {
+    const cwd = makeTempDir();
+    const client = new AppServerClient({ binPath: fakeBin, cwd });
+    try {
+      await client.settle();
+      const created = await client.request('session/create', createParams(cwd));
+      const sessionId = created.session.sessionId;
+      const cmd = (type, payload, extra = {}) => client.request('v4/command',
+        { commandId: `c-${type}-${Math.random()}`, clientId: 't', sessionId, ...extra, type, payload, issuedAt: Date.now() });
+      const missing = await cmd('setAutoDrain', { autoDrain: true });
+      assert.equal(missing.status, 'rejected');
+      assert.equal(missing.reasonCode, 'proto.invalidPayload');
+      assert.equal(missing.message, 'CAS commands require baseRevision and baseLogEpoch');
+      assert.equal(missing.revisionAtDecision, 0);
+      const stale = await cmd('setFollowupMode', { mode: 'guide' }, { baseRevision: 7 });
+      assert.deepEqual(stale, { status: 'stale', reasonCode: 'proto.staleRevision', revisionAtDecision: 0 });
+      const ok = await cmd('setFollowupMode', { mode: 'guide' }, { baseRevision: stale.revisionAtDecision });
+      assert.deepEqual(ok, { status: 'accepted', revisionAtDecision: 1 });
+      await client.request('session/send', { sessionId, content: 'go' });
+      // the old delivery.requested shape is ignored: the item is queued, acked 'queue'
+      const steer = await cmd('sendText', { text: 'x', delivery: { requested: 'guide' } });
+      assert.equal(steer.status, 'accepted');
+      assert.equal(steer.result.delivery, 'queue');
+      assert.equal(steer.revisionAtDecision, 3);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
 });

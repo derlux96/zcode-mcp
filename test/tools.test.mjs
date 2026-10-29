@@ -1057,7 +1057,7 @@ test('zcode_send on a running protocol job is accepted', async () => {
   await waitFor(() => getJob(id)?.state === 'running');
   const sent = await call('zcode_send', { job_id: id, text: 'please also add tests' });
   assert.match(textOf(sent), /^send: (accepted|queued)$/m);
-  if (/^send: accepted$/m.test(textOf(sent))) assert.match(textOf(sent), /^delivery: guide \(into the running turn\)$/m);
+  if (/^send: accepted$/m.test(textOf(sent))) assert.match(textOf(sent), /^delivery: guide \(into the running turn at its next step; a follow-up turn if the turn ends first\)$/m);
 });
 
 test('zcode_send errors: unknown job, bad arguments, queued hint, rejected is isError', async () => {

@@ -104,27 +104,55 @@
 //             a stop is caught.
 //             FAKE_APPSERVER_STOP_COMPLETES=1: the in-flight turn ends in
 //             turn.completed instead (the model finished as the stop landed).
-//   v4/command    models ZCode 0.17.0's follow-up routing (bundle reading +
-//             probe): the session's followupMode starts 'queue', autoDrain true.
-//             sendText while a turn is in flight -> {status:'accepted',
-//             result:{type:'inputAccepted', delivery}} with delivery 'guide'
-//             when followupMode is 'guide', else 'queue', plus a
-//             turn.steerQueued session/event. 'guide': a turn.steerDrained
-//             follows shortly (at the latest right before the turn ends) and
-//             the turn.completed response gets "\nsteered: <texts joined ' | '>".
-//             'queue': the text is held; a turn that completes with held texts
-//             sets autoDrain false (ZCode holds the queue: no new turn).
-//             sendText with no turn in flight -> {status:'rejected', reasonCode:'idle'}.
-//             setFollowupMode {payload:{mode}} -> {status:'accepted'}.
-//             setAutoDrain {payload:{autoDrain}} -> {status:'accepted'}; true
-//             with held texts and no turn in flight starts a new turn (no
-//             session/send) whose response is "fake follow-up turn: " + the
-//             held texts joined with "\n\n".
+//   v4/command    models ZCode 0.17.0's follow-up routing (read from the
+//             bundle and probed live). Envelope {commandId, clientId, sessionId,
+//             baseRevision?, type, payload, issuedAt}. The conversation has a
+//             revision (starts 0, +1 on every state change: a send, an accepted
+//             command, a drained steer, a turn end); every answer carries it as
+//             revisionAtDecision (the revision after the decision).
+//             sendText {text, requestedDelivery?, heldQueueDisposition?}
+//             (payload.delivery.requested is ignored; the default is 'queue'):
+//               turn in flight, 'guide' or 'queue' -> {status:'accepted',
+//               revisionAtDecision, result:{type:'inputAccepted',
+//               delivery:'queue', inputId}} and a turn.steerQueued event (an
+//               accepted steer always acks 'queue': it joins the pending list).
+//               A 'guide' item is drained 10 ms later while the turn still runs
+//               (turn.steerDrained; the turn.completed response gets
+//               "\nsteered: <texts joined ' | '>"); 'queue' items, and guide
+//               items the turn ended before draining, are held. A turn that ends
+//               with held items sets autoDrain false (no new turn).
+//               turn in flight, 'startNow' -> the running turn is preempted
+//               (turn.failed {code:'preempted'}) and a new turn runs the text.
+//               no turn in flight, held items and no heldQueueDisposition ->
+//               {status:'rejected', reasonCode:'queue.choiceRequired'};
+//               'startNow' (+ 'clearQueueAndSend' clears the held items,
+//               'keepQueueAndSend' keeps them) -> accepted delivery 'startNow'
+//               and a new turn whose response is "fake startNow turn: " + text.
+//               no turn in flight otherwise -> {status:'rejected', reasonCode:'idle'}.
+//             CAS commands (setFollowupMode {mode}, setAutoDrain {autoDrain},
+//             sendQueuedNow {queueItemId}) need a top-level baseRevision:
+//               missing -> {status:'rejected', reasonCode:'proto.invalidPayload',
+//               message:'CAS commands require baseRevision and baseLogEpoch'};
+//               != revision -> {status:'stale', reasonCode:'proto.staleRevision',
+//               revisionAtDecision}; else accepted. setAutoDrain true with held
+//               items and no turn in flight starts a new turn (no session/send)
+//               whose response is "fake follow-up turn: " + the held texts joined
+//               with "\n\n". sendQueuedNow runs the oldest held item the same way.
 //             Other command types -> {status:'rejected', reasonCode:'unknown_command'}.
 // FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop', 'steer', 'followup',
 // 'autodrain'; session/stop, v4/command (all types), and the v4/command types
 // setFollowupMode / setAutoDrain answer error -32601 "Method not found".
 // FAKE_APPSERVER_AUTODRAIN_NOOP=1: setAutoDrain is accepted but never starts a turn.
+// FAKE_APPSERVER_AUTODRAIN_REJECT=1: setAutoDrain answers {status:'rejected',
+// reasonCode:'proto.forbidden'}.
+// FAKE_APPSERVER_STARTNOW_REJECT=1: sendText 'startNow' is rejected
+// (reasonCode 'proto.invalidPayload').
+// FAKE_APPSERVER_NO_DRAIN=1: guide items are never drained (the model is past
+// its last step), so they are held when the turn ends.
+// FAKE_APPSERVER_DRAIN_LIMIT=n: only the first n guide items are drained; later
+// ones are held like with FAKE_APPSERVER_NO_DRAIN.
+// FAKE_APPSERVER_CAS_STALE=n: the first n CAS commands answer stale whatever
+// their baseRevision.
 //
 // Trap enforcement: server-initiated requests must be answered with their
 // documented result within 2 s or this process FAILS the connection
@@ -230,12 +258,18 @@ let inFlight = null; // session/send whose turn has not ended yet
 let chattyTimer = null;
 const stoppedSends = new Set(); // send ids whose turn was ended by session/stop
 // v4/command follow-up routing state (see the header).
+let revision = 0;
 let followupMode = 'queue';
 let autoDrain = true;
-const heldTexts = []; // sendText texts delivered 'queue', waiting for a drain
-let guided = []; // sendText texts delivered 'guide' into the current turn
-let undrained = []; // guide texts whose turn.steerDrained is not out yet
+const heldTexts = []; // texts held in ZCode's queue, waiting for a drain
+let guided = []; // guide texts drained into the current turn
+let undrained = []; // guide texts accepted in the current turn, not drained yet
+let drainTimer = null;
 let drainTurns = 0;
+let inputs = 0;
+let forcedStale = Number(process.env.FAKE_APPSERVER_CAS_STALE) || 0;
+let drainsLeft = process.env.FAKE_APPSERVER_NO_DRAIN === '1' ? 0
+  : process.env.FAKE_APPSERVER_DRAIN_LIMIT !== undefined ? Number(process.env.FAKE_APPSERVER_DRAIN_LIMIT) : Infinity;
 
 function answerArrived(msg) {
   if (msg.id === 'server-ask') {
@@ -436,6 +470,7 @@ function handleSend(req) {
   const n = countSend();
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: n } });
+  revision += 1;
   inFlight = req;
   guided = [];
   if (MODE === 'slowhang') {
@@ -559,6 +594,8 @@ function handleStop(req) {
   inFlight = null;
   if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
   if (askReq === turn) askReq = null;
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+  heldTexts.push(...undrained.splice(0));
   if (process.env.FAKE_APPSERVER_STOP_COMPLETES === '1') {
     emitTurn(turn);
     stoppedSends.add(turn.id);
@@ -586,56 +623,125 @@ function steerEvent(type, payload) {
 }
 
 function flushDrains() {
+  drainTimer = null;
+  if (!inFlight) return;
   const texts = undrained;
   undrained = [];
-  for (const text of texts) steerEvent('turn.steerDrained', { text, delivery: 'guide' });
+  for (const text of texts) {
+    revision += 1;
+    guided.push(text);
+    steerEvent('turn.steerDrained', { text, delivery: 'guide' });
+  }
 }
+
+// Starts a turn ZCode runs without a session/send (auto-drain, startNow).
+function startTurn(content, response) {
+  const turn = { id: `drain-${++drainTurns}`, params: { content } };
+  inFlight = turn;
+  guided = [];
+  undrained = [];
+  setTimeout(() => emitTurn(turn, null, response), 25);
+}
+
+const CAS = new Set(['setFollowupMode', 'setAutoDrain', 'sendQueuedNow']);
 
 function handleCommand(req) {
   const p = req.params || {};
   const payload = p.payload && typeof p.payload === 'object' ? p.payload : {};
   const unsupported = () => send({ id: req.id, error: { code: -32601, message: `Method not found: v4/command ${p.type}` } });
+  const answer = (result) => send({ id: req.id, result: { ...result, revisionAtDecision: revision } });
+  const accept = (result = {}) => { revision += 1; answer({ status: 'accepted', ...result }); };
   if (p.type === 'sendText') {
-    if (!inFlight) return send({ id: req.id, result: { status: 'rejected', reasonCode: 'idle' } });
     const text = typeof payload.text === 'string' ? payload.text : '';
-    const delivery = followupMode === 'guide' ? 'guide' : 'queue';
-    send({ id: req.id, result: { status: 'accepted', result: { type: 'inputAccepted', delivery } } });
-    steerEvent('turn.steerQueued', { text, delivery });
-    if (delivery === 'guide') {
-      guided.push(text);
-      undrained.push(text);
-      setTimeout(flushDrains, 10);
+    const requested = typeof payload.requestedDelivery === 'string' ? payload.requestedDelivery : 'queue';
+    const inputId = `in_cmd${++inputs}`;
+    if (requested === 'startNow') {
+      if (process.env.FAKE_APPSERVER_STARTNOW_REJECT === '1') return answer({ status: 'rejected', reasonCode: 'proto.invalidPayload' });
+      if (!inFlight && heldTexts.length && !payload.heldQueueDisposition) return answer({ status: 'rejected', reasonCode: 'queue.choiceRequired' });
+      if (payload.heldQueueDisposition === 'clearQueueAndSend') heldTexts.splice(0);
+      if (inFlight) preempt();
+      accept({ result: { type: 'inputAccepted', delivery: 'startNow', inputId } });
+      return startTurn(text, `fake startNow turn: ${text}`);
+    }
+    if (!inFlight) {
+      if (heldTexts.length && !payload.heldQueueDisposition) return answer({ status: 'rejected', reasonCode: 'queue.choiceRequired' });
+      return answer({ status: 'rejected', reasonCode: 'idle' });
+    }
+    accept({ result: { type: 'inputAccepted', delivery: 'queue', inputId } });
+    steerEvent('turn.steerQueued', { text, delivery: requested === 'guide' ? 'guide' : 'queue' });
+    if (requested === 'guide') {
+      if (drainsLeft > 0) {
+        drainsLeft -= 1;
+        undrained.push(text);
+        if (!drainTimer) drainTimer = setTimeout(flushDrains, 10);
+      } else {
+        heldTexts.push(text);
+      }
     } else {
       heldTexts.push(text);
     }
     return;
   }
+  if (CAS.has(p.type)) {
+    if (p.type === 'setFollowupMode' && UNSUPPORTED.has('followup')) return unsupported();
+    if (p.type === 'setAutoDrain' && UNSUPPORTED.has('autodrain')) return unsupported();
+    if (typeof p.baseRevision !== 'number') {
+      return answer({ status: 'rejected', reasonCode: 'proto.invalidPayload', message: 'CAS commands require baseRevision and baseLogEpoch' });
+    }
+    if (forcedStale > 0 || p.baseRevision !== revision) {
+      if (forcedStale > 0) forcedStale -= 1;
+      return answer({ status: 'stale', reasonCode: 'proto.staleRevision' });
+    }
+  }
   if (p.type === 'setFollowupMode') {
-    if (UNSUPPORTED.has('followup')) return unsupported();
     followupMode = payload.mode;
-    return send({ id: req.id, result: { status: 'accepted' } });
+    return accept();
   }
   if (p.type === 'setAutoDrain') {
-    if (UNSUPPORTED.has('autodrain')) return unsupported();
+    if (process.env.FAKE_APPSERVER_AUTODRAIN_REJECT === '1') return answer({ status: 'rejected', reasonCode: 'proto.forbidden' });
     autoDrain = payload.autoDrain === true;
-    send({ id: req.id, result: { status: 'accepted' } });
+    accept();
     if (autoDrain && heldTexts.length && !inFlight && process.env.FAKE_APPSERVER_AUTODRAIN_NOOP !== '1') {
       const content = heldTexts.splice(0).join('\n\n');
-      const turn = { id: `drain-${++drainTurns}`, params: { content } };
-      inFlight = turn;
-      guided = [];
-      setTimeout(() => emitTurn(turn, null, `fake follow-up turn: ${content}`), 25);
+      startTurn(content, `fake follow-up turn: ${content}`);
     }
     return;
   }
-  send({ id: req.id, result: { status: 'rejected', reasonCode: 'unknown_command' } });
+  if (p.type === 'sendQueuedNow') {
+    if (!heldTexts.length || inFlight) return answer({ status: 'rejected', reasonCode: 'queue.itemNotFound' });
+    accept();
+    const content = heldTexts.shift();
+    return startTurn(content, `fake follow-up turn: ${content}`);
+  }
+  answer({ status: 'rejected', reasonCode: 'unknown_command' });
+}
+
+// requestedDelivery 'startNow' during a turn cancels it.
+function preempt() {
+  const turn = inFlight;
+  inFlight = null;
+  if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
+  stoppedSends.add(turn.id);
+  heldTexts.push(...undrained.splice(0));
+  revision += 1;
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_preempted', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_preempt_${turn.id}`, seq: 950, timestamp: Date.now(), type: 'turn.failed',
+      payload: { error: { code: 'preempted', message: 'turn preempted by a startNow input' }, turnPhase: 'model_request', inputId: 'in_preempted' },
+    },
+  });
 }
 
 function emitTurn(req, scripted = null, responseOverride = null) {
   if (stoppedSends.has(req.id)) return; // the stop already ended this turn
   if (inFlight === req) inFlight = null;
-  flushDrains(); // guided texts are drained before the turn ends
-  // ZCode holds texts still queued when a turn ends: no automatic new turn.
+  // Guide texts the turn ended before draining stay in ZCode's queue; ZCode
+  // holds a queue left at turn end (autoDrain false: no automatic new turn).
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+  heldTexts.push(...undrained.splice(0));
+  revision += 1;
   if (heldTexts.length) autoDrain = false;
   const steered = guided.length ? `\nsteered: ${guided.join(' | ')}` : '';
   guided = [];

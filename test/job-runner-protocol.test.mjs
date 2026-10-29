@@ -626,25 +626,34 @@ test('without steer support an inbox entry is acked not_supported', async () => 
   assert.equal(readStatus(dir).capabilities.steer, false);
 });
 
-test('a steer ZCode queues is acked with delivery queue and runs as a follow-up turn', async () => {
+test('a steer the turn ends before draining is acked guide and runs as a follow-up turn', async () => {
   process.env.FAKE_APPSERVER_MODE = 'chatty';
-  process.env.FAKE_APPSERVER_UNSUPPORTED = 'followup';
-  const { dir } = mkJob({ cwd: tempCwd() });
-  const done = runJob(dir, { heartbeatMs: 50 });
-  await controlReady(dir);
-  const seq = writeInboxEntry(dir, { kind: 'send', text: 'use port 8080' });
-  const ack = await waitFor(() => readAck(dir, seq), 2000);
-  assert.deepEqual({ status: ack.status, delivery: ack.delivery }, { status: 'accepted', delivery: 'queue' });
-  await done;
-  const res = readResult(dir);
-  assert.equal(res.state, 'completed');
-  assert.equal(res.output, 'fake follow-up turn: use port 8080');
-  assert.equal(readStatus(dir).capabilities.followupMode, false);
+  process.env.FAKE_APPSERVER_NO_DRAIN = '1';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  try {
+    const { dir } = mkJob({ cwd });
+    const done = runJob(dir, { heartbeatMs: 50 });
+    await controlReady(dir);
+    const seq = writeInboxEntry(dir, { kind: 'send', text: 'use port 8080' });
+    const ack = await waitFor(() => readAck(dir, seq), 2000);
+    assert.deepEqual({ status: ack.status, delivery: ack.delivery }, { status: 'accepted', delivery: 'guide' });
+    await done;
+    const res = readResult(dir);
+    assert.equal(res.state, 'completed');
+    assert.equal(res.output, 'fake follow-up turn: use port 8080');
+    assert.equal('followupMode' in readStatus(dir).capabilities, false);
+    const drain = logged(log).filter((m) => m.method === 'v4/command' && m.params.type === 'setAutoDrain');
+    assert.ok(drain.length >= 1 && drain.every((m) => typeof m.params.baseRevision === 'number'));
+  } finally {
+    delete process.env.FAKE_APPSERVER_NO_DRAIN;
+  }
 });
 
-test('a queued steer left when the job is cancelled is reported as a warning', async () => {
+test('a held steer left when the job is cancelled is reported as a warning', async () => {
   process.env.FAKE_APPSERVER_MODE = 'slowhang';
-  process.env.FAKE_APPSERVER_UNSUPPORTED = 'followup';
+  process.env.FAKE_APPSERVER_NO_DRAIN = '1';
   process.env.FAKE_APPSERVER_STOP_COMPLETES = '1';
   process.env.FAKE_APPSERVER_SLOWHANG_STARTED = '1'; // the runner steers only once the turn is under way
   try {
@@ -653,7 +662,7 @@ test('a queued steer left when the job is cancelled is reported as a warning', a
     await controlReady(dir);
     const seq = writeInboxEntry(dir, { kind: 'send', text: 'never mind' });
     const ack = await waitFor(() => readAck(dir, seq), 3000);
-    assert.equal(ack.delivery, 'queue');
+    assert.equal(ack.delivery, 'guide');
     writeFileSync(join(dir, 'cancel'), '');
     await done;
     const res = readResult(dir);
@@ -662,6 +671,7 @@ test('a queued steer left when the job is cancelled is reported as a warning', a
   } finally {
     delete process.env.FAKE_APPSERVER_STOP_COMPLETES;
     delete process.env.FAKE_APPSERVER_SLOWHANG_STARTED;
+    delete process.env.FAKE_APPSERVER_NO_DRAIN;
   }
 });
 
