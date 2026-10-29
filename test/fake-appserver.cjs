@@ -38,6 +38,11 @@
 //             (id 'server-ask', question 'Which port?', NOT trapped: the client
 //             may park it), and completes the turn with response
 //             "answer: " + JSON.stringify(<result of the requestUserInput answer>)
+//   ask-fail-then-hang  first send: parks interaction/requestUserInput (id
+//             'server-ask-1', question 'Which port?', not trapped), then ends the
+//             turn after 300 ms in a transient turn.failed (HTTP 429) without
+//             waiting for the answer; later sends are acked and hang silently
+//             (a pending question must end with the failed attempt)
 //   fail-429-then-ok      the first FAKE_APPSERVER_FAIL_TIMES (default 1) turns
 //             fail with an HTTP 429 rate-limit text, every later turn completes
 //   fail-network-then-ok  same, with "TypeError: fetch failed"
@@ -340,6 +345,12 @@ function handleSend(req) {
       emitTurn(req, { n, failure });
       if (failure && process.env.FAKE_APPSERVER_EXIT_AFTER_FAIL === '1') setTimeout(() => process.exit(1), 100);
     }, 25);
+    return;
+  }
+  if (MODE === 'ask-fail-then-hang') {
+    if (n > 1) return;
+    send({ id: 'server-ask-1', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question: 'Which port?' } });
+    setTimeout(() => emitTurn(req, { n, failure: plain(MSG_429) }), 300);
     return;
   }
   if (MODE === 'ask') {

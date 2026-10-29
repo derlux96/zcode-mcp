@@ -391,6 +391,11 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     questions.push(oneLine(redactText(String(question ?? ''))));
     if (questions.length === 1) showQuestion();
   };
+  // The attempt that asked failed and is retried: its questions are gone.
+  const onUserInputAbandoned = () => {
+    questions.length = 0;
+    showQuestion();
+  };
   // A steer request that fails otherwise (e.g. request timeout) is a rejection.
   const steer = async (text) => {
     try {
@@ -462,6 +467,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     onSpawn: childRecorder(setStatus, warn, identity, identityRetryDelayMs),
     onEvent,
     onUserInput,
+    onUserInputAbandoned,
     onControl,
     transientRetry: {
       maxRetries: params.max_transient_retries ?? DEFAULT_MAX_TRANSIENT_RETRIES,

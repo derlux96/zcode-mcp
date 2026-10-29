@@ -346,6 +346,16 @@ export class AppServerClient {
    * is still parked (so a late second answer for the same question is
    * dropped); returns true when sent, false otherwise.
    */
+  /**
+   * Drops every parked requestUserInput without answering it (the attempt that
+   * asked has ended). Returns how many were dropped.
+   */
+  abandonParked() {
+    const n = this._parkedInput.size;
+    this._parkedInput.clear();
+    return n;
+  }
+
   respond(protocolId, result) {
     if (!this._parkedInput.has(protocolId)) return false;
     this._parkedInput.delete(protocolId);
@@ -649,6 +659,8 @@ function retryOptions(transientRetry) {
  * stop() answers 'not_supported', steer() {status:'rejected', reason:'closed'}
  * and answer() rejected 'no_question'. onUserInput is passed to the client
  * (parking interaction/requestUserInput); without it questions are answered {}.
+ * When a failed turn is retried, parked questions are dropped unanswered and
+ * onUserInputAbandoned() is called (the asking attempt has ended).
  * timeoutMs > 0 is a deadline for the whole task from the first send: every
  * wait gets the remaining time and a backoff that would pass it is not
  * started. The result carries retries [{at, attempt, delayMs, reason}] and
@@ -670,6 +682,7 @@ export async function runTaskWithModel({
   onSpawn,
   onEvent,
   onUserInput,
+  onUserInputAbandoned,
   onControl,
   signal,
   transientRetry,
@@ -872,6 +885,11 @@ export async function runTaskWithModel({
       const at = new Date().toISOString();
       const reason = describeTurnError(error);
       const klass = cls.klass ?? null;
+      // A pending user-input request ends with the failed attempt: the retry
+      // starts a new turn that never sees an answer to it.
+      if (client.abandonParked() > 0 && typeof onUserInputAbandoned === 'function') {
+        try { onUserInputAbandoned(); } catch { /* an observer must not end the task */ }
+      }
       retries.push({ at, attempt, delayMs, reason, klass });
       if (retry.onRetry) {
         try {

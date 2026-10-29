@@ -680,3 +680,22 @@ test('runTaskWithModel reports stopped: true when a stop was sent before the tur
   const plain = await runTaskWithModel({ binPath: fakeAppServer, cwd: tempCwd(), prompt: 'p', timeoutMs: 10000 });
   assert.equal(plain.stopped, false);
 });
+
+test('a question pending when the turn fails transiently ends with that attempt: back to running, idle timer armed', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask-fail-then-hang';
+  const { dir } = mkJob({ cwd: tempCwd(), timeout_ms: 8000, idle_timeout_ms: 600 });
+  const patches = [];
+  await runJob(dir, { heartbeatMs: 50, retryDelaysMs: [20], onStatus: (_s, p) => patches.push(p) });
+  const asked = patches.findIndex((p) => p.state === 'needs_input');
+  assert.ok(asked >= 0, 'the question parked the job');
+  const back = patches.findIndex((p, i) => i > asked && p.state === 'running');
+  assert.ok(back > asked, 'status returned to running after the failed attempt');
+  assert.equal(patches[back].question, null);
+  assert.equal(patches[back].inputDeadline, null);
+  const res = readResult(dir);
+  assert.equal(res.state, 'timeout');
+  assert.equal(res.timeoutKind, 'idle', 'the idle timer fired on the silent retry turn');
+  assert.equal(res.retries.length, 1);
+  const st = readStatus(dir);
+  assert.equal(st.question ?? null, null);
+});
