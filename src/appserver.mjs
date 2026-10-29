@@ -90,7 +90,7 @@ export function entryReasoningLevels(entry) {
     ? entry.reasoning.levels
     : [];
   return levels
-    .map((l) => (typeof l === 'string' ? l : l && typeof l === 'object' && typeof l.value === 'string' ? l.value : null))
+    .map((l) => (typeof l === 'string' ? l : l && l.value))
     .filter((v) => typeof v === 'string');
 }
 
@@ -206,7 +206,6 @@ export class AppServerClient {
         onSpawn(this.child);
       } catch (err) {
         this._kill('SIGKILL');
-        this._closed = true;
         throw err;
       }
     }
@@ -214,16 +213,16 @@ export class AppServerClient {
       this._signal = signal;
       this._onAbort = () => { this.close(); };
       if (signal.aborted) this.close();
-      else signal.addEventListener('abort', this._onAbort, { once: true });
+      else signal.addEventListener('abort', this._onAbort); // close() removes it
     }
   }
 
-  // Signal the child, or its whole process group when killGroup is set.
+  // Signal the child, or its whole process group when killGroup is set
+  // (signalGroup refuses a missing pid or a pgid <= 1 with a RangeError).
   _kill(sig) {
-    const pid = this.child.pid;
-    if (this._killGroup && Number.isInteger(pid) && pid > 1) {
+    if (this._killGroup) {
       try {
-        signalGroup(pid, sig);
+        signalGroup(this.child.pid, sig);
         return;
       } catch {
         // fall back to the child alone
@@ -310,7 +309,7 @@ export class AppServerClient {
     } catch {
       return; // tolerate stray non-JSON output on stdout
     }
-    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+    if (!msg) return; // null; other primitives and arrays carry neither method nor id
     if (typeof msg.method === 'string') {
       if (msg.id !== undefined) this._handleServerRequest(msg);
       else this._handleNotification(msg);
@@ -589,7 +588,7 @@ function abortableSleep(ms, signal) {
       resolve();
     };
     const timer = setTimeout(done, ms);
-    if (signal) signal.addEventListener('abort', done, { once: true });
+    if (signal) signal.addEventListener('abort', done); // done removes it
   });
 }
 
@@ -617,7 +616,7 @@ async function backoff(client, retry, delayMs, signals) {
   const live = signals.filter(Boolean);
   for (const s of live) {
     if (s.aborted) stop();
-    else s.addEventListener('abort', stop, { once: true });
+    else s.addEventListener('abort', stop); // removed in the finally below
   }
   client.exited.then(stop);
   try {
@@ -640,7 +639,7 @@ function isGone(err) {
 let steerSeq = 0; // keeps commandIds unique when Date.now() repeats
 
 function retryOptions(transientRetry) {
-  const o = transientRetry && typeof transientRetry === 'object' ? transientRetry : {};
+  const o = transientRetry || {};
   const delaysMs = Array.isArray(o.delaysMs) && o.delaysMs.length && o.delaysMs.every((d) => Number.isFinite(d) && d >= 0)
     ? o.delaysMs
     : DEFAULT_RETRY_DELAYS_MS;
