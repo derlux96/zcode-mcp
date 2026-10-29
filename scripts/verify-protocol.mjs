@@ -1,7 +1,7 @@
 // Protocol spike: verifies facts about the ZCode app-server event stream
 // that the job API relies on. `--real` talks to the installed ZCode and
 // spends a little quota; run it in a throwaway git repo, never in this repo.
-import { pathToFileURL } from 'node:url';
+import { isMain } from '../src/is-main.mjs';
 import { AppServerClient, resolveBin, buildUserInputAnswer } from '../src/appserver.mjs';
 
 const tsOf = (e) => (e && typeof e === 'object' ? (typeof e.ts === 'number' ? e.ts : typeof e.timestamp === 'number' ? e.timestamp : null) : null);
@@ -291,7 +291,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main().catch((e) => {
     process.stderr.write(`${e && e.stack}\n`);
     process.exit(1);

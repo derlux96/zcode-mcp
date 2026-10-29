@@ -7,7 +7,7 @@
 // whose event stream allows an idle timeout and progress lines.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './is-main.mjs';
 import { redactText } from './redact.mjs';
 import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES, STOP_GRACE_MS } from './jobstore.mjs';
 import { getProcessIdentity, signalGroup } from './procid.mjs';
@@ -750,7 +750,7 @@ export function runnerEnvOptions(env = process.env) {
   return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0, retryDelaysMs };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   // Signal handlers first, so an early SIGTERM/SIGINT still ends in a terminal state.
   const early = new AbortController();
   process.on('SIGTERM', () => early.abort());

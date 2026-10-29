@@ -3,7 +3,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { symlinkSync } from 'node:fs';
+import { readFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isMain } from '../src/is-main.mjs';
@@ -43,4 +43,19 @@ test('install.mjs --help and doctor.mjs --bogus through a symlinked dir', () => 
   const d = spawnSync(process.execPath, [join(link, 'scripts', 'doctor.mjs'), '--bogus'], { encoding: 'utf8' });
   assert.equal(d.status, 2);
   assert.match(d.stderr, /unknown argument/);
+});
+
+test('verify-protocol.mjs without --real through a symlinked dir prints usage', () => {
+  const r = spawnSync(process.execPath, [join(link, 'scripts', 'verify-protocol.mjs')], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /usage: node scripts\/verify-protocol\.mjs/);
+});
+
+test('every entry point uses isMain, not a typed-path URL comparison', () => {
+  const files = ['src/job-runner.mjs', 'scripts/smoke-real.mjs', 'scripts/soak-real.mjs', 'scripts/faults-real.mjs', 'scripts/verify-protocol.mjs'];
+  for (const f of files) {
+    const src = readFileSync(join(root, f), 'utf8');
+    assert.doesNotMatch(src, /pathToFileURL\(process\.argv\[1\]\)/, f);
+    assert.match(src, /isMain\(import\.meta\.url\)/, f);
+  }
 });

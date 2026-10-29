@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from '../src/is-main.mjs';
 import { safeSignal, waitFor, sleep } from '../test/helpers.mjs';
 import {
   startCli, tempDir, initRepo, realServer, stopServer, runJob, followJob, readJobStatus,
@@ -354,7 +354,7 @@ async function main() {
   return report.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main().then((code) => process.exit(code), (error) => {
     process.stderr.write(`faults-real: ${error && error.stack ? error.stack : error}\n`);
     process.exit(1);
