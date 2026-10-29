@@ -154,6 +154,7 @@ test('zcode_run without mode runs the protocol path (status names protocol)', as
   assert.match(text, /^status: completed \(protocol\)$/m);
   assert.match(text, /^session_id: sess_fakeB1$/m);
   assert.match(text, /fake model task done/);
+  assert.match(text, /^usage: 105 tokens \(in 100, out 5, reasoning 0, cache read 0\), 1 requests$/m);
 });
 
 test('zcode_run records a non-resumable job id when the CLI prints no session id', async () => {

@@ -450,6 +450,22 @@ export class AppServerClient {
   }
 }
 
+const USAGE_FIELDS = ['inputTokens', 'outputTokens', 'reasoningTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'modelRequestCount'];
+
+/**
+ * Adds one turn's payload.usage to the running total. Non-object u leaves acc
+ * unchanged (null stays null); missing or non-finite fields count as 0.
+ */
+export function addUsage(acc, u) {
+  if (!u || typeof u !== 'object' || Array.isArray(u)) return acc;
+  const out = {};
+  for (const k of USAGE_FIELDS) {
+    const v = Number(u[k]);
+    out[k] = (acc ? acc[k] : 0) + (Number.isFinite(v) ? v : 0);
+  }
+  return out;
+}
+
 export const DEFAULT_RETRY_DELAYS_MS = [30000, 60000, 120000, 300000, 600000, 900000];
 export const DEFAULT_MAX_TRANSIENT_RETRIES = 6;
 
@@ -608,6 +624,7 @@ export async function runTaskWithModel({
   let sessionId = null;
   const retry = retryOptions(transientRetry);
   const retries = [];
+  let usage = null;
   try {
     await client.settle();
 
@@ -664,12 +681,13 @@ export async function runTaskWithModel({
       } catch (err) {
         throw err instanceof AppServerError && err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
       }
+      usage = addUsage(usage, event.payload && event.payload.usage);
       if (event.type === 'turn.completed') {
-        return { ...base, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
+        return { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
       }
       const raw = (event.payload && event.payload.error) || {};
       const error = turnError(raw);
-      const failed = (retryStop) => ({ ...base, ok: false, response: null, failed: true, error, retryStop });
+      const failed = (retryStop) => ({ ...base, usage, ok: false, response: null, failed: true, error, retryStop });
       const cls = retry.classify(error) || {};
       if (!cls.transient) return failed(null);
       const classCap = Number.isInteger(cls.maxRetries) ? cls.maxRetries : Infinity;
@@ -703,6 +721,7 @@ export async function runTaskWithModel({
     if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
     if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
     if (retries.length && out && typeof out === 'object') out.retries = retries;
+    if (out && typeof out === 'object') out.usage = usage;
     throw out;
   } finally {
     await client.close();

@@ -418,6 +418,14 @@ function retriesLine(r) {
   return n ? oneLine(`retries: ${n} (${r.retryOutcome || 'unknown'})`) : null;
 }
 
+// result.usage as one line, or null when the job reported none.
+function usageLine(r) {
+  const u = r.usage;
+  if (!u || typeof u !== 'object') return null;
+  const n = (k) => Number(u[k]) || 0;
+  return oneLine(`usage: ${n('totalTokens')} tokens (in ${n('inputTokens')}, out ${n('outputTokens')}, reasoning ${n('reasoningTokens')}, cache read ${n('cacheReadTokens')}), ${n('modelRequestCount')} requests`);
+}
+
 // notes: extra lines after job_id (zcode_cancel's "already finished", the stale-reaper note).
 async function terminalResult(view, { notes = [] } = {}) {
   const { r, logOnly } = await resultOrFallback(view);
@@ -432,6 +440,8 @@ async function terminalResult(view, { notes = [] } = {}) {
   lines.push(...loginHint(r));
   const retries = retriesLine(r);
   if (retries) lines.push(retries);
+  const usage = usageLine(r);
+  if (usage) lines.push(usage);
   if (view.state === 'timeout' && (r.timeoutKind === 'idle' || r.timeoutKind === 'total')) {
     lines.push(`timeout: ${r.timeoutKind}`);
   }

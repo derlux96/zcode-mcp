@@ -398,6 +398,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     progress,
     retries,
     retryOutcome,
+    usage: (res && res.usage) || (error && error.usage) || null,
   };
 }
 
@@ -549,6 +550,7 @@ export async function runJob(dir, opts = {}) {
       stderr: redactText(cap(run.stderr)),
       durationMs: Date.now() - startedMs,
       ...(run.retries ? { retries: run.retries, retryOutcome: run.retryOutcome } : {}),
+      ...(run.usage ? { usage: run.usage } : {}),
     });
     setFinalStatus({
       state, sessionId, warnings, errorKind, finishedAt: now(),

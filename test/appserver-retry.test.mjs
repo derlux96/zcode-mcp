@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AppServerClient, AppServerError, runTaskWithModel, DEFAULT_CONTINUE_PROMPT } from '../src/appserver.mjs';
+import { AppServerClient, AppServerError, runTaskWithModel, addUsage, DEFAULT_CONTINUE_PROMPT } from '../src/appserver.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
 
 const fakeBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
@@ -375,4 +375,26 @@ test('class bookkeeping: delays and attempt k/N count within the class; history 
     [1, 'rate_limit', 1, 6], [2, 'rate_limit', 2, 6], [3, 'balance', 1, 2], [4, 'balance', 2, 2],
   ]);
   assert.deepEqual(res.retries.map((r) => [r.attempt, r.klass]), [[1, 'rate_limit'], [2, 'rate_limit'], [3, 'balance'], [4, 'balance']]);
+});
+
+test('addUsage: null stays null, missing fields become 0, adds sum', () => {
+  assert.equal(addUsage(null, undefined), null);
+  assert.equal(addUsage(null, 'x'), null);
+  const a = addUsage(null, { inputTokens: 10, totalTokens: 12 });
+  assert.deepEqual(a, { inputTokens: 10, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 12, modelRequestCount: 0 });
+  const b = addUsage(a, { inputTokens: 1, modelRequestCount: 1 });
+  assert.equal(b.inputTokens, 11);
+  assert.equal(b.totalTokens, 12);
+  assert.equal(b.modelRequestCount, 1);
+});
+
+test('usage is summed across the failed and the completed turn', async () => {
+  const { cwd } = setup('fail-429-then-ok');
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', providerId: 'p', modelId: 'm', timeoutMs: 10000,
+    transientRetry: { delaysMs: [1], jitter: 0, sleep: async () => {} },
+  });
+  assert.equal(res.usage.totalTokens, 210);
+  assert.equal(res.usage.inputTokens, 200);
+  assert.equal(res.usage.modelRequestCount, 2);
 });

@@ -402,12 +402,13 @@ function emitTurn(req, scripted = null) {
       payload: { assistantMessageId: 'msg_fake0001', delta: 'fake ', done: false, kind: 'reasoning_delta' },
     },
   });
+  const FAKE_USAGE = { inputTokens: 100, outputTokens: 5, totalTokens: 105, modelRequestCount: 1 };
   const FAILURES = { fail: 'fake model failure', 'rate-limit': '429 rate limit', 'auth-fail': 'project_token_login_failed' };
   const failMsg = FAILURES[MODE];
   if (scripted) {
     const tail = scripted.failure
-      ? { type: 'turn.failed', payload: { error: scripted.failure, turnPhase: 'model_request', inputId: `in_fake${n}` } }
-      : { type: 'turn.completed', payload: { response: `fake model task done after ${n} turn(s)`, resultType: 'success', inputId: `in_fake${n}` } };
+      ? { type: 'turn.failed', payload: { error: scripted.failure, turnPhase: 'model_request', usage: FAKE_USAGE, inputId: `in_fake${n}` } }
+      : { type: 'turn.completed', payload: { response: `fake model task done after ${n} turn(s)`, resultType: 'success', usage: FAKE_USAGE, inputId: `in_fake${n}` } };
     send({ method: 'session/event', params: { ...base, eventId: `evt_fake_${n}_3`, seq: 10 * n + 2, timestamp: Date.now(), ...tail } });
     return;
   }
@@ -420,6 +421,7 @@ function emitTurn(req, scripted = null) {
         payload: {
           error: { type: 'unknown_error', code: 'model_not_found', message: failMsg, detail: 'Model creation failed', underlyingErrorMessage: failMsg, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
           turnPhase: 'model_creation',
+          usage: FAKE_USAGE,
           inputId: 'in_fake0001',
         },
       }
@@ -431,7 +433,7 @@ function emitTurn(req, scripted = null) {
         payload: {
           response: MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
           tokenCount: 32485,
-          usage: { source: 'provider', modelRequestCount: 1, inputTokens: 32467, outputTokens: 18, totalTokens: 32485, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 14, webFetchRequests: 0, webSearchRequests: 0 },
+          usage: { source: 'provider', modelRequestCount: 1, inputTokens: 100, outputTokens: 5, totalTokens: 105, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,
           historyRoundCount: 1,
           duration: 12532,
