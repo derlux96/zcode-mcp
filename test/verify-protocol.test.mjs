@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzeEvents, answerShapes, summarizeProbeEvents, truncateText, answerReachedOutput, runControlProbes } from '../scripts/verify-protocol.mjs';
+import { analyzeEvents, answerShapes, summarizeProbeEvents, truncateText, answerReachedOutput, runControlProbes, startSession } from '../scripts/verify-protocol.mjs';
 
 test('analyzeEvents: unique sorted types, max gap, denied tools', () => {
   const r = analyzeEvents([
@@ -87,6 +87,26 @@ test('runControlProbes against the fake app-server (ask mode)', { timeout: 60000
     assert.ok(r.stop.stopResult || r.stop.error);
   } finally {
     for (const [k, v] of [['ZCODE_APPSERVER_BIN', saved.b], ['FAKE_APPSERVER_MODE', saved.m]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('startSession: closes the spawned app-server when setup fails', { timeout: 30000 }, async () => {
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const fake = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'fake-appserver.cjs');
+  const saved = { b: process.env.ZCODE_APPSERVER_BIN, d: process.env.FAKE_APPSERVER_CREATE_DELAY_MS };
+  process.env.ZCODE_APPSERVER_BIN = fake;
+  process.env.FAKE_APPSERVER_CREATE_DELAY_MS = '5000';
+  let child = null;
+  try {
+    await assert.rejects(startSession(process.cwd(), { timeoutMs: 300, onSpawn: (c) => { child = c; } }));
+    assert.ok(child && child.pid, 'child was spawned');
+    if (child.exitCode === null && child.signalCode === null) await new Promise((r) => child.once('exit', r));
+    assert.ok(child.exitCode !== null || child.signalCode !== null, 'child exited');
+  } finally {
+    for (const [k, v] of [['ZCODE_APPSERVER_BIN', saved.b], ['FAKE_APPSERVER_CREATE_DELAY_MS', saved.d]]) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }

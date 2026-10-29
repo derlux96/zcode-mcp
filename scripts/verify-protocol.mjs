@@ -87,8 +87,9 @@ export function summarizeProbeEvents(events) {
   };
 }
 
-async function startSession(cwd, clientOpts = {}) {
+export async function startSession(cwd, clientOpts = {}) {
   const client = new AppServerClient({ binPath: resolveBin(), cwd, ...clientOpts });
+  try {
   await client.settle();
   const created = await client.request('session/create', {
     workspace: { workspacePath: cwd, workspaceKey: cwd },
@@ -103,6 +104,10 @@ async function startSession(cwd, clientOpts = {}) {
     ...(current ? { modelSelection: { providerId: current.providerId, modelId: current.modelId, options: current.options || {} } } : {}),
   });
   return { client, sessionId, send };
+  } catch (e) {
+    await client.close(); // do not leak the spawned app-server when setup fails
+    throw e;
+  }
 }
 
 const errInfo = (e) => ({ message: String(e && e.message), code: e && e.code });
@@ -131,9 +136,14 @@ async function probeSteer(cwd, o) {
     } catch (e) {
       steerResult = { error: errInfo(e) };
     }
-    await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
+    let waitError = null;
+    try {
+      await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
+    } catch (e) {
+      waitError = errInfo(e);
+    }
     await sleep(300);
-    return finish(s.client, { v4CommandResult: steerResult });
+    return finish(s.client, { v4CommandResult: steerResult, ...(waitError ? { waitError } : {}) });
   } catch (e) {
     return { error: errInfo(e) };
   } finally {
