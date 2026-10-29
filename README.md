@@ -109,7 +109,7 @@ Details: [INSTALL.md](INSTALL.md). Setup done by an AI model: [llms-install.md](
 | `zcode_status` | With `job_id` (+ optional `wait_ms`, max 120000, waits for a change of state; heartbeats and progress do not end the wait): state (`status: running` or `status: needs_input` with the question), elapsed time, last activity, warnings, files changed so far, progress lines; a finished job shows its full result. Without `job_id`: all jobs (newest first) and the open worktrees. |
 | `zcode_result` | The result of a job, repeatable; for a running job its current status. |
 | `zcode_cancel` | Stops a running job (protocol path: ZCode is asked to stop first, up to 10 s; then ZCode and its children get SIGTERM, then SIGKILL) and returns its final state with the changes so far (not rolled back). A finished job is returned unchanged with `already finished`. |
-| `zcode_send` | Sends `text` to a running protocol-path job: answers ZCode's question while the job is `needs_input`, otherwise steers the running turn (or, if ZCode queues it, a follow-up turn; an accepted steer shows `delivery: guide` or `queue`). Answers `send: accepted`, `rejected`, `not_supported` (the last two are errors) or `queued` (delivered later). |
+| `zcode_send` | Sends `text` to a running protocol-path job: answers ZCode's question while the job is `needs_input`, otherwise steers the running turn (or, if that turn ends before taking it, a follow-up turn; an accepted steer shows `delivery: guide`). Answers `send: accepted`, `rejected`, `not_supported` (the last two are errors) or `queued` (delivered later). |
 | `zcode_sessions` | ZCode sessions that ran through this server (`sess_…` ids are resumable). |
 
 Cancelling a waiting `zcode_run`/`zcode_status` call (MCP `notifications/cancelled`) only ends
@@ -139,10 +139,10 @@ create no job.
 ### Job control (protocol path)
 
 - **Steering and answers (`zcode_send`)**: `zcode_send {job_id, text}` steers a running job with a
-  short message. The job's session is switched to ZCode's `guide` follow-up mode first, so the text
-  normally reaches the running turn (`delivery: guide`). If ZCode queues it instead
-  (`delivery: queue`), it is delivered as a follow-up turn once the current turn ends, and the job's
-  result is that last turn's output. A steer still queued when the job is cancelled is not sent; the
+  short message. It is sent with ZCode's `guide` delivery (`delivery: guide`), so ZCode works it into
+  the running turn at the turn's next step. If the turn ends before that, ZCode holds the text and it
+  is delivered as a follow-up turn, and the job's result is that last turn's output. A steer still
+  held when the job is cancelled is not sent; the
   result then carries the warning `steers_not_delivered:<n>`. When ZCode asks the user a question,
   the job goes to the non-terminal state `needs_input`; `zcode_status` then shows `question:` (each
   question as `<question> [options: a | b]`, several joined by ` / `), `input_deadline:` and the hint

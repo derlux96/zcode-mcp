@@ -218,16 +218,40 @@ undefined)`, a string (trimmed) or a string[] (joined with ", "). Exact answer f
 zcode-delegate answers with the text keyed by every question (`buildUserInputAnswer`), declines with
 a reason when nobody answers within `input_timeout_ms`, and cancels when it has no listener.
 
-**Steer routing (v4/command sendText).** A `sendText` during a running turn is accepted with
-`{status:"accepted", result:{type:"inputAccepted", delivery}}` and a `turn.steerQueued` event. The
-routing is `session followupMode === "guide" ? "guide" : "enqueue"`; the default followupMode is
-`"queue"` (with `queueAutoDrain` true). Only `"guide"` inputs are injected into the running turn
-(`turn.steerDrained`). The probe's steer (followupMode left at its default) came back
-`delivery:"queue"`, never drained, and only one turn ran: after a turn completes with queued inputs
-ZCode sets autoDrain false and **holds** the queue (no automatic new turn).
-v4 command types also include `setFollowupMode`, `setAutoDrain` and `sendQueuedNow {queueItemId, …}`.
-zcode-delegate sends `setFollowupMode` with `payload: {mode: "guide"}` before the first steer and,
-when steers are still held after a completed turn, `setAutoDrain` with `payload: {autoDrain: true}`
-(falling back to a `session/send` of the held texts when no turn starts within 10 s). These payload
-field names (`mode`, `autoDrain`) are **inferred** from the bundle, not yet verified; the updated
-steer probe records the raw results to confirm them.
+**v4/command envelope.** `{commandId, clientId, sessionId, baseRevision?: number, baseLogEpoch?:
+string, type, payload, issuedAt}`. `baseRevision` is **top level**, not part of `payload`. Every
+answer (accepted, rejected, stale) carries `revisionAtDecision`, the conversation's current
+revision; it grows during a turn (a `sendText` ack mid-turn showed 4). `session/event` envelopes do
+**not** carry it, so the latest command answer is the only revision source.
+
+**CAS commands.** `setFollowupMode {mode: "queue"|"guide"}`, `setAutoDrain {autoDrain: boolean}`,
+`sendQueuedNow {queueItemId}` (and others) are compare-and-set: without `baseRevision` they are
+rejected `{status:"rejected", reasonCode:"proto.invalidPayload"}` with the misleading message "CAS
+commands require baseRevision and baseLogEpoch" (these three need only `baseRevision`). A wrong
+`baseRevision` answers `{status:"stale", reasonCode:"proto.staleRevision", revisionAtDecision:
+<current>}`; retrying once with that value works.
+
+**Steer routing (sendText).** Payload `{text, attachments?, requestedDelivery?: "startNow"|"queue"|"guide",
+heldQueueDisposition?: "clearQueueAndSend"|"keepQueueAndSend", expectedHeldQueueItemIds?,
+modelSelection?, …}`; `sendText` is no CAS command. The earlier `delivery: {requested: "guide"}` is
+**ignored** (the routing default `"queue"` applies), which is why the first probe's steer was never
+drained. With `requestedDelivery: "guide"` the input is injected into the running turn at its next
+model step, confirmed only by a `turn.steerDrained` event; `setFollowupMode` is not needed. The ack
+of an accepted `sendText` is `{status:"accepted", revisionAtDecision: N, result:{type:"inputAccepted",
+delivery:"queue"|"startNow", inputId}}`: a guide steer also acks `delivery:"queue"` (it joined the
+pending list). `requestedDelivery: "startNow"` during a running turn **preempts** (cancels) that turn;
+it is not a steer. When a turn ends with inputs still queued, ZCode sets `queueAutoDrain` false and
+**holds** them (no automatic new turn). They start with CAS `setAutoDrain {autoDrain: true}` or
+`sendQueuedNow`. A new `sendText` while the queue is held gets routing `"choice"` and needs
+`heldQueueDisposition` (`"keepQueueAndSend"` or `"clearQueueAndSend"`).
+
+zcode-delegate steers with `sendText {text, requestedDelivery: "guide"}` and counts
+`turn.steerDrained` events against its accepted steers (oldest first). Steers without a drain when
+the turn completes are delivered as a follow-up turn: CAS `setAutoDrain {autoDrain: true}` with
+`baseRevision` = the latest `revisionAtDecision` (one retry on stale), then the turn ZCode starts
+within 10 s; when that is rejected or no turn starts, one `sendText {text: <steers joined by a blank
+line>, requestedDelivery: "startNow", heldQueueDisposition: "clearQueueAndSend"}` (dropping ZCode's
+held copies, so nothing runs twice), and as a last resort a `session/send` of the joined texts. No
+follow-up is sent after a stop. `scripts/verify-protocol.mjs --real --controls` probes the guide
+steer (`steerDrained`, and whether the marker word PINEAPPLE reaches the answer) and the auto-drain
+path (a default-delivery input held at turn end, then `setAutoDrain` with `baseRevision`).
