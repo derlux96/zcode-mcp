@@ -69,6 +69,8 @@
 //   fail-zh-model-creation  the real model_not_found payload (localized message,
 //             detail "Model creation failed")
 //   fail-auth             every turn fails with an HTTP 401 invalid api key
+//   fail-status-401-always  every turn fails with only statusCode 401 (no text
+//             field: the cause is the HTTP status alone)
 //   fail-model-request-failed  every turn fails with the generic
 //             "Model request failed." (what a wrong baseUrl produces)
 //   fail-model-creation   every turn fails with "Model creation failed"
@@ -451,6 +453,7 @@ const FAIL_MODES = {
   'fail-1113-always': [plain(MSG_1113), Infinity],
   'fail-status-1113-always': [{ type: 'provider_error', statusCode: 429, statusMessage: '[1113][Insufficient balance or no resource package. Please recharge.][req_fake]', retryable: false }, Infinity],
   'fail-auth': [plain('HTTP 401 Unauthorized: invalid api key'), Infinity],
+  'fail-status-401-always': [{ statusCode: 401 }, Infinity],
   'fail-model-request-failed': [plain('Model request failed.'), Infinity],
   'fail-model-creation': [plain('Model creation failed'), Infinity],
   'fail-zh-model-creation': [{ type: 'unknown_error', code: 'model_not_found', message: ZH_NOT_FOUND, detail: 'Model creation failed', underlyingErrorMessage: ZH_NOT_FOUND, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' }, Infinity],

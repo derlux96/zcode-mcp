@@ -277,12 +277,10 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   let eventSession = null;
   let lastEventMs = 0;
   let lastWriteMs = 0;
-  let dirty = false;
   let flushTimer = null;
+  // Called at once or from the timer an event armed: there is always something to write.
   const flush = () => {
     flushTimer = null;
-    if (!dirty) return;
-    dirty = false;
     lastWriteMs = Date.now();
     try {
       setStatus({ lastActivityAt: new Date(lastEventMs).toISOString(), progress: progress.slice() });
@@ -325,7 +323,6 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     }
     const line = describeEvent(event);
     if (line) addProgress(line, lastEventMs);
-    dirty = true;
     if (flushTimer) return;
     const wait = lastWriteMs + ACTIVITY_WRITE_MS - lastEventMs;
     if (wait <= 0) {
@@ -376,7 +373,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   const replyQuestion = (reply) => {
     let r;
     try { r = reply(); } catch { r = { status: 'rejected', reason: 'no_question' }; }
-    if (r && r.status === 'accepted') {
+    if (r.status === 'accepted') { // answer/decline/the catch always give an object
       questions.shift();
       showQuestion();
       return true;
@@ -400,7 +397,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   const steer = async (text) => {
     try {
       const r = await control.steer(text);
-      return r && r.status ? r : { status: 'rejected', reason: 'error' };
+      return r.status ? r : { status: 'rejected', reason: 'error' }; // a non-object r throws: caught below
     } catch {
       return { status: 'rejected', reason: 'error' };
     }
@@ -579,7 +576,6 @@ export async function runJob(dir, opts = {}) {
   const outputLogPath = join(dir, 'output.log');
   let heartbeat = null;
   let cancelPoll = null;
-  let finished = false;
   // gracefulStop: set by runProtocol while it runs (cancel file -> session/stop first).
   const hooks = { gracefulStop: null };
   const inbox = { seq: 0 }; // highest inbox seq handled
@@ -589,7 +585,7 @@ export async function runJob(dir, opts = {}) {
   process.on('SIGINT', abort);
   if (opts.signal) {
     if (opts.signal.aborted) abort();
-    else opts.signal.addEventListener('abort', abort, { once: true });
+    else opts.signal.addEventListener('abort', abort);
   }
   try {
     const identity = opts.identity || getProcessIdentity;
@@ -678,7 +674,6 @@ export async function runJob(dir, opts = {}) {
 
     if (managerFinal) {
       if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId); // only if still ours
-      finished = true;
       return;
     }
     // Lock release precedes the terminal status so the job counts as alive until the lock is gone.
@@ -708,14 +703,12 @@ export async function runJob(dir, opts = {}) {
       ...(run.retries ? { retry: null } : {}),
       ...(run.controlled ? { question: null, inputDeadline: null } : {}),
     });
-    finished = true;
   } catch (err) {
-    if (!finished) {
-      try {
-        writeCrashState(dir, job, err, { startedMs, warnings, onStatus });
-      } catch {
-        // State directory unusable: nothing more can be recorded.
-      }
+    // The try ends with the terminal writes: a throw always comes before they are complete.
+    try {
+      writeCrashState(dir, job, err, { startedMs, warnings, onStatus });
+    } catch {
+      // State directory unusable: nothing more can be recorded.
     }
   } finally {
     if (heartbeat) clearInterval(heartbeat);
@@ -747,7 +740,7 @@ export function runnerEnvOptions(env = process.env) {
   let retryDelaysMs;
   if (testing && typeof env.ZCODE_MCP_TEST_RETRY_DELAYS_MS === 'string') {
     const list = env.ZCODE_MCP_TEST_RETRY_DELAYS_MS.split(',').map((v) => (v.trim() === '' ? NaN : Number(v)));
-    if (list.length && list.every((n) => Number.isInteger(n) && n >= 0)) retryDelaysMs = list;
+    if (list.every((n) => Number.isInteger(n) && n >= 0)) retryDelaysMs = list; // split() yields >= 1 entry
   }
   return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0, retryDelaysMs };
 }
@@ -760,10 +753,8 @@ if (isMain(import.meta.url)) {
   const [dir, token] = process.argv.slice(2);
   const job = dir ? readJson(join(dir, 'job.json')) : null;
   if (!job || typeof token !== 'string' || token === '' || job.token !== token) process.exit(2);
-  let crashing = false;
+  // Synchronous to the end (process.exit), so it cannot be re-entered.
   const onFatal = (err) => {
-    if (crashing) process.exit(1);
-    crashing = true;
     try { killActiveChild(); } catch { /* proceed to the crash state */ }
     try {
       writeCrashState(dir, job, err, { startedMs: Date.parse(readStatus(dir)?.startedAt) });

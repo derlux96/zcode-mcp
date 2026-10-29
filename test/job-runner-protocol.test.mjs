@@ -224,6 +224,8 @@ test('cancel file aborts a protocol job: state cancelled, app-server process gon
   assert.equal(res.state, 'cancelled');
   assert.equal(res.errorKind, 'cancelled');
   assert.equal(res.timeoutKind, 'cancelled');
+  assert.deepEqual(res.retries, []);
+  assert.equal(res.retryOutcome, null); // no retries: nothing to relabel as cancelled
   assert.equal(readStatus(dir).state, 'cancelled');
   await waitFor(() => !alive(st.childPid), 2000);
 });
@@ -259,6 +261,8 @@ test('progress keeps the last 5 describeEvent lines and events.log has them', as
 
 test('describeEvent unit cases', () => {
   assert.equal(describeEvent({ type: 'tool.updated', payload: { toolName: 'Write', kind: 'scheduled' } }), 'tool Write scheduled');
+  assert.equal(describeEvent({ type: 'tool.updated', payload: { toolName: '', kind: '' } }), 'tool  ');
+  assert.equal(describeEvent({ type: 'tool.updated' }), 'tool ? ?');
   assert.equal(describeEvent({ type: 'turn.started', payload: {} }), 'turn.started');
   assert.equal(describeEvent({ type: 'turn.completed', payload: { response: 'x' } }), 'turn.completed');
   assert.equal(describeEvent({ type: 'turn.failed', payload: { error: {} } }), 'turn.failed');
@@ -584,6 +588,8 @@ test('cancel while needs_input ends the job cancelled', async () => {
   assert.equal(res.sessionId, 'sess_fakeB1');
   const st = readStatus(dir);
   assert.equal(st.state, 'cancelled');
+  assert.equal(st.question, null);
+  assert.equal(st.inputDeadline, null);
 });
 
 test('an inbox entry written before the session exists is handled only once control is up', async () => {
@@ -753,4 +759,110 @@ test('a question pending when the turn fails transiently ends with that attempt:
   assert.equal(res.retries.length, 1);
   const st = readStatus(dir);
   assert.equal(st.question ?? null, null);
+});
+
+test('the CLI fallback runs without the idle limit (the CLI is silent until it ends)', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'no-model';
+  process.env.FAKE_ZCODE_MODE = 'slow-start'; // silent for 2 s, then completes
+  const { dir } = mkJob({ cwd: tempCwd(), idle_timeout_ms: 600 });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.equal(res.sessionId, 'sess_slow001');
+});
+
+test('a turn that never got under way: one session/stop for a lasting cancel file; early inbox entries wait', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'nosendack';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd });
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'early note' });
+  const done = runJob(dir, { heartbeatMs: 50, stopGraceMs: 1200 });
+  await controlReady(dir);
+  await waitFor(() => logged(log).some((m) => m.method === 'session/send'));
+  await new Promise((r) => setTimeout(r, 600)); // several inbox polls with control up
+  writeFileSync(join(dir, 'cancel'), ''); // stays there: polled every 250 ms
+  await done;
+  assert.equal(readResult(dir).state, 'cancelled');
+  assert.equal(logged(log).filter((m) => m.method === 'session/stop').length, 1);
+  assert.equal(logged(log).some((m) => m.method === 'v4/command'), false, 'no steer before the turn is under way');
+  const ack = readAck(dir, seq);
+  assert.equal(ack.status, 'rejected');
+  assert.equal(ack.reason, 'finished');
+});
+
+test('stopGraceMs 0 kills right after session/stop', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'nosendack';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd });
+  const done = runJob(dir, { heartbeatMs: 50, stopGraceMs: 0 });
+  await controlReady(dir);
+  await waitFor(() => logged(log).some((m) => m.method === 'session/send'));
+  const t0 = Date.now();
+  writeFileSync(join(dir, 'cancel'), '');
+  await done;
+  assert.ok(Date.now() - t0 < 5000, `ended after ${Date.now() - t0} ms (STOP_GRACE_MS is ${STOP_GRACE_MS})`);
+  assert.equal(readResult(dir).state, 'cancelled');
+});
+
+test('an inbox entry is steered once even when the steer answer is slower than the poll', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  process.env.FAKE_APPSERVER_STEER_ACK_DELAY_MS = '700';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  try {
+    const { dir } = mkJob({ cwd });
+    const done = runJob(dir, { heartbeatMs: 50 });
+    await controlReady(dir);
+    const seq = writeInboxEntry(dir, { kind: 'send', text: 'once only' });
+    const ack = await waitFor(() => readAck(dir, seq), 5000);
+    assert.equal(ack.status, 'accepted');
+    await done;
+    const steers = logged(log).filter((m) => m.method === 'v4/command' && m.params.type === 'sendText');
+    assert.equal(steers.length, 1);
+  } finally {
+    delete process.env.FAKE_APPSERVER_STEER_ACK_DELAY_MS;
+  }
+});
+
+test('input_timeout_ms 1 declines the question at once', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const { dir } = mkJob({ cwd: tempCwd(), input_timeout_ms: 1 });
+  const backstop = setTimeout(() => writeFileSync(join(dir, 'cancel'), ''), 4000);
+  try {
+    await runJob(dir, { heartbeatMs: 50 });
+  } finally {
+    clearTimeout(backstop);
+  }
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.equal(res.output, `AskUserQuestion was declined: ${INPUT_TIMEOUT_ANSWER}`);
+});
+
+test('an input_timeout_ms that is not a positive integer falls back to the default', async () => {
+  for (const bad of [0, -5, 1.5]) {
+    process.env.FAKE_APPSERVER_MODE = 'ask';
+    const { dir } = mkJob({ cwd: tempCwd(), input_timeout_ms: bad });
+    const done = runJob(dir, { heartbeatMs: 50 });
+    const st = await waitFor(() => (readStatus(dir)?.state === 'needs_input' ? readStatus(dir) : null));
+    await new Promise((r) => setTimeout(r, 200)); // a bad timeout would have declined by now
+    assert.equal(readStatus(dir).state, 'needs_input', `input_timeout_ms ${bad}`);
+    assert.ok(Date.parse(st.inputDeadline) > Date.now() + DEFAULT_INPUT_TIMEOUT_MS - 60000, `input_timeout_ms ${bad}`);
+    writeFileSync(join(dir, 'cancel'), '');
+    await done;
+    assert.equal(readResult(dir).state, 'cancelled');
+  }
+});
+
+test('a failure known only by its HTTP status is classified from that status', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'fail-status-401-always';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'auth');
 });

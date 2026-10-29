@@ -62,7 +62,14 @@ test('recovered after one 429: completed, history, warning, continue sent into t
   const { cwd, sends } = setup('fail-429-then-ok');
   const { dir } = mkJob({ cwd });
   const retryPatches = [];
-  await runJob(dir, { retryDelaysMs: [30], onStatus: (_s, p) => { if ('retry' in p) retryPatches.push(p.retry); } });
+  let clearedWhileRunning = false;
+  await runJob(dir, {
+    retryDelaysMs: [30],
+    onStatus: (_s, p) => {
+      if ('retry' in p) retryPatches.push(p.retry);
+      if (p.retry === null && !p.state) clearedWhileRunning = true; // not the final status write
+    },
+  });
   const res = readResult(dir);
   assert.equal(res.state, 'completed');
   assert.equal(res.output, 'fake model task done after 2 turn(s)');
@@ -82,6 +89,10 @@ test('recovered after one 429: completed, history, warning, continue sent into t
   assert.equal(retryPatches[0].delayMs, r.delayMs);
   assert.match(retryPatches[0].reason, /HTTP 429/);
   assert.ok(retryPatches.includes(null), 'retry cleared');
+  assert.ok(clearedWhileRunning, 'retry cleared when the next turn started');
+  // usage sums both turns (the fake reports 105 tokens per turn).
+  assert.equal(res.usage.totalTokens, 210);
+  assert.equal(res.usage.modelRequestCount, 2);
   const st = readStatus(dir);
   assert.equal(st.retry, null);
   assert.equal(st.state, 'completed');
@@ -213,6 +224,20 @@ test('cancel during the backoff ends cancelled within a second and leaves no pro
   assert.equal(res.retryOutcome, 'cancelled');
   assert.equal(readStatus(dir).retry, null);
   await waitFor(() => !alive(st.childPid), 2000);
+});
+
+test('an abort during the backoff keeps the usage of the failed turn', async () => {
+  const { cwd } = setup('fail-429-always');
+  const { dir } = mkJob({ cwd, timeout_ms: 0 });
+  const ctl = new AbortController();
+  const done = runJob(dir, { retryDelaysMs: [60000], heartbeatMs: 50, signal: ctl.signal });
+  await waitFor(() => readStatus(dir)?.retry);
+  ctl.abort();
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'cancelled');
+  assert.equal(res.usage.totalTokens, 105);
+  assert.equal(res.usage.modelRequestCount, 1);
 });
 
 // --- validation and plumbing ---
