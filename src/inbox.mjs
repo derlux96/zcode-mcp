@@ -18,7 +18,7 @@ function listEntrySeqs(inbox) {
   const seqs = [];
   for (const n of names) {
     const m = ENTRY_RE.exec(n);
-    if (m) seqs.push(parseInt(m[1], 10));
+    if (m) seqs.push(Number(m[1]));
   }
   return seqs.sort((a, b) => a - b);
 }
@@ -57,17 +57,17 @@ export function writeInboxEntry(dir, entry) {
 // first reserved-but-unfilled entry (so a caller advancing its high-water mark
 // never skips a message that is still being written). An unfilled entry older
 // than staleMs is abandoned and skipped. Ack and *.tmp files are never listed.
-export function readPending(dir, afterSeq, { staleMs = INBOX_STALE_RESERVATION_MS } = {}) {
+export function readPending(dir, afterSeq, { staleMs = INBOX_STALE_RESERVATION_MS, now = Date.now } = {}) {
   const inbox = inboxDir(dir);
   const out = [];
   for (const seq of listEntrySeqs(inbox)) {
     if (seq <= afterSeq) continue;
     const file = join(inbox, `${name(seq)}.json`);
     const e = readJson(file);
-    if (!e || typeof e !== 'object' || typeof e.text !== 'string') {
-      let age = 0;
-      try { age = Date.now() - statSync(file).mtimeMs; } catch { continue; }
-      if (age > staleMs) continue;
+    if (typeof e?.text !== 'string') {
+      let mtimeMs;
+      try { ({ mtimeMs } = statSync(file)); } catch { continue; }
+      if (now() - mtimeMs > staleMs) continue;
       break;
     }
     out.push({ seq, kind: e.kind, text: e.text, createdAt: e.createdAt });
@@ -111,7 +111,7 @@ export function waitAck(dir, seq, ms, { signal } = {}) {
     };
     if (signal) {
       if (signal.aborted) return done(null);
-      signal.addEventListener('abort', onAbort, { once: true });
+      signal.addEventListener('abort', onAbort);
     }
     tick();
   });

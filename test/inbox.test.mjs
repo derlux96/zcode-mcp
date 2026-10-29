@@ -131,11 +131,33 @@ test('readPending on a missing inbox returns []', () => {
   assert.deepEqual(readPending(tmp(), 0), []);
 });
 
+test('readPending orders entries by seq whatever order they were created in', () => {
+  const d = tmp();
+  const inbox = join(d, 'inbox');
+  mkdirSync(inbox, { recursive: true });
+  for (const seq of [2, 10, 3, 1]) writeFileSync(join(inbox, `${String(seq).padStart(6, '0')}.json`), filled(seq, `t${seq}`));
+  assert.deepEqual(readPending(d, 0).map((e) => e.seq), [1, 2, 3, 10]);
+});
+
+test('an unfilled reservation is stale only once it is older than staleMs', () => {
+  const d = tmp();
+  const inbox = join(d, 'inbox');
+  mkdirSync(inbox, { recursive: true });
+  const f1 = join(inbox, '000001.json');
+  writeFileSync(f1, 'null');
+  writeFileSync(join(inbox, '000002.json'), filled(2, 'b'));
+  const t = 1700000000000;
+  utimesSync(f1, t / 1000, t / 1000);
+  assert.deepEqual(readPending(d, 0, { staleMs: 1000, now: () => t + 1000 }).map((e) => e.seq), []);
+  assert.deepEqual(readPending(d, 0, { staleMs: 1000, now: () => t + 1001 }).map((e) => e.seq), [2]);
+});
+
 test('invalid input throws TypeError', () => {
   const d = tmp();
   assert.throws(() => writeInboxEntry(d, { kind: 'send', text: 5 }), TypeError);
   assert.throws(() => writeInboxEntry(d, { kind: 'stop', text: 'x' }), TypeError);
-  assert.throws(() => writeInboxEntry(d, null), TypeError);
+  assert.throws(() => writeInboxEntry(d, null), { name: 'TypeError', message: 'inbox entry must be an object' });
+  assert.throws(() => writeInboxEntry(d, 'send'), { name: 'TypeError', message: 'inbox entry must be an object' });
   assert.deepEqual(readPending(d, 0), []);
 });
 
@@ -147,6 +169,8 @@ test('readAck / writeAck round-trip', () => {
   assert.equal(a.status, 'rejected');
   assert.equal(a.reason, 'nope');
   assert.equal(typeof a.at, 'string');
+  writeFileSync(join(d, 'inbox', '000002.ack.json'), '"accepted"');
+  assert.equal(readAck(d, 2), null);
 });
 
 test('waitAck returns null after the timeout', async () => {

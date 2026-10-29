@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { redactText, redactValue, isSensitiveKey, REDACTED } from '../src/redact.mjs';
+import { redactText, redactValue, isSensitiveKey, isSensitiveParam, REDACTED } from '../src/redact.mjs';
 
 test('REDACTED marker', () => assert.equal(REDACTED, '[REDACTED]'));
 
@@ -80,4 +80,11 @@ test('high-entropy rule leaves session ids, UUIDs, long identifiers and hex SHAs
 test('high-entropy rule needs upper case, lower case and digits together', () => {
   assert.equal(redactText('x Zk3Jq9XvB2nLm8Rt4Yw7Pc1Hd6Fs5Gu0AeIoKbNxQz y'), 'x [REDACTED] y');
   assert.equal(redactText('ghp_Zk3Jq9XvB2nLm8Rt4Yw7Pc1Hd6Fs5Gu0AeIoKb'), '[REDACTED]');
+});
+
+test('isSensitiveParam: substring match on names, never on non-strings', () => {
+  assert.equal(isSensitiveParam('X-Api-Key'), true);
+  assert.equal(isSensitiveParam('page'), false);
+  assert.equal(isSensitiveParam(undefined), false);
+  assert.equal(isSensitiveParam(42), false);
 });
