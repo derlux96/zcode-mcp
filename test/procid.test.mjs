@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { getProcessIdentity, matchesIdentity, identityAlive, signalGroup } from '../src/procid.mjs';
+import {
+  getProcessIdentity, matchesIdentity, identityAlive, signalGroup, groupHasMembers,
+} from '../src/procid.mjs';
 
 async function withChild(cmd, args, fn) {
   const child = spawn(cmd, args, { stdio: 'ignore' });
@@ -99,7 +101,20 @@ test('the same live pid has the same start under TZ=UTC and TZ=Asia/Tokyo', asyn
 const psFailure = (props) => () => { throw Object.assign(new Error('ps failed'), props); };
 
 test('getProcessIdentity: ps exit 1 with empty output means gone (null)', () => {
-  assert.equal(getProcessIdentity(4242, { exec: psFailure({ status: 1, stdout: '' }) }), null);
+  for (const stdout of ['', ' \n', Buffer.from(''), undefined, null]) {
+    assert.equal(getProcessIdentity(4242, { exec: psFailure({ status: 1, stdout }) }), null, String(stdout));
+  }
+  assert.deepEqual(getProcessIdentity(4242, { exec: psFailure({ status: 1, stdout: 'junk' }) }), { pid: 4242, unknown: true });
+});
+
+test('getProcessIdentity: ps failing only for the command field yields { unknown: true }', () => {
+  const exec = (cmd, args) => {
+    if (args.includes('lstart=')) return 'Thu Oct 15 10:00:00 2026\n';
+    throw Object.assign(new Error('fork failed'), { code: 'EAGAIN' });
+  };
+  assert.deepEqual(getProcessIdentity(4242, { exec }), { pid: 4242, unknown: true });
+  assert.equal(matchesIdentity({ pid: 4242, start: 'Thu Oct 15 10:00:00 2026' }, { exec }), false);
+  assert.equal(identityAlive({ pid: 4242, start: 'Thu Oct 15 10:00:00 2026' }, { exec }), true);
 });
 
 test('getProcessIdentity: a ps spawn failure yields { unknown: true }', () => {
@@ -129,4 +144,30 @@ test('ps runs without width truncation of the command', async () => {
     const id = getProcessIdentity(child.pid);
     assert.ok(id.command.includes('TAILTOKEN'));
   });
+});
+
+test('groupHasMembers probes only groups above 1; EPERM counts as members, ESRCH as none', () => {
+  const calls = [];
+  const fake = (code) => ({
+    kill: (p, sig) => { calls.push([p, sig]); if (code) throw Object.assign(new Error(code), { code }); },
+  });
+  for (const bad of [1, 0, -1, -5, 2.5, NaN, '12', undefined]) {
+    assert.equal(groupHasMembers(bad, fake()), false, String(bad));
+  }
+  assert.deepEqual(calls, [], 'never signalled');
+  assert.equal(groupHasMembers(2, fake()), true);
+  assert.equal(groupHasMembers(4242, fake('EPERM')), true);
+  assert.equal(groupHasMembers(4242, fake('ESRCH')), false);
+  assert.deepEqual(calls, [[-2, 0], [-4242, 0], [-4242, 0]]);
+});
+
+test('bootTimeMs caches only the real sysctl answer; an injected exec bypasses the cache', async () => {
+  const fresh = await import(`../src/procid.mjs?boot=${Date.now()}`); // an empty cache
+  const sample = () => '{ sec = 1792000000, usec = 0 }';
+  assert.equal(fresh.bootTimeMs({ exec: sample }), 1792000000 * 1000);
+  const real = fresh.bootTimeMs();
+  assert.ok(real === null || (real > 0 && real < Date.now()), String(real));
+  assert.notEqual(real, 1792000000 * 1000, 'the injected answer was not cached');
+  assert.equal(fresh.bootTimeMs(), real);
+  assert.equal(fresh.bootTimeMs({ exec: () => '{ sec = 5 }' }), 5000);
 });

@@ -7,7 +7,9 @@ import {
 import { join } from 'node:path';
 import { makeTempDir, removeDir } from './helpers.mjs';
 import { reap, removeJobDir } from '../src/reaper.mjs';
-import { createJobDir, patchStatus, readJson, readResult, readStatus, stateHome, jobsRoot, writeResult } from '../src/jobstore.mjs';
+import {
+  createJobDir, newJobId, patchStatus, readJson, readResult, readStatus, stateHome, jobsRoot, writeResult,
+} from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey } from '../src/locks.mjs';
 import { getProcessIdentity, matchesIdentity, identityAlive, bootTimeMs } from '../src/procid.mjs';
 import { signalJob } from '../src/jobs.mjs';
@@ -483,4 +485,116 @@ test('bootTimeMs parses kern.boottime and falls back to null', () => {
     const real = bootTimeMs();
     assert.ok(real > 0 && real < Date.now());
   }
+});
+
+test('durationMs of a lost job counts from its recorded start', async () => {
+  const j = handJob({ status: deadRunner({ startedAt: new Date(Date.now() - 5000).toISOString() }) });
+  assert.deepEqual((await reap(GRACE)).lost, [j.jobId]);
+  const { durationMs } = readResult(j.dir);
+  assert.ok(durationMs >= 5000 && durationMs < 60000, String(durationMs));
+});
+
+test('a leftover group gets the kill grace between SIGTERM and SIGKILL', async () => {
+  const child = spawnSleep(); // test-owned group; the fake signal below never reaches it
+  const j = handJob({ status: deadRunner({ childPid: child, childPgid: child, childStart: getProcessIdentity(child).start }) });
+  const sent = [];
+  const signalOverride = (pgid, sig) => { sent.push([pgid, sig, Date.now()]); return true; };
+  const r = await reap({ killGraceMs: 400, confirmMs: 20, signalOverride });
+  assert.deepEqual(r.lost, [j.jobId]);
+  assert.deepEqual(sent.map(([p, sig]) => [p, sig]), [[child, 'SIGTERM'], [child, 'SIGKILL']]);
+  assert.ok(sent[1][2] - sent[0][2] >= 400, `grace ${sent[1][2] - sent[0][2]} ms`);
+  assert.equal(alive(child), true);
+});
+
+test('the reaper never signals the runner of a job it judges lost', async () => {
+  const j = await liveJob(); // the runner is alive for real; only the reaper's sample says otherwise
+  const sent = [];
+  const r = await reap({ ...GRACE, identityOverride: () => false, signalOverride: (p, sig) => { sent.push([p, sig]); return true; } });
+  assert.deepEqual(r.lost, [j.jobId]);
+  assert.deepEqual(sent, []);
+});
+
+// Identity samples per lost candidate: 1-2 confirm, 3 before SIGTERM, 4 after the grace (only
+// when a group was signalled), then one before the lost result is written.
+test('a runner that passes the identity check again is never recorded as lost', async () => {
+  const aliveFrom = (n) => { let calls = 0; return () => ++calls >= n; };
+  const signalOverride = (p, sig) => { sent.push([p, sig]); return true; };
+  let sent = [];
+  // Alive again before SIGTERM: nothing signalled, the lock stays.
+  const a = handJob({ status: deadRunner(), lock: true });
+  assert.deepEqual(await reap({ ...GRACE, identityOverride: aliveFrom(3), signalOverride }), { lost: [], deleted: [], killed: [] });
+  assert.equal(JSON.parse(readFileSync(lockFile(a.lockCwd), 'utf8')).jobId, a.jobId);
+  assert.equal(readStatus(a.dir).state, 'running');
+  removeDir(a.dir);
+  // Alive again after the grace: no SIGKILL, the lock stays.
+  const child = spawnSleep();
+  const b = handJob({ lock: true, status: deadRunner({ childPid: child, childPgid: child, childStart: getProcessIdentity(child).start }) });
+  sent = [];
+  const rb = await reap({ ...GRACE, identityOverride: aliveFrom(4), signalOverride });
+  assert.deepEqual(rb.lost, []);
+  assert.deepEqual(sent, [[child, 'SIGTERM']]);
+  assert.equal(JSON.parse(readFileSync(lockFile(b.lockCwd), 'utf8')).jobId, b.jobId);
+  assert.equal(readStatus(b.dir).state, 'running');
+  removeDir(b.dir);
+  // Alive again just before the lost result: nothing is written.
+  const c = handJob({ status: deadRunner() });
+  sent = [];
+  assert.deepEqual((await reap({ ...GRACE, identityOverride: aliveFrom(4), signalOverride })).lost, []);
+  assert.deepEqual(sent, []);
+  assert.equal(readStatus(c.dir).state, 'running');
+  assert.equal(readResult(c.dir), null);
+});
+
+function bareJobDir(files = {}) {
+  mkdirSync(jobsRoot(), { recursive: true });
+  const dir = join(jobsRoot(), newJobId());
+  mkdirSync(dir);
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+  return dir;
+}
+
+const idOf = (dir) => dir.split('/').pop();
+
+test('husks without a status: empty or terminal-result-only dirs go after 7 days, others stay', async () => {
+  const empty = bareJobDir();
+  const done = bareJobDir({ 'result.json': JSON.stringify({ state: 'completed' }) });
+  const running = bareJobDir({ 'result.json': JSON.stringify({ state: 'running' }) });
+  const other = bareJobDir({ 'notes.txt': 'x' });
+  const young = bareJobDir();
+  for (const d of [empty, done, running, other]) age(d, 8 * DAY);
+  const r = await reap(GRACE);
+  assert.deepEqual(r.deleted.sort(), [idOf(empty), idOf(done)].sort());
+  for (const d of [running, other, young]) assert.equal(existsSync(d), true);
+});
+
+test('retention boundary: exactly 7 days old stays, one millisecond more goes', async () => {
+  const t = Math.floor(Date.now() / 1000) - 3600; // whole seconds: mtimeMs is exact
+  const fin = finishedJob('completed');
+  const husk = bareJobDir();
+  for (const dir of [fin.dir, husk]) {
+    for (const name of readdirSync(dir)) utimesSync(join(dir, name), t, t);
+    utimesSync(dir, t, t);
+  }
+  const at = async (now) => (await reap({ ...GRACE, now })).deleted.sort();
+  assert.deepEqual(await at(t * 1000 + 7 * DAY), []);
+  assert.deepEqual(await at(t * 1000 + 7 * DAY + 1), [fin.jobId, idOf(husk)].sort());
+});
+
+test('removeJobDir removes only a real job dir directly in the jobs root', () => {
+  mkdirSync(jobsRoot(), { recursive: true });
+  const rootReal = realpathSync(jobsRoot());
+  const notJob = join(jobsRoot(), 'notajob');
+  mkdirSync(notJob);
+  assert.equal(removeJobDir(notJob, rootReal), false);
+  const dir = bareJobDir({ 'result.json': '{}' });
+  const id = idOf(dir);
+  assert.equal(removeJobDir(`${jobsRoot()}/./${id}`, rootReal), false, 'not spelled as jobDir(id)');
+  assert.equal(removeJobDir(dir, tempDir('zcode-otherroot-')), false, 'real path outside the given root');
+  const file = join(jobsRoot(), newJobId());
+  writeFileSync(file, 'x');
+  assert.equal(removeJobDir(file, rootReal), false, 'a regular file');
+  assert.equal(removeJobDir(join(jobsRoot(), newJobId()), rootReal), false, 'missing');
+  for (const kept of [notJob, dir, file]) assert.equal(existsSync(kept), true, kept);
+  assert.equal(removeJobDir(dir, rootReal), true);
+  assert.equal(existsSync(dir), false);
 });
