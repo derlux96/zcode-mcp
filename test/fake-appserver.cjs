@@ -25,6 +25,8 @@
 //             150 ms for 1.5 s before turn.completed (idle-timeout tests)
 //   tools     acks send, then emits six tool.updated session/events
 //             (toolName T0..T5, kind 'scheduled') before the ok turn
+//   secret    like ok, but the turn response contains sk-abc123def456ghi789jkl
+//             (redaction tests)
 //   no-model  like ok, but session/create carries no current model and an
 //             empty catalog (runner falls back to the CLI path)
 //   nosendack answers create + subscribe, but never answers session/send
@@ -427,7 +429,7 @@ function emitTurn(req, scripted = null) {
         timestamp: 1792184703455,
         type: 'turn.completed',
         payload: {
-          response: 'fake model task done',
+          response: MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
           tokenCount: 32485,
           usage: { source: 'provider', modelRequestCount: 1, inputTokens: 32467, outputTokens: 18, totalTokens: 32485, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 14, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,

@@ -7,8 +7,8 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { oneLine, cleanName } from './sanitize.mjs';
+import { isSensitiveParam } from './redact.mjs';
 
-const SENSITIVE = /key|token|secret|password|auth/i;
 
 /** The file ZCode reads: $ZCODE_PERSONAL_PROVIDER_CONFIG_FILE, else <HOME>/.zcode/v2/provider_config.json. */
 export function providerConfigPath(env = process.env) {
@@ -24,7 +24,7 @@ function redactUrl(raw) {
   return raw
     .replace(/#.*$/s, '#***')
     .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/?#]*@/i, '$1***@')
-    .replace(/([?&])([^=&#]*)=([^&#]*)/g, (m, sep, name) => (SENSITIVE.test(name) ? `${sep}${name}=***` : m));
+    .replace(/([?&])([^=&#]*)=([^&#]*)/g, (m, sep, name) => (isSensitiveParam(name) ? `${sep}${name}=***` : m));
 }
 
 // The first problem of a baseUrl, or null.

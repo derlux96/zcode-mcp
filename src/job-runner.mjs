@@ -5,9 +5,10 @@
 // (cancel file, SIGTERM, SIGINT) and always ends with a terminal state.
 // job.path 'cli' runs the headless CLI; 'protocol' runs the app-server protocol,
 // whose event stream allows an idle timeout and progress lines.
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { redactText } from './redact.mjs';
 import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES } from './jobstore.mjs';
 import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
@@ -68,7 +69,7 @@ export function writeCrashState(dir, job, err, { startedMs, warnings = [], onSta
     changesAvailable: false,
     warnings,
     errorKind: 'crash',
-    errorMessage: err && err.message ? err.message : String(err),
+    errorMessage: redactText(err && err.message ? err.message : String(err)),
     timeoutKind: null,
     exitCode: null,
     stderr: '',
@@ -372,7 +373,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     warn(`reasoning_level_substituted:${res.reasoningSubstitution.requested}->${res.reasoningSubstitution.used}`);
   }
   const text = (res && res.response) || '';
-  try { writeFileSync(outputLogPath, text); } catch { warn('output_log_failed'); }
+  try { writeFileSync(outputLogPath, redactText(text)); } catch { warn('output_log_failed'); }
   const result = protocolOutcome(res, error, params);
   const stop = res && res.retryStop;
   let retryOutcome = null;
@@ -492,6 +493,10 @@ export async function runJob(dir, opts = {}) {
     }
 
     const { state, errorKind, errorMessage, sessionId } = run;
+    // The CLI path appends raw chunks to output.log; scrub the finished file.
+    try {
+      if (existsSync(outputLogPath)) writeFileSync(outputLogPath, redactText(readFileSync(outputLogPath, 'utf8')));
+    } catch { warn('output_log_failed'); }
     const changes = await collectChanges(job, params);
     if (state === 'completed' && changes.available && changes.changedFiles.length === 0 && params.mode !== 'plan') {
       warn('no_changes');
@@ -530,7 +535,7 @@ export async function runJob(dir, opts = {}) {
     writeResult(dir, {
       state,
       sessionId,
-      output: cap(run.output),
+      output: redactText(cap(run.output)),
       outputLogPath,
       changedFiles: changes.changedFiles,
       diffStat: changes.diffStat,
@@ -538,10 +543,10 @@ export async function runJob(dir, opts = {}) {
       ...(job.worktree ? { worktree: { branch: job.worktree.branch, dir: job.worktree.dir, startSha: job.worktree.startSha } } : {}),
       warnings,
       errorKind,
-      errorMessage,
+      errorMessage: errorMessage == null ? errorMessage : redactText(errorMessage),
       timeoutKind: run.timeoutKind,
       exitCode: run.exitCode,
-      stderr: cap(run.stderr),
+      stderr: redactText(cap(run.stderr)),
       durationMs: Date.now() - startedMs,
       ...(run.retries ? { retries: run.retries, retryOutcome: run.retryOutcome } : {}),
     });

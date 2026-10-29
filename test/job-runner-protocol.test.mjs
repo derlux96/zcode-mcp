@@ -395,3 +395,17 @@ test('a cancel whose app-server exit is seen before the runner aborts still ends
   assert.equal(res.timeoutKind, 'cancelled');
   assert.equal(readStatus(dir).state, 'cancelled');
 });
+
+test('secrets in the model output are redacted in result.json and output.log', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'secret';
+  const cwd = tempCwd();
+  const { dir } = mkJob({ cwd });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.ok(res.output.includes('[REDACTED]'));
+  assert.ok(!res.output.includes('sk-abc123def456ghi789jkl'));
+  const log = readFileSync(join(dir, 'output.log'), 'utf8');
+  assert.ok(log.includes('[REDACTED]'));
+  assert.ok(!log.includes('sk-abc123def456ghi789jkl'));
+});
