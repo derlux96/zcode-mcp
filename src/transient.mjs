@@ -89,7 +89,7 @@ export function errorText(err) {
 
 /** A human-readable one-liner: the message plus the distinct causes from the other fields. */
 export function describeTurnError(err) {
-  const e = err && typeof err === 'object' ? err : {};
+  const e = err || {};
   const parts = [];
   for (const f of ['message', ...CAUSE_FIELDS]) {
     const v = typeof e[f] === 'string' ? e[f].trim() : '';

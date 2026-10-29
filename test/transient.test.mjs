@@ -210,3 +210,42 @@ test('"aborted due to timeout" is transient only next to a fetch/stream/network 
   assert.equal(classifyTransient({ message: 'TypeError: fetch: The operation was aborted due to timeout' }).klass, 'network');
   assert.equal(isTransientProviderError({ message: 'The operation was aborted due to timeout' }), false);
 });
+
+test('errorText skips absent and blank fields; only a status 100..599 counts', () => {
+  assert.equal(errorText({ message: 'm' }), 'm');
+  assert.equal(errorText({ message: 'm', detail: '  ', code: 0 }), '0\nm');
+  for (const s of [100, 599, '503']) assert.equal(errorText({ message: 'm', statusCode: s }), `m\nHTTP ${Number(s)}`, String(s));
+  for (const s of [42, 99, 600, -5, 429.5, ['503'], true]) assert.equal(errorText({ message: 'm', status: s }), 'm', String(s));
+});
+
+test('the structured status decides alone: 4xx except 429 is permanent, 429 and 5xx are transient', () => {
+  assert.deepEqual(classifyTransient({ statusCode: 429 }), { transient: true, klass: 'rate_limit' });
+  assert.deepEqual(classifyTransient({ statusCode: 500 }), { transient: true, klass: 'overloaded' });
+  assert.deepEqual(classifyTransient({ statusCode: 418, message: 'rate limit, try again' }), { transient: false, klass: null });
+  assert.deepEqual(classifyTransient({ statusCode: 499, message: 'try again' }), { transient: false, klass: null });
+});
+
+test('describeTurnError tolerates non-object payloads', () => {
+  for (const v of [null, undefined, 'text', 7, false]) assert.equal(describeTurnError(v), 'turn failed without an error payload');
+});
+
+test('retryAfterMs: zero and fractions below one second, odd headers and values', () => {
+  assert.equal(retryAfterMs({ 'retry-after': 0 }), 0);
+  assert.equal(retryAfterMs({ 'retry-after': '0' }), 0);
+  assert.equal(retryAfterMs({ 'retry-after': 0.5 }), 1000);
+  assert.equal(retryAfterMs({ headers: null, message: 'retry-after: 3' }), 3000);
+  assert.equal(retryAfterMs({ headers: 'retry-after: 9', message: 'retry-after: 3' }), 3000);
+  assert.equal(retryAfterMs({ 'retry-after': ['7'], message: 'retry-after: 3' }), 3000);
+  assert.equal(retryAfterMs({ 'retry-after': true }), null);
+});
+
+test('retryDelayMs: no jitter by default, attempt below 1 is the first step, a zero step stays zero', () => {
+  assert.equal(retryDelayMs(1, { delaysMs: [1000], random: () => 1 }), 1000);
+  assert.equal(retryDelayMs(1, { delaysMs: [1000], random: () => 0 }), 1000);
+  assert.equal(retryDelayMs(0, { delaysMs: [100, 200] }), 100);
+  assert.equal(retryDelayMs(-3, { delaysMs: [100, 200] }), 100);
+  assert.equal(retryDelayMs(2, { delaysMs: [100, 200] }), 200);
+  assert.equal(retryDelayMs(5, { delaysMs: [100, 200] }), 200);
+  assert.equal(retryDelayMs(1, { delaysMs: [0, 200], jitter: 0.5, random: () => 0 }), 0);
+  assert.equal(retryDelayMs(1, { delaysMs: [10, 200], jitter: 2, random: () => 0 }), 0, 'never negative');
+});
