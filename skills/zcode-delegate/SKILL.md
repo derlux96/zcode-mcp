@@ -38,8 +38,9 @@ below your client's request timeout (60 s in many MCP clients):
 
 1. Finished within `wait_ms` → the full result text (`status: completed|failed|timeout|cancelled`,
    `job_id`, `session_id`, …).
-2. Still working → `status: running` with `job_id`, elapsed time and progress. This is **not an
-   error**. Then:
+2. Still working → `status: running` with `job_id`, elapsed time and progress; a protocol job that
+   asks a question returns at once with `status: needs_input`, the `question:` and `job_id`
+   (`zcode_status` shows the same). Neither is **an error**. Then:
    - `zcode_status {job_id, wait_ms}` — waits up to `wait_ms` (max 120000) for a state change
      (heartbeats and progress do not end the wait) and shows state, last activity, warnings, the
      files changed so far and progress lines. Never busy-loop: always pass a `wait_ms` (e.g.
