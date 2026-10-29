@@ -62,3 +62,22 @@ test('sk- needs a left boundary', () => {
   }
   assert.equal(redactText('sk-abc123def456ghi789jkl'), '[REDACTED]');
 });
+
+test('high-entropy rule leaves session ids, UUIDs, long identifiers and hex SHAs alone', () => {
+  for (const s of [
+    'sess_d565c105-4f40-4557-a1b0-529acd944a02',
+    'session sess_d565c105-4f40-4557-a1b0-529acd944a02 resumed',
+    'job-D565C105-4F40-4557-A1B0-529ACD944A02',
+    'thread_d565c105-4f40-4557-a1b0-529acd944a02',
+    'should_handle_extremely_long_identifier_names_v2_and_more',
+    'node_modules/@scope/some-really-long-package-name-with-version-2/',
+    'SHOULD_HANDLE_EXTREMELY_LONG_CONSTANT_NAMES_V2_AND_MORE_X',
+    'commit 3D6DE5B0A1C2E3F4A5B6C7D8E9F00112233445566',
+    '3D6DE5B0a1c2e3f4a5b6c7d8e9f00112233445566',
+  ]) assert.equal(redactText(s), s, s);
+});
+
+test('high-entropy rule needs upper case, lower case and digits together', () => {
+  assert.equal(redactText('x Zk3Jq9XvB2nLm8Rt4Yw7Pc1Hd6Fs5Gu0AeIoKbNxQz y'), 'x [REDACTED] y');
+  assert.equal(redactText('ghp_Zk3Jq9XvB2nLm8Rt4Yw7Pc1Hd6Fs5Gu0AeIoKb'), '[REDACTED]');
+});

@@ -18,10 +18,13 @@ export function isSensitiveParam(name) {
   return /key|token|secret|password|passwd|auth|sig/i.test(name);
 }
 
-// 40+ chars of [A-Za-z0-9_-] with a letter, a digit and a character outside
-// [0-9a-f]: pure hex runs (git SHAs) are not secrets.
+// 40+ chars of [A-Za-z0-9_-] mixing upper case, lower case and digits. Exempt:
+// pure hex in any case (git SHAs), session ids (sess_...) and UUID-shaped ids,
+// optionally behind a word prefix (job-<uuid>, thread_<uuid>).
+const UUID_RUN = /^(?:[A-Za-z0-9]+[_-])*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function looksHighEntropy(run) {
-  return /[A-Za-z]/.test(run) && /[0-9]/.test(run) && /[g-zA-Z_-]/.test(run);
+  if (/^[0-9a-f]+$/i.test(run) || run.startsWith('sess_') || UUID_RUN.test(run)) return false;
+  return /[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run);
 }
 
 /** Masks secret-shaped substrings of a string. */
