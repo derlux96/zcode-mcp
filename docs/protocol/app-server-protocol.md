@@ -184,3 +184,50 @@ Gotchas summary: bidirectional requests (answer within 15s); no handshake but he
 - `session/setModel`, `session/setThoughtLevel`, `session/fork`, `session/stop`, `modelExecution`, attachments, permission-request flow (`_F` decision schema exists in bundle) — schemas located in the bundle but not exercised.
 - Whether `workspaceKey` must equal `workspacePath` in all cases (all observed sessions had them equal; schema allows them to differ).
 - Whether the desktop app uses extra methods (`workspace/*`, `plugins/*`, `automation/*`, conversation gateway `Sg.*` family) relevant to a delegation MCP — out of scope.
+
+## 13. Verified on ZCode 0.17.0 (2026-10-29)
+
+Source: `scripts/verify-protocol.mjs --real --controls` on the owner's Mac against ZCode 0.17.0, plus a
+reading of its bundle (`/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`). Facts marked
+**inferred** come from the bundle only and await the next probe.
+
+**session/stop.** `session/stop {sessionId}` is answered; the running turn then ends with
+`turn.completed` and an **empty** `payload.response` (not `turn.failed`). Callers must treat any
+turn that ends after a stop as stopped, whatever its type.
+
+**interaction/requestUserInput (AskUserQuestion).** Server request params, e.g.:
+
+```json
+{ "requestId": "perm_5d6b…", "sessionId": "…", "turnId": "…", "toolCallId": "…",
+  "toolName": "AskUserQuestion", "schema": { "toolName": "AskUserQuestion" },
+  "prompt": "Tool AskUserQuestion requires user interaction",
+  "input": { "questions": [ { "question": "Which port should I use?", "header": "Port",
+    "options": [ { "label": "3000 (Recommended)", "description": "…" }, { "label": "8080", "description": "…" } ],
+    "multiSelect": false } ] },
+  "questions": [ { "question": "Which port should I use?", "header": "Port", "multiSelect": false,
+    "options": [ { "label": "…", "value": "…", "description": "…" } ] } ] }
+```
+
+The answer is validated against a **strict** schema (no other keys):
+`{ action: "accept"|"decline"|"cancel", content?: Record<string, unknown>, reason?: string }`.
+AskUserQuestion maps it as follows: `action !== "accept"` denies the tool ("AskUserQuestion was
+cancelled|declined") and the model continues; on accept, for each question `q` at index `i` the
+value is `content.answers?.[q.question] ?? content["answer_" + i] ?? (one question ? content.answer :
+undefined)`, a string (trimmed) or a string[] (joined with ", "). Exact answer for one question:
+`{"action":"accept","content":{"answers":{"Which port should I use?":"8080"}}}`.
+zcode-delegate answers with the text keyed by every question (`buildUserInputAnswer`), declines with
+a reason when nobody answers within `input_timeout_ms`, and cancels when it has no listener.
+
+**Steer routing (v4/command sendText).** A `sendText` during a running turn is accepted with
+`{status:"accepted", result:{type:"inputAccepted", delivery}}` and a `turn.steerQueued` event. The
+routing is `session followupMode === "guide" ? "guide" : "enqueue"`; the default followupMode is
+`"queue"` (with `queueAutoDrain` true). Only `"guide"` inputs are injected into the running turn
+(`turn.steerDrained`). The probe's steer (followupMode left at its default) came back
+`delivery:"queue"`, never drained, and only one turn ran: after a turn completes with queued inputs
+ZCode sets autoDrain false and **holds** the queue (no automatic new turn).
+v4 command types also include `setFollowupMode`, `setAutoDrain` and `sendQueuedNow {queueItemId, …}`.
+zcode-delegate sends `setFollowupMode` with `payload: {mode: "guide"}` before the first steer and,
+when steers are still held after a completed turn, `setAutoDrain` with `payload: {autoDrain: true}`
+(falling back to a `session/send` of the held texts when no turn starts within 10 s). These payload
+field names (`mode`, `autoDrain`) are **inferred** from the bundle, not yet verified; the updated
+steer probe records the raw results to confirm them.
