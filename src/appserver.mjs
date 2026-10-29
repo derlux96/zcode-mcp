@@ -249,6 +249,7 @@ export class AppServerClient {
   _onChildGone(message) {
     if (this._exited) return;
     this._exited = true;
+    this._parkedInput.clear(); // nobody is left to read an answer
     this._failAll(new AppServerError(message, { code: 'child_exited' }));
     this._resolveExit();
   }
@@ -317,9 +318,10 @@ export class AppServerClient {
     if (msg.method === 'interaction/requestUserInput' && this._onUserInput) {
       const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
       this._parkedInput.set(msg.id, { protocolId: msg.id, params });
-      const question = params.question ?? params.prompt ?? params.message ?? '';
+      // First string among question/prompt/message; anything else is '' (never "[object Object]").
+      const question = [params.question, params.prompt, params.message].find((v) => typeof v === 'string') ?? '';
       try {
-        this._onUserInput({ requestId: params.requestId, protocolId: msg.id, question: typeof question === 'string' ? question : String(question), params });
+        this._onUserInput({ requestId: params.requestId, protocolId: msg.id, question, params });
       } catch { /* a failing observer must not wedge the protocol */ }
       return;
     }
@@ -334,10 +336,21 @@ export class AppServerClient {
     return this._parkedInput.size;
   }
 
-  /** Answer a parked server request (see onUserInput). */
+  /** Parked requestUserInput requests, oldest first: [{ protocolId, params }]. */
+  get parkedUserInput() {
+    return [...this._parkedInput.values()];
+  }
+
+  /**
+   * Answer a parked server request (see onUserInput). Sends only when the id
+   * is still parked (so a late second answer for the same question is
+   * dropped); returns true when sent, false otherwise.
+   */
   respond(protocolId, result) {
+    if (!this._parkedInput.has(protocolId)) return false;
     this._parkedInput.delete(protocolId);
     this._send({ id: protocolId, result });
+    return true;
   }
 
   _send(obj) {
@@ -470,6 +483,7 @@ export class AppServerClient {
   close() {
     if (this._closePromise) return this._closePromise;
     this._closed = true;
+    this._parkedInput.clear();
     if (this._signal) this._signal.removeEventListener('abort', this._onAbort);
     this._closePromise = (async () => {
       if (!this._exited) {
@@ -535,22 +549,35 @@ function turnError(raw) {
   return error;
 }
 
-// The backoff wait: ends early when the caller aborts or the app-server exits
-// (a dead app-server has no session left to continue).
-async function backoff(client, retry, delayMs, signal) {
+// The backoff wait: ends early when the caller aborts, control.stop() is
+// called, or the app-server exits (a dead app-server has no session left to continue).
+async function backoff(client, retry, delayMs, signals) {
   const ctl = new AbortController();
   const stop = () => ctl.abort();
-  if (signal) {
-    if (signal.aborted) stop();
-    else signal.addEventListener('abort', stop, { once: true });
+  const live = signals.filter(Boolean);
+  for (const s of live) {
+    if (s.aborted) stop();
+    else s.addEventListener('abort', stop, { once: true });
   }
   client.exited.then(stop);
   try {
     await retry.sleep(delayMs, ctl.signal);
   } finally {
-    if (signal) signal.removeEventListener('abort', stop);
+    for (const s of live) s.removeEventListener('abort', stop);
   }
 }
+
+// A JSON-RPC answer meaning "this server does not know the method".
+function notSupported(err) {
+  return err instanceof AppServerError && (err.code === -32601 || /method not found|unknown method/i.test(err.message));
+}
+
+// The request failed because the client or its child is gone.
+function isGone(err) {
+  return err instanceof AppServerError && (err.code === 'closed' || err.code === 'child_exited');
+}
+
+let steerSeq = 0; // keeps commandIds unique when Date.now() repeats
 
 function retryOptions(transientRetry) {
   const o = transientRetry && typeof transientRetry === 'object' ? transientRetry : {};
@@ -599,6 +626,29 @@ function retryOptions(transientRetry) {
  * app-server exits (rejecting with code 'child_exited'). The returned `error`
  * carries code, message and the payload's other diagnostic fields (type, detail,
  * underlyingErrorMessage, statusCode, statusMessage, retryable, ...).
+ * Job control: onControl(control) is called once, right after session/subscribe
+ * succeeds and before the first session/send, with
+ *   control.stop()      -> Promise<'accepted'|'not_supported'>; sends session/stop.
+ *                          The turn that ends after a stop is returned as failed
+ *                          without any retry, whatever its error looks like, and
+ *                          a running backoff ends at once. Other request errors
+ *                          (e.g. request_timeout) reject.
+ *   control.steer(text) -> Promise<{status:'accepted'|'rejected'|'not_supported', reason?}>;
+ *                          sends a v4/command sendText with delivery 'guide';
+ *                          rejected 'retry' during a backoff, else the server's
+ *                          reasonCode. Other request errors reject.
+ *   control.answer(text) -> {status:'accepted'|'rejected', reason?}; answers the
+ *                          oldest parked requestUserInput (needs onUserInput),
+ *                          rejected 'no_question' when nothing is parked.
+ *   control.capabilities -> {stop, steer, userInput}: null until known; stop and
+ *                          steer turn false on the first "method not found"
+ *                          answer (later calls then return not_supported without
+ *                          a request), true on any other answer; userInput turns
+ *                          true when a question is parked.
+ * The control is only useful while the task runs: after the client is closed,
+ * stop() answers 'not_supported', steer() {status:'rejected', reason:'closed'}
+ * and answer() rejected 'no_question'. onUserInput is passed to the client
+ * (parking interaction/requestUserInput); without it questions are answered {}.
  * timeoutMs > 0 is a deadline for the whole task from the first send: every
  * wait gets the remaining time and a backoff that would pass it is not
  * started. The result carries retries [{at, attempt, delayMs, reason}] and
@@ -619,6 +669,8 @@ export async function runTaskWithModel({
   killGroup = false,
   onSpawn,
   onEvent,
+  onUserInput,
+  onControl,
   signal,
   transientRetry,
 } = {}) {
@@ -650,8 +702,14 @@ export async function runTaskWithModel({
   const turnTimeout = (ms) => new AppServerError(`timed out after ${ms} ms waiting for session/event turn.completed|turn.failed`, { code: 'turn_timeout' });
   if (signal && signal.aborted) throw aborted();
   let client;
+  const capabilities = { stop: null, steer: null, userInput: null };
+  // Only hook requestUserInput when the caller listens; otherwise the client
+  // answers {} at once and nothing can be left parked forever.
+  const userInputHook = typeof onUserInput === 'function'
+    ? (req) => { capabilities.userInput = true; onUserInput(req); }
+    : undefined;
   try {
-    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, signal });
+    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, onUserInput: userInputHook, signal });
   } catch (err) {
     if (err instanceof AppServerError) err.startup = true;
     throw err;
@@ -661,6 +719,71 @@ export async function runTaskWithModel({
   const retry = retryOptions(transientRetry);
   const retries = [];
   let usage = null;
+  let stopRequested = false;
+  let backingOff = false;
+  const stopCtl = new AbortController();
+
+  // The job-control handle given to onControl (see the doc comment above).
+  function makeControl() {
+    return {
+      capabilities,
+      async stop() {
+        if (capabilities.stop === false) return 'not_supported';
+        // Set before the request: the server may end the turn before it answers.
+        const wasRequested = stopRequested;
+        stopRequested = true;
+        try {
+          await client.request('session/stop', { sessionId });
+        } catch (err) {
+          stopRequested = wasRequested;
+          if (notSupported(err)) {
+            capabilities.stop = false;
+            return 'not_supported';
+          }
+          if (isGone(err)) return 'not_supported';
+          throw err;
+        }
+        capabilities.stop = true;
+        stopCtl.abort(); // end a running backoff at once
+        return 'accepted';
+      },
+      async steer(text) {
+        if (capabilities.steer === false) return { status: 'not_supported' };
+        if (backingOff) return { status: 'rejected', reason: 'retry' };
+        const now = Date.now();
+        const command = {
+          commandId: `steer-${sessionId}-${now}-${++steerSeq}`,
+          clientId: 'zcode-delegate',
+          sessionId,
+          type: 'sendText',
+          payload: { text, delivery: { requested: 'guide' } },
+          issuedAt: now,
+        };
+        let result;
+        try {
+          result = await client.request('v4/command', command);
+        } catch (err) {
+          if (notSupported(err)) {
+            capabilities.steer = false;
+            return { status: 'not_supported' };
+          }
+          if (isGone(err)) return { status: 'rejected', reason: 'closed' };
+          throw err;
+        }
+        capabilities.steer = true;
+        if (result && result.status === 'accepted') return { status: 'accepted' };
+        return { status: 'rejected', reason: (result && typeof result.reasonCode === 'string' && result.reasonCode) || 'rejected' };
+      },
+      answer(text) {
+        const oldest = client.parkedUserInput[0];
+        if (!oldest || !client.respond(oldest.protocolId, buildUserInputAnswer(oldest.params, text))) {
+          return { status: 'rejected', reason: 'no_question' };
+        }
+        return { status: 'accepted' };
+      },
+    };
+  }
+
   try {
     await client.settle();
 
@@ -699,6 +822,12 @@ export async function runTaskWithModel({
     // Gates session/event delivery on the real server (notes §4).
     await client.request('session/subscribe', { sessionId, deliveryKind: 'desktop-continuous' });
 
+    if (typeof onControl === 'function') {
+      try {
+        onControl(makeControl());
+      } catch { /* an observer must not end the task */ }
+    }
+
     // ACK-only: acceptance says nothing about model validity; the turn
     // outcome arrives as a session/event notification (notes §5/§6).
     startup = false; // from here on the task may be running: never retry
@@ -724,6 +853,7 @@ export async function runTaskWithModel({
       const raw = (event.payload && event.payload.error) || {};
       const error = turnError(raw);
       const failed = (retryStop) => ({ ...base, usage, ok: false, response: null, failed: true, error, retryStop });
+      if (stopRequested) return failed(null); // a stopped turn is never retried
       const cls = retry.classify(error) || {};
       if (!cls.transient) return failed(null);
       const classCap = Number.isInteger(cls.maxRetries) ? cls.maxRetries : Infinity;
@@ -745,8 +875,14 @@ export async function runTaskWithModel({
           retry.onRetry({ attempt, maxRetries: retry.maxRetries, classAttempt, classMaxRetries, klass, delayMs, reason, at });
         } catch { /* an observer must not end the task */ }
       }
-      await backoff(client, retry, delayMs, signal);
+      backingOff = true;
+      try {
+        await backoff(client, retry, delayMs, [signal, stopCtl.signal]);
+      } finally {
+        backingOff = false;
+      }
       if (signal && signal.aborted) throw aborted();
+      if (stopRequested) return failed(null);
       if (!client.isRunning()) {
         throw new AppServerError('app-server child exited during the backoff after a transient error', { code: 'child_exited' });
       }

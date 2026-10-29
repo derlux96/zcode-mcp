@@ -69,6 +69,20 @@
 // FAKE_APPSERVER_LOG: path; every received message is appended as one JSON
 // line (lets tests assert exact wire params the client sent).
 //
+// FAKE_APPSERVER_ASK_QUESTION: JSON value used as the question of mode ask's
+// requestUserInput instead of 'Which port?' (non-string question tests).
+//
+// Job control:
+//   session/stop  answers {}; if a turn is in flight (any mode, including
+//             slowhang and chatty) that turn ends in turn.failed with
+//             payload.error {code:'aborted', message:'429 rate limit'} —
+//             deliberately transient-looking, so a client that retries after
+//             a stop is caught.
+//   v4/command    answers {status:'accepted'} for type 'sendText' while a turn
+//             is in flight, else {status:'rejected', reasonCode:'idle'}.
+// FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop' and/or 'steer'; those
+// methods (session/stop, v4/command) answer error -32601 "Method not found".
+//
 // Trap enforcement: server-initiated requests must be answered with their
 // documented result within 2 s or this process FAILS the connection
 // (exit 1) — mirroring the real server, where an unanswered
@@ -83,6 +97,7 @@ const readline = require('node:readline');
 const MODE = process.env.FAKE_APPSERVER_MODE || 'ok';
 const LOG_PATH = process.env.FAKE_APPSERVER_LOG || '';
 const SESSION_ID = 'sess_fakeB1';
+const UNSUPPORTED = new Set((process.env.FAKE_APPSERVER_UNSUPPORTED || '').split(',').map((s) => s.trim()).filter(Boolean));
 
 if (!process.argv.includes('app-server')) {
   // Executed directly (e.g. by `node --test` discovery, which runs every
@@ -168,6 +183,9 @@ function isAnyResult(msg) {
 let pendingCreate = null; // create request whose response waits on the trap
 let created = false;
 let askReq = null; // session/send waiting on the parked requestUserInput answer
+let inFlight = null; // session/send whose turn has not ended yet
+let chattyTimer = null;
+const stoppedSends = new Set(); // send ids whose turn was ended by session/stop
 
 function answerArrived(msg) {
   if (msg.id === 'server-ask') {
@@ -303,6 +321,7 @@ function handleSend(req) {
   const n = countSend();
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: n } });
+  inFlight = req;
   if (MODE === 'slowhang') return;
   if (FAIL_MODES[MODE]) {
     // Later sends continue the same session: no second prefs/auth probe.
@@ -321,7 +340,8 @@ function handleSend(req) {
   if (MODE === 'ask') {
     askReq = req;
     sendServerRequest('server-ask-browser', 'interaction/browserList', { sessionId: SESSION_ID }, isAnyResult);
-    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question: 'Which port?' } });
+    const question = process.env.FAKE_APPSERVER_ASK_QUESTION ? JSON.parse(process.env.FAKE_APPSERVER_ASK_QUESTION) : 'Which port?';
+    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question } });
     return;
   }
   if (MODE === 'flood') {
@@ -385,9 +405,11 @@ function handleSend(req) {
       });
       if (++n === 10) {
         clearInterval(t);
+        chattyTimer = null;
         emitTurn(req);
       }
     }, 150);
+    chattyTimer = t;
     return;
   }
   // Notes §2: a second prefs request (scope user-execution) arrives at first
@@ -397,7 +419,33 @@ function handleSend(req) {
   setTimeout(() => emitTurn(req), 25);
 }
 
+function handleStop(req) {
+  send({ id: req.id, result: {} });
+  if (!inFlight) return;
+  const turn = inFlight;
+  inFlight = null;
+  stoppedSends.add(turn.id);
+  if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
+  if (askReq === turn) askReq = null;
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_stopped', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_stop_${turn.id}`, seq: 900, timestamp: Date.now(), type: 'turn.failed',
+      payload: { error: { code: 'aborted', message: '429 rate limit' }, turnPhase: 'model_request', inputId: 'in_stopped' },
+    },
+  });
+}
+
+function handleCommand(req) {
+  const p = req.params || {};
+  if (p.type === 'sendText' && inFlight) send({ id: req.id, result: { status: 'accepted' } });
+  else send({ id: req.id, result: { status: 'rejected', reasonCode: 'idle' } });
+}
+
 function emitTurn(req, scripted = null, responseOverride = null) {
+  if (stoppedSends.has(req.id)) return; // the stop already ended this turn
+  if (inFlight === req) inFlight = null;
   const input = (req.params && req.params.content) || '';
   const n = scripted ? scripted.n : 1;
   const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001' };
@@ -504,6 +552,14 @@ rl.on('line', (line) => {
     case 'session/subscribe': handleSubscribe(msg); break;
     case 'session/send': handleSend(msg); break;
     case 'noop/hang': break; // deliberately never answered: per-request timeout path
+    case 'session/stop':
+      if (UNSUPPORTED.has('stop')) send({ id: msg.id, error: { code: -32601, message: 'Method not found' } });
+      else handleStop(msg);
+      break;
+    case 'v4/command':
+      if (UNSUPPORTED.has('steer')) send({ id: msg.id, error: { code: -32601, message: 'Method not found' } });
+      else handleCommand(msg);
+      break;
     default:
       send({ id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } });
   }

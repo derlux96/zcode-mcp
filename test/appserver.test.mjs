@@ -535,3 +535,230 @@ test('mode ask: interaction/browserList is still answered {} (the 2 s trap would
     }
   });
 });
+
+// --- respond() / parked-input hygiene (Task 3 review items) ---
+
+function readLog(path) {
+  let text = '';
+  try { text = readFileSync(path, 'utf8'); } catch { return []; }
+  return text.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('respond() sends only for a parked id and reports whether it sent', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    const log = join(cwd, 'rx.log');
+    process.env.FAKE_APPSERVER_LOG = log;
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      const cursor = await askSession(client, cwd);
+      const req = await got;
+      assert.equal(client.respond('not-parked', { answer: 'x' }), false);
+      assert.equal(client.respond(req.protocolId, buildUserInputAnswer(req.params, '1')), true);
+      assert.equal(client.respond(req.protocolId, buildUserInputAnswer(req.params, '2')), false);
+      await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
+      const answers = readLog(log).filter((m) => m.method === undefined && (m.id === 'not-parked' || m.id === 'server-ask'));
+      assert.deepEqual(answers.map((m) => m.id), ['server-ask']);
+      assert.equal(answers[0].result.answer, '1');
+    } finally {
+      delete process.env.FAKE_APPSERVER_LOG;
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('parked input is cleared when the child exits', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      await askSession(client, cwd);
+      const req = await got;
+      assert.equal(client.pendingUserInput, 1);
+      client.child.kill('SIGKILL');
+      await client.exited;
+      assert.equal(client.pendingUserInput, 0);
+      assert.equal(client.respond(req.protocolId, {}), false);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('parked input is cleared when the client closes', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      await askSession(client, cwd);
+      const req = await got;
+      assert.equal(client.pendingUserInput, 1);
+      await client.close();
+      assert.equal(client.pendingUserInput, 0);
+      assert.equal(client.respond(req.protocolId, {}), false);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('a non-string question becomes an empty string, never "[object Object]"', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    process.env.FAKE_APPSERVER_ASK_QUESTION = JSON.stringify({ text: 'Which port?' });
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      await askSession(client, cwd);
+      const req = await got;
+      assert.equal(req.question, '');
+      client.respond(req.protocolId, {});
+    } finally {
+      delete process.env.FAKE_APPSERVER_ASK_QUESTION;
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+// --- onControl: stop / steer / answer ---
+
+// Runs a task; onControl hands the control to `drive(control, ctx)` (not awaited by the run).
+async function runWithControl(mode, drive, opts = {}, env = {}) {
+  const cwd = makeTempDir();
+  const log = join(cwd, 'rx.log');
+  Object.assign(process.env, { FAKE_APPSERVER_MODE: mode, FAKE_APPSERVER_LOG: log, ...env });
+  let driven = null;
+  let control = null;
+  try {
+    const run = runTaskWithModel({
+      binPath: fakeBin, cwd, prompt: 'x', providerId: 'glm-test', modelId: 'small', timeoutMs: 10000, idleTimeoutMs: 0,
+      transientRetry: { delaysMs: [10], jitter: 0, sleep: async () => {} },
+      ...opts,
+      onControl: (c) => { control = c; driven = drive(c); },
+    });
+    const res = await run.then((r) => r, (e) => e);
+    return { res, control, driven: await driven, log: readLog(log) };
+  } finally {
+    delete process.env.FAKE_APPSERVER_MODE;
+    delete process.env.FAKE_APPSERVER_LOG;
+    for (const k of Object.keys(env)) delete process.env[k];
+    removeDir(cwd);
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('onControl is called once, after subscribe and before the first send', async () => {
+  const calls = [];
+  const { log } = await runWithControl('ok', (c) => { calls.push(c); });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].capabilities, { stop: null, steer: null, userInput: null });
+  const methods = log.filter((m) => typeof m.method === 'string').map((m) => m.method);
+  assert.deepEqual(methods, ['session/create', 'session/subscribe', 'session/send']);
+});
+
+test('stop() in slowhang: accepted, the turn fails aborted and is not retried', async () => {
+  const { res, control, driven, log } = await runWithControl('slowhang', async (c) => { await sleep(200); return c.stop(); });
+  assert.equal(driven, 'accepted');
+  assert.equal(res.ok, false);
+  assert.equal(res.failed, true);
+  assert.equal(res.error.code, 'aborted');
+  assert.equal(res.retries.length, 0);
+  assert.equal(control.capabilities.stop, true);
+  const stop = log.find((m) => m.method === 'session/stop');
+  assert.equal(stop.params.sessionId, 'sess_fakeB1');
+  assert.equal(log.filter((m) => m.method === 'session/send').length, 1);
+});
+
+test('stop() in chatty ends the streaming turn the same way', async () => {
+  const { res, driven } = await runWithControl('chatty', async (c) => { await sleep(300); return c.stop(); });
+  assert.equal(driven, 'accepted');
+  assert.equal(res.failed, true);
+  assert.equal(res.error.message, '429 rate limit');
+  assert.equal(res.retries.length, 0);
+});
+
+test('FAKE_APPSERVER_UNSUPPORTED=stop,steer: both answer not_supported and the capabilities turn false', async () => {
+  const { res, control, driven, log } = await runWithControl('chatty', async (c) => {
+    await sleep(100);
+    const s1 = await c.stop();
+    const st1 = await c.steer('x');
+    const s2 = await c.stop();
+    const st2 = await c.steer('y');
+    return { s1, st1, s2, st2 };
+  }, {}, { FAKE_APPSERVER_UNSUPPORTED: 'stop,steer' });
+  assert.equal(res.ok, true);
+  assert.equal(driven.s1, 'not_supported');
+  assert.deepEqual(driven.st1, { status: 'not_supported' });
+  assert.equal(driven.s2, 'not_supported');
+  assert.deepEqual(driven.st2, { status: 'not_supported' });
+  assert.deepEqual(control.capabilities, { stop: false, steer: false, userInput: null });
+  // the second calls short-circuit without a request
+  assert.equal(log.filter((m) => m.method === 'session/stop').length, 1);
+  assert.equal(log.filter((m) => m.method === 'v4/command').length, 1);
+});
+
+test('steer() in chatty is accepted and sends the documented v4/command envelope', async () => {
+  const { res, control, driven, log } = await runWithControl('chatty', async (c) => {
+    await sleep(200);
+    const a = await c.steer('use port 8080');
+    const b = await c.steer('and log it');
+    return [a, b];
+  });
+  assert.equal(res.ok, true);
+  assert.deepEqual(driven[0], { status: 'accepted' });
+  assert.deepEqual(driven[1], { status: 'accepted' });
+  assert.equal(control.capabilities.steer, true);
+  const cmds = log.filter((m) => m.method === 'v4/command');
+  assert.equal(cmds.length, 2);
+  const p = cmds[0].params;
+  assert.equal(p.type, 'sendText');
+  assert.equal(p.sessionId, 'sess_fakeB1');
+  assert.equal(p.clientId, 'zcode-delegate');
+  assert.equal(p.payload.text, 'use port 8080');
+  assert.equal(p.payload.delivery.requested, 'guide');
+  assert.match(p.commandId, /^steer-sess_fakeB1-\d+/);
+  assert.equal(typeof p.issuedAt, 'number');
+  assert.notEqual(cmds[0].params.commandId, cmds[1].params.commandId);
+});
+
+test('steer() with no turn in flight is rejected with the server reasonCode', async () => {
+  const { driven } = await runWithControl('ok', async (c) => c.steer('too early'));
+  assert.deepEqual(driven, { status: 'rejected', reason: 'idle' });
+});
+
+test('after the run, stop() answers not_supported and steer() rejected closed', async () => {
+  const { control } = await runWithControl('ok', () => {});
+  assert.equal(await control.stop(), 'not_supported');
+  assert.deepEqual(await control.steer('late'), { status: 'rejected', reason: 'closed' });
+  assert.deepEqual(control.answer('late'), { status: 'rejected', reason: 'no_question' });
+});
+
+test('answer() with nothing parked is rejected no_question', async () => {
+  const { driven } = await runWithControl('ok', (c) => c.answer('x'));
+  assert.deepEqual(driven, { status: 'rejected', reason: 'no_question' });
+});
+
+test('answer() replies to the parked question via onUserInput and the turn completes', async () => {
+  const asked = [];
+  let ctl;
+  const { res, control } = await runWithControl('ask', (c) => { ctl = c; }, {
+    onUserInput: (q) => { asked.push(q); queueMicrotask(() => { asked.push(ctl.answer('8080')); }); },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.response, `answer: ${JSON.stringify({ requestId: 'req_1', answer: '8080' })}`);
+  assert.equal(asked[0].question, 'Which port?');
+  assert.deepEqual(asked[1], { status: 'accepted' });
+  assert.equal(control.capabilities.userInput, true);
+});

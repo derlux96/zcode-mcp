@@ -398,3 +398,55 @@ test('usage is summed across the failed and the completed turn', async () => {
   assert.equal(res.usage.inputTokens, 200);
   assert.equal(res.usage.modelRequestCount, 2);
 });
+
+test('stop(): a transient-looking aborted failure after stop is returned without any retry', async () => {
+  const { cwd, sends } = setup('slowhang');
+  const s = fakeSleep();
+  let control;
+  let stopped;
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, idleTimeoutMs: 0,
+    transientRetry: { delaysMs: [10], jitter: 0, sleep: s.sleep },
+    onControl: (c) => { control = c; stopped = new Promise((r) => setTimeout(r, 200)).then(() => c.stop()); },
+  });
+  assert.equal(await stopped, 'accepted');
+  assert.equal(res.failed, true);
+  assert.equal(res.error.message, '429 rate limit');
+  assert.equal(res.retries.length, 0);
+  assert.equal(res.retryStop, null);
+  assert.deepEqual(s.waits, []);
+  assert.equal(sends().length, 1);
+  assert.equal(control.capabilities.stop, true);
+});
+
+test('stop() during a backoff ends the wait and returns the failure without the continue send', async () => {
+  const { cwd, sends } = setup('fail-429-always');
+  let control;
+  let stopped;
+  const t0 = Date.now();
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 20000,
+    transientRetry: { delaysMs: [5000], jitter: 0, onRetry: () => { stopped = new Promise((r) => setTimeout(r, 100)).then(() => control.stop()); } },
+    onControl: (c) => { control = c; },
+  });
+  assert.equal(await stopped, 'accepted');
+  assert.ok(Date.now() - t0 < 4000, 'the backoff ended early');
+  assert.equal(res.failed, true);
+  assert.equal(res.retries.length, 1);
+  assert.equal(sends().length, 1);
+});
+
+test('steer() during a retry backoff is rejected with reason retry', async () => {
+  const { cwd } = setup('fail-429-then-ok');
+  let control;
+  let steered;
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    transientRetry: { delaysMs: [300], jitter: 0, onRetry: () => { steered = new Promise((r) => setTimeout(r, 100)).then(() => control.steer('hint')); } },
+    onControl: (c) => { control = c; },
+  });
+  assert.equal(res.ok, true);
+  assert.deepEqual(await steered, { status: 'rejected', reason: 'retry' });
+  const log = readFileSync(join(cwd, 'rx.log'), 'utf8');
+  assert.equal(log.includes('v4/command'), false);
+});
