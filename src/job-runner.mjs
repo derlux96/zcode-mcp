@@ -33,7 +33,7 @@ const PROGRESS_LINES = 5;
 const RETRY_REASON_MAX = 200;
 // STOP_GRACE_MS lives in jobstore.mjs (leaf module, no jobs <-> job-runner cycle); re-exported here.
 export { STOP_GRACE_MS };
-// A parked user-input request is answered with INPUT_TIMEOUT_ANSWER after this long.
+// A parked user-input request is declined after this long, with INPUT_TIMEOUT_ANSWER as the reason.
 export const DEFAULT_INPUT_TIMEOUT_MS = 1800000;
 export const INPUT_TIMEOUT_ANSWER = 'No answer available, decide yourself and continue';
 
@@ -369,13 +369,13 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     inputTimer = setTimeout(() => {
       inputTimer = null;
       if (closed || !control) return;
-      answerQuestion(INPUT_TIMEOUT_ANSWER);
+      replyQuestion(() => control.decline(INPUT_TIMEOUT_ANSWER));
     }, inputTimeoutMs);
   };
-  // Answers the oldest parked question; false when the client has none (any more).
-  const answerQuestion = (text) => {
+  // Replies to the oldest parked question via reply(); false when the client has none (any more).
+  const replyQuestion = (reply) => {
     let r;
-    try { r = control.answer(text); } catch { r = { status: 'rejected', reason: 'no_question' }; }
+    try { r = reply(); } catch { r = { status: 'rejected', reason: 'no_question' }; }
     if (r && r.status === 'accepted') {
       questions.shift();
       showQuestion();
@@ -418,7 +418,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
         if (closed) break; // the final cleanup answers what is left
         let ack;
         if (e.kind !== 'send') ack = { status: 'rejected', reason: 'unknown_kind' };
-        else if (questions.length && answerQuestion(e.text)) ack = { status: 'accepted' };
+        else if (questions.length && replyQuestion(() => control.answer(e.text))) ack = { status: 'accepted' };
         else ack = await steer(e.text);
         writeCaps();
         try { writeAck(dir, e.seq, ack); } catch { warn('inbox_ack_failed'); }

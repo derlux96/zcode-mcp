@@ -825,6 +825,22 @@ test('after the run, stop() answers not_supported and steer() rejected closed', 
   assert.deepEqual(control.answer('late'), { status: 'rejected', reason: 'no_question' });
 });
 
+test('decline() declines the parked question with a reason and the turn goes on', async () => {
+  let ctl;
+  const { res, log } = await runWithControl('ask', (c) => { ctl = c; }, {
+    onUserInput: () => { queueMicrotask(() => { ctl.decline('nobody here'); }); },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.response, 'AskUserQuestion was declined: nobody here');
+  const answer = log.find((m) => m.method === undefined && m.id === 'server-ask');
+  assert.deepEqual(answer.result, { action: 'decline', reason: 'nobody here' });
+});
+
+test('decline() with nothing parked is rejected no_question', async () => {
+  const { driven } = await runWithControl('ok', (c) => c.decline('x'));
+  assert.deepEqual(driven, { status: 'rejected', reason: 'no_question' });
+});
+
 test('answer() with nothing parked is rejected no_question', async () => {
   const { driven } = await runWithControl('ok', (c) => c.answer('x'));
   assert.deepEqual(driven, { status: 'rejected', reason: 'no_question' });

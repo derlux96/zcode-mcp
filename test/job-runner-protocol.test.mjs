@@ -478,15 +478,20 @@ test('a question parks the job in needs_input; an inbox entry answers it', async
   assert.equal(fin.inputDeadline, null);
 });
 
-test('an unanswered question is answered with the input-timeout text after input_timeout_ms', async () => {
+test('an unanswered question is declined with the input-timeout text as reason after input_timeout_ms', async () => {
   process.env.FAKE_APPSERVER_MODE = 'ask';
-  const { dir } = mkJob({ cwd: tempCwd(), input_timeout_ms: 300 });
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  const { dir } = mkJob({ cwd, input_timeout_ms: 300 });
   const states = [];
   await runJob(dir, { heartbeatMs: 50, onStatus: (_s, patch) => { if (patch.state) states.push(patch.state); } });
   const res = readResult(dir);
   assert.equal(res.state, 'completed');
-  assert.ok(res.output.includes(INPUT_TIMEOUT_ANSWER));
+  assert.equal(res.output, `AskUserQuestion was declined: ${INPUT_TIMEOUT_ANSWER}`);
   assert.ok(states.includes('needs_input'));
+  const answer = logged(log).find((m) => m.method === undefined && m.id === 'server-ask');
+  assert.deepEqual(answer.result, { action: 'decline', reason: INPUT_TIMEOUT_ANSWER });
 });
 
 test('the status question is one line and redacted', async () => {

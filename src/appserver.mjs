@@ -696,6 +696,9 @@ function retryOptions(transientRetry) {
  *   control.answer(text) -> {status:'accepted'|'rejected', reason?}; answers the
  *                          oldest parked requestUserInput (needs onUserInput),
  *                          rejected 'no_question' when nothing is parked.
+ *   control.decline(reason) -> same, but declines the question
+ *                          ({action:'decline', reason}); ZCode tells the model
+ *                          it was declined and the turn goes on.
  *   control.capabilities -> {stop, steer, userInput}: null until known; stop and
  *                          steer turn false on the first "method not found"
  *                          answer (later calls then return not_supported without
@@ -782,6 +785,15 @@ export async function runTaskWithModel({
   let backingOff = false;
   const stopCtl = new AbortController();
 
+  // Answers the oldest parked requestUserInput with build(params).
+  function replyOldest(build) {
+    const oldest = client.parkedUserInput[0];
+    if (!oldest || !client.respond(oldest.protocolId, build(oldest.params))) {
+      return { status: 'rejected', reason: 'no_question' };
+    }
+    return { status: 'accepted' };
+  }
+
   // The job-control handle given to onControl (see the doc comment above).
   function makeControl() {
     return {
@@ -834,11 +846,10 @@ export async function runTaskWithModel({
         return { status: 'rejected', reason: (result && typeof result.reasonCode === 'string' && result.reasonCode) || 'rejected' };
       },
       answer(text) {
-        const oldest = client.parkedUserInput[0];
-        if (!oldest || !client.respond(oldest.protocolId, buildUserInputAnswer(oldest.params, text))) {
-          return { status: 'rejected', reason: 'no_question' };
-        }
-        return { status: 'accepted' };
+        return replyOldest((params) => buildUserInputAnswer(params, text));
+      },
+      decline(reason) {
+        return replyOldest(() => buildUserInputDecline(reason));
       },
     };
   }

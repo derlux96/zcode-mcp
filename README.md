@@ -142,8 +142,9 @@ create no job.
   short message. When ZCode asks the user a question, the job goes to the non-terminal state
   `needs_input`; `zcode_status` then shows `question:`, `input_deadline:` and the hint
   `answer with zcode_send <job_id> "<text>"`. The text of that call is the answer. If nobody answers
-  within `input_timeout_ms` (`zcode_run`, default 1800000 = 30 min, max 21600000) ZCode is told
-  `No answer available, decide yourself and continue`. The server waits up to 5 s for the runner's
+  within `input_timeout_ms` (`zcode_run`, default 1800000 = 30 min, max 21600000) the question is
+  declined with the reason `No answer available, decide yourself and continue`; ZCode tells the
+  model the question was declined and the turn goes on. The server waits up to 5 s for the runner's
   acknowledgement; later it answers `queued`. On the CLI path `zcode_send` is an error
   (`Sending messages is not supported on the CLI path`).
 - **Graceful cancel**: `zcode_cancel` first asks ZCode to stop its session (up to 10 s) and only then

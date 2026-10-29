@@ -100,7 +100,7 @@ const toolSchemas = {
           type: 'integer',
           minimum: 1,
           maximum: MAX_TIMEOUT_MS,
-          description: `Protocol path only: how long a question from ZCode (status needs_input) waits for an answer via zcode_send. Default 1800000 (30 min), max ${MAX_TIMEOUT_MS}. After that ZCode is told to decide itself and continue. Rejected on the CLI path, which cannot ask questions.`,
+          description: `Protocol path only: how long a question from ZCode (status needs_input) waits for an answer via zcode_send. Default 1800000 (30 min), max ${MAX_TIMEOUT_MS}. After that the question is declined and ZCode is told to decide itself and continue. Rejected on the CLI path, which cannot ask questions.`,
         },
       },
       required: ['prompt', 'cwd'],
