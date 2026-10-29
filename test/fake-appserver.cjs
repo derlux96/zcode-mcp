@@ -81,6 +81,8 @@
 //             payload.error {code:'aborted', message:'429 rate limit'} —
 //             deliberately transient-looking, so a client that retries after
 //             a stop is caught.
+//             FAKE_APPSERVER_STOP_COMPLETES=1: the in-flight turn ends in
+//             turn.completed instead (the model finished as the stop landed).
 //   v4/command    answers {status:'accepted'} for type 'sendText' while a turn
 //             is in flight, else {status:'rejected', reasonCode:'idle'}.
 // FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop' and/or 'steer'; those
@@ -427,9 +429,14 @@ function handleStop(req) {
   if (!inFlight) return;
   const turn = inFlight;
   inFlight = null;
-  stoppedSends.add(turn.id);
   if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
   if (askReq === turn) askReq = null;
+  if (process.env.FAKE_APPSERVER_STOP_COMPLETES === '1') {
+    emitTurn(turn);
+    stoppedSends.add(turn.id);
+    return;
+  }
+  stoppedSends.add(turn.id);
   send({
     method: 'session/event',
     params: {

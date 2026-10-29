@@ -527,6 +527,7 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     retries,
     retryOutcome,
     usage: (res && res.usage) || (error && error.usage) || null,
+    stopped: !!((res && res.stopped) || (error && error.stopped)),
     controlled: true,
   };
 }
@@ -626,9 +627,11 @@ export async function runJob(dir, opts = {}) {
     }
     clearInterval(heartbeat);
     clearInterval(cancelPoll);
-    // A cancel whose ZCode exit was seen before the abort (signal or cancel-file
-    // poll) is still a cancel; a genuinely completed run stays completed.
-    if (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile))) {
+    // A graceful stop (session/stop sent) is a cancel whatever turn type ended it;
+    // output, changes and session id are kept. Without a stop, a cancel whose ZCode
+    // exit was seen before the abort (signal or cancel-file poll) is still a cancel,
+    // but a genuinely completed run stays completed.
+    if (run.stopped || (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile)))) {
       run = { ...run, ...CANCELLED, ...(run.retryOutcome && run.retryOutcome !== 'exhausted' ? { retryOutcome: 'cancelled' } : {}) };
     }
 

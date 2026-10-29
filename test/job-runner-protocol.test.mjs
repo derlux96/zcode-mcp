@@ -637,3 +637,46 @@ test('redaction runs before the output cap: a key straddling the cap is not part
     delete process.env.FAKE_APPSERVER_RESPONSE;
   }
 });
+
+test('a graceful stop whose turn ends turn.completed is still recorded cancelled, keeping output and session id', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  process.env.FAKE_APPSERVER_STOP_COMPLETES = '1';
+  const cwd = tempCwd();
+  const log = join(cwd, 'rx.log');
+  process.env.FAKE_APPSERVER_LOG = log;
+  try {
+    const { dir } = mkJob({ cwd });
+    const done = runJob(dir, { heartbeatMs: 50 });
+    await controlReady(dir);
+    await waitFor(() => logged(log).some((m) => m.method === 'session/send'));
+    writeFileSync(join(dir, 'cancel'), '');
+    await done;
+    assert.ok(logged(log).some((m) => m.method === 'session/stop'));
+    const res = readResult(dir);
+    assert.equal(res.state, 'cancelled');
+    assert.equal(res.errorKind, 'cancelled');
+    assert.equal(res.sessionId, 'sess_fakeB1');
+    assert.equal(res.output, 'fake model task done');
+    assert.equal(readStatus(dir).state, 'cancelled');
+  } finally {
+    delete process.env.FAKE_APPSERVER_STOP_COMPLETES;
+  }
+});
+
+test('runTaskWithModel reports stopped: true when a stop was sent before the turn ended', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  process.env.FAKE_APPSERVER_STOP_COMPLETES = '1';
+  try {
+    const res = await runTaskWithModel({
+      binPath: fakeAppServer, cwd: tempCwd(), prompt: 'p', timeoutMs: 10000,
+      onControl: (c) => { setTimeout(() => { c.stop(); }, 200); },
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.stopped, true);
+  } finally {
+    delete process.env.FAKE_APPSERVER_STOP_COMPLETES;
+  }
+  process.env.FAKE_APPSERVER_MODE = 'ok';
+  const plain = await runTaskWithModel({ binPath: fakeAppServer, cwd: tempCwd(), prompt: 'p', timeoutMs: 10000 });
+  assert.equal(plain.stopped, false);
+});

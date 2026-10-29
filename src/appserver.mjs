@@ -847,12 +847,15 @@ export async function runTaskWithModel({
         throw err instanceof AppServerError && err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
       }
       usage = addUsage(usage, event.payload && event.payload.usage);
+      // stopped: a session/stop was sent before this terminal event arrived; the
+      // caller records the job cancelled even when the turn completed.
+      const stopped = stopRequested;
       if (event.type === 'turn.completed') {
-        return { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
+        return { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null, stopped };
       }
       const raw = (event.payload && event.payload.error) || {};
       const error = turnError(raw);
-      const failed = (retryStop) => ({ ...base, usage, ok: false, response: null, failed: true, error, retryStop });
+      const failed = (retryStop) => ({ ...base, usage, ok: false, response: null, failed: true, error, retryStop, stopped: stopped || stopRequested });
       if (stopRequested) return failed(null); // a stopped turn is never retried
       const cls = retry.classify(error) || {};
       if (!cls.transient) return failed(null);
@@ -894,6 +897,7 @@ export async function runTaskWithModel({
     if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
     if (retries.length && out && typeof out === 'object') out.retries = retries;
     if (out && typeof out === 'object') out.usage = usage;
+    if (out && typeof out === 'object') out.stopped = stopRequested;
     throw out;
   } finally {
     await client.close();
