@@ -69,6 +69,9 @@
 // FAKE_APPSERVER_LOG: path; every received message is appended as one JSON
 // line (lets tests assert exact wire params the client sent).
 //
+// FAKE_APPSERVER_RESPONSE: JSON string used as the turn.completed response of
+// the non-scripted modes (ok, chatty, tools, flood) instead of the default.
+//
 // FAKE_APPSERVER_ASK_QUESTION: JSON value used as the question of mode ask's
 // requestUserInput instead of 'Which port?' (non-string question tests).
 //
@@ -500,7 +503,9 @@ function emitTurn(req, scripted = null, responseOverride = null) {
         timestamp: 1792184703455,
         type: 'turn.completed',
         payload: {
-          response: responseOverride !== null ? responseOverride : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
+          response: responseOverride !== null ? responseOverride
+            : process.env.FAKE_APPSERVER_RESPONSE ? JSON.parse(process.env.FAKE_APPSERVER_RESPONSE)
+            : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
           tokenCount: 32485,
           usage: { source: 'provider', modelRequestCount: 1, inputTokens: 100, outputTokens: 5, totalTokens: 105, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,

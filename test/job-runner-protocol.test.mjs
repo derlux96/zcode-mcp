@@ -619,3 +619,21 @@ test('without steer support an inbox entry is acked not_supported', async () => 
   await done;
   assert.equal(readStatus(dir).capabilities.steer, false);
 });
+
+test('redaction runs before the output cap: a key straddling the cap is not partly leaked', async () => {
+  const { OUTPUT_CAP } = await import('../src/runner.mjs');
+  process.env.FAKE_APPSERVER_MODE = 'ok';
+  // The cap keeps 'sk-abc123def45' (11 chars after sk-): too short for the sk- rule on its own.
+  process.env.FAKE_APPSERVER_RESPONSE = JSON.stringify('x'.repeat(OUTPUT_CAP - 15) + ' sk-abc123def456ghi789jkl tail');
+  try {
+    const { dir } = mkJob({ cwd: tempCwd() });
+    await runJob(dir);
+    const res = readResult(dir);
+    assert.equal(res.state, 'completed');
+    assert.ok(!res.output.includes('sk-abc'), 'partial key leaked past the cap: ' + res.output.slice(-120));
+    assert.ok(res.output.includes('[REDACTED]'));
+    assert.match(res.output, /output truncated at/);
+  } finally {
+    delete process.env.FAKE_APPSERVER_RESPONSE;
+  }
+});

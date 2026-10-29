@@ -675,7 +675,7 @@ export async function runJob(dir, opts = {}) {
     writeResult(dir, {
       state,
       sessionId,
-      output: redactText(cap(run.output)),
+      output: cap(redactText(run.output)),
       outputLogPath,
       changedFiles: changes.changedFiles,
       diffStat: changes.diffStat,
@@ -686,7 +686,7 @@ export async function runJob(dir, opts = {}) {
       errorMessage: errorMessage == null ? errorMessage : redactText(errorMessage),
       timeoutKind: run.timeoutKind,
       exitCode: run.exitCode,
-      stderr: redactText(cap(run.stderr)),
+      stderr: cap(redactText(run.stderr)),
       durationMs: Date.now() - startedMs,
       ...(run.retries ? { retries: run.retries, retryOutcome: run.retryOutcome } : {}),
       ...(run.usage ? { usage: run.usage } : {}),
