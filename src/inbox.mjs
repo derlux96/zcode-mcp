@@ -75,11 +75,13 @@ export function readPending(dir, afterSeq, { staleMs = INBOX_STALE_RESERVATION_M
   return out;
 }
 
-export function writeAck(dir, seq, { status, reason } = {}) {
+export function writeAck(dir, seq, { status, reason, delivery } = {}) {
   const inbox = inboxDir(dir);
   ensurePrivateDir(inbox);
   const ack = { status };
   if (reason !== undefined) ack.reason = reason;
+  // How ZCode took an accepted steer: 'guide' (into the running turn) or 'queue' (a follow-up turn).
+  if (typeof delivery === 'string') ack.delivery = delivery;
   ack.at = new Date().toISOString();
   writeJsonAtomic(join(inbox, `${name(seq)}.ack.json`), ack);
 }

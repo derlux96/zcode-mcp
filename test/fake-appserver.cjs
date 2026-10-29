@@ -14,7 +14,9 @@
 //   fail      same as ok, but the turn ends in turn.failed with
 //             payload.error.message "fake model failure"
 //   slowhang  answers create + subscribe, acks send, then never emits the
-//             turn event (client timeout path)
+//             turn event (client timeout path); with
+//             FAKE_APPSERVER_SLOWHANG_STARTED=1 it emits turn.started first
+//             (the turn is visibly under way, but never ends)
 //   flood     acks send, then emits 2005 model.streaming session/event
 //             notifications before turn.completed — exceeds the client's
 //             EVENT_BUFFER_CAP (2000) while a waiter is live (regression
@@ -102,10 +104,27 @@
 //             a stop is caught.
 //             FAKE_APPSERVER_STOP_COMPLETES=1: the in-flight turn ends in
 //             turn.completed instead (the model finished as the stop landed).
-//   v4/command    answers {status:'accepted'} for type 'sendText' while a turn
-//             is in flight, else {status:'rejected', reasonCode:'idle'}.
-// FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop' and/or 'steer'; those
-// methods (session/stop, v4/command) answer error -32601 "Method not found".
+//   v4/command    models ZCode 0.17.0's follow-up routing (bundle reading +
+//             probe): the session's followupMode starts 'queue', autoDrain true.
+//             sendText while a turn is in flight -> {status:'accepted',
+//             result:{type:'inputAccepted', delivery}} with delivery 'guide'
+//             when followupMode is 'guide', else 'queue', plus a
+//             turn.steerQueued session/event. 'guide': a turn.steerDrained
+//             follows shortly (at the latest right before the turn ends) and
+//             the turn.completed response gets "\nsteered: <texts joined ' | '>".
+//             'queue': the text is held; a turn that completes with held texts
+//             sets autoDrain false (ZCode holds the queue: no new turn).
+//             sendText with no turn in flight -> {status:'rejected', reasonCode:'idle'}.
+//             setFollowupMode {payload:{mode}} -> {status:'accepted'}.
+//             setAutoDrain {payload:{autoDrain}} -> {status:'accepted'}; true
+//             with held texts and no turn in flight starts a new turn (no
+//             session/send) whose response is "fake follow-up turn: " + the
+//             held texts joined with "\n\n".
+//             Other command types -> {status:'rejected', reasonCode:'unknown_command'}.
+// FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop', 'steer', 'followup',
+// 'autodrain'; session/stop, v4/command (all types), and the v4/command types
+// setFollowupMode / setAutoDrain answer error -32601 "Method not found".
+// FAKE_APPSERVER_AUTODRAIN_NOOP=1: setAutoDrain is accepted but never starts a turn.
 //
 // Trap enforcement: server-initiated requests must be answered with their
 // documented result within 2 s or this process FAILS the connection
@@ -210,6 +229,13 @@ let askReq = null; // session/send waiting on the parked requestUserInput answer
 let inFlight = null; // session/send whose turn has not ended yet
 let chattyTimer = null;
 const stoppedSends = new Set(); // send ids whose turn was ended by session/stop
+// v4/command follow-up routing state (see the header).
+let followupMode = 'queue';
+let autoDrain = true;
+const heldTexts = []; // sendText texts delivered 'queue', waiting for a drain
+let guided = []; // sendText texts delivered 'guide' into the current turn
+let undrained = []; // guide texts whose turn.steerDrained is not out yet
+let drainTurns = 0;
 
 function answerArrived(msg) {
   if (msg.id === 'server-ask') {
@@ -411,7 +437,20 @@ function handleSend(req) {
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: n } });
   inFlight = req;
-  if (MODE === 'slowhang') return;
+  guided = [];
+  if (MODE === 'slowhang') {
+    if (process.env.FAKE_APPSERVER_SLOWHANG_STARTED === '1') {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_slow_${n}`, seq: 10, timestamp: Date.now(), type: 'turn.started',
+          payload: { executionStartedAt: Date.now(), turnNumber: 0, input: (req.params && req.params.content) || '', inputId: `in_slow${n}` },
+        },
+      });
+    }
+    return;
+  }
   if (FAIL_MODES[MODE]) {
     // Later sends continue the same session: no second prefs/auth probe.
     if (n === 1) {
@@ -536,15 +575,70 @@ function handleStop(req) {
   });
 }
 
+function steerEvent(type, payload) {
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_fake1', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_${type}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, seq: 500, timestamp: Date.now(), type, payload,
+    },
+  });
+}
+
+function flushDrains() {
+  const texts = undrained;
+  undrained = [];
+  for (const text of texts) steerEvent('turn.steerDrained', { text, delivery: 'guide' });
+}
+
 function handleCommand(req) {
   const p = req.params || {};
-  if (p.type === 'sendText' && inFlight) send({ id: req.id, result: { status: 'accepted' } });
-  else send({ id: req.id, result: { status: 'rejected', reasonCode: 'idle' } });
+  const payload = p.payload && typeof p.payload === 'object' ? p.payload : {};
+  const unsupported = () => send({ id: req.id, error: { code: -32601, message: `Method not found: v4/command ${p.type}` } });
+  if (p.type === 'sendText') {
+    if (!inFlight) return send({ id: req.id, result: { status: 'rejected', reasonCode: 'idle' } });
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    const delivery = followupMode === 'guide' ? 'guide' : 'queue';
+    send({ id: req.id, result: { status: 'accepted', result: { type: 'inputAccepted', delivery } } });
+    steerEvent('turn.steerQueued', { text, delivery });
+    if (delivery === 'guide') {
+      guided.push(text);
+      undrained.push(text);
+      setTimeout(flushDrains, 10);
+    } else {
+      heldTexts.push(text);
+    }
+    return;
+  }
+  if (p.type === 'setFollowupMode') {
+    if (UNSUPPORTED.has('followup')) return unsupported();
+    followupMode = payload.mode;
+    return send({ id: req.id, result: { status: 'accepted' } });
+  }
+  if (p.type === 'setAutoDrain') {
+    if (UNSUPPORTED.has('autodrain')) return unsupported();
+    autoDrain = payload.autoDrain === true;
+    send({ id: req.id, result: { status: 'accepted' } });
+    if (autoDrain && heldTexts.length && !inFlight && process.env.FAKE_APPSERVER_AUTODRAIN_NOOP !== '1') {
+      const content = heldTexts.splice(0).join('\n\n');
+      const turn = { id: `drain-${++drainTurns}`, params: { content } };
+      inFlight = turn;
+      guided = [];
+      setTimeout(() => emitTurn(turn, null, `fake follow-up turn: ${content}`), 25);
+    }
+    return;
+  }
+  send({ id: req.id, result: { status: 'rejected', reasonCode: 'unknown_command' } });
 }
 
 function emitTurn(req, scripted = null, responseOverride = null) {
   if (stoppedSends.has(req.id)) return; // the stop already ended this turn
   if (inFlight === req) inFlight = null;
+  flushDrains(); // guided texts are drained before the turn ends
+  // ZCode holds texts still queued when a turn ends: no automatic new turn.
+  if (heldTexts.length) autoDrain = false;
+  const steered = guided.length ? `\nsteered: ${guided.join(' | ')}` : '';
+  guided = [];
   const input = (req.params && req.params.content) || '';
   const n = scripted ? scripted.n : 1;
   const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001' };
@@ -599,9 +693,9 @@ function emitTurn(req, scripted = null, responseOverride = null) {
         timestamp: 1792184703455,
         type: 'turn.completed',
         payload: {
-          response: responseOverride !== null ? responseOverride
+          response: (responseOverride !== null ? responseOverride
             : process.env.FAKE_APPSERVER_RESPONSE ? JSON.parse(process.env.FAKE_APPSERVER_RESPONSE)
-            : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
+            : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done') + steered,
           tokenCount: 32485,
           usage: { source: 'provider', modelRequestCount: 1, inputTokens: 100, outputTokens: 5, totalTokens: 105, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,

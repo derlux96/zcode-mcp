@@ -636,6 +636,8 @@ function buildSendHandler() {
     if (!r.ok) return failText(r.error);
     const lines = [`send: ${r.status}`];
     if (r.reason) lines.push(`reason: ${oneLine(r.reason)}`);
+    if (r.delivery === 'guide') lines.push('delivery: guide (into the running turn)');
+    else if (r.delivery === 'queue') lines.push('delivery: queue (ZCode runs it as a follow-up turn once the current turn ends)');
     lines.push(`job_id: ${r.view.jobId}`, `status: ${oneLine(r.view.state)}`);
     if (r.status === 'queued') lines.push(`the message will be delivered when the job is ready; check zcode_status ${r.view.jobId}`);
     const result = text(lines.join('\n'));

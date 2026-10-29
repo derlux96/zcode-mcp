@@ -574,6 +574,9 @@ export function addUsage(acc, u) {
 
 export const DEFAULT_RETRY_DELAYS_MS = [30000, 60000, 120000, 300000, 600000, 900000];
 export const DEFAULT_MAX_TRANSIENT_RETRIES = 6;
+// How long a setAutoDrain may take to start the follow-up turn before the held
+// steers are sent with session/send instead.
+export const DEFAULT_AUTO_DRAIN_WAIT_MS = 10000;
 
 // Abortable wait for a backoff; the timer is cleared when `signal` aborts.
 function abortableSleep(ms, signal) {
@@ -689,17 +692,32 @@ function retryOptions(transientRetry) {
  *                          without any retry, whatever its error looks like, and
  *                          a running backoff ends at once. Other request errors
  *                          (e.g. request_timeout) reject.
- *   control.steer(text) -> Promise<{status:'accepted'|'rejected'|'not_supported', reason?}>;
- *                          sends a v4/command sendText with delivery 'guide';
- *                          rejected 'retry' during a backoff, else the server's
- *                          reasonCode. Other request errors reject.
+ *   control.steer(text) -> Promise<{status:'accepted', delivery} | {status:'rejected'|'not_supported', reason?}>;
+ *                          before the session's first steer sends v4/command
+ *                          setFollowupMode {mode:'guide'} (any answer is no
+ *                          blocker; capabilities.followupMode records it), then a
+ *                          v4/command sendText with delivery 'guide'. delivery is
+ *                          the server's result.result.delivery ('guide': worked
+ *                          into the running turn; 'queue': held until the turn
+ *                          ends) or null. rejected 'retry' during a backoff, else
+ *                          the server's reasonCode. Other request errors reject.
+ *                          Steers ZCode still holds when a turn completes
+ *                          (delivery 'queue', or more turn.steerQueued than
+ *                          turn.steerDrained events) are delivered as a follow-up
+ *                          turn: v4/command setAutoDrain {autoDrain:true}, then
+ *                          the turn ZCode starts within autoDrainWaitMs (default
+ *                          10 s); when that is unsupported, rejected or no turn
+ *                          starts, a session/send of the texts joined by a blank
+ *                          line. The last turn's outcome is returned (usage summed).
+ *                          Not after a stop: steers left over are then returned
+ *                          as undeliveredSteers (string[], only when non-empty).
  *   control.answer(text) -> {status:'accepted'|'rejected', reason?}; answers the
  *                          oldest parked requestUserInput (needs onUserInput),
  *                          rejected 'no_question' when nothing is parked.
  *   control.decline(reason) -> same, but declines the question
  *                          ({action:'decline', reason}); ZCode tells the model
  *                          it was declined and the turn goes on.
- *   control.capabilities -> {stop, steer, userInput}: null until known; stop and
+ *   control.capabilities -> {stop, steer, userInput, followupMode}: null until known; stop and
  *                          steer turn false on the first "method not found"
  *                          answer (later calls then return not_supported without
  *                          a request), true on any other answer; userInput turns
@@ -735,6 +753,7 @@ export async function runTaskWithModel({
   onControl,
   signal,
   transientRetry,
+  autoDrainWaitMs = DEFAULT_AUTO_DRAIN_WAIT_MS,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new TypeError('prompt must be a non-empty string');
@@ -764,14 +783,25 @@ export async function runTaskWithModel({
   const turnTimeout = (ms) => new AppServerError(`timed out after ${ms} ms waiting for session/event turn.completed|turn.failed`, { code: 'turn_timeout' });
   if (signal && signal.aborted) throw aborted();
   let client;
-  const capabilities = { stop: null, steer: null, userInput: null };
+  const capabilities = { stop: null, steer: null, userInput: null, followupMode: null };
   // Only hook requestUserInput when the caller listens; otherwise the client
   // answers {} at once and nothing can be left parked forever.
   const userInputHook = typeof onUserInput === 'function'
     ? (req) => { capabilities.userInput = true; onUserInput(req); }
     : undefined;
+  // Accepted steers, oldest first: { text, delivery, delivered }. With the
+  // counts of turn.steerQueued / turn.steerDrained seen since the last
+  // delivery they tell which steers ZCode still holds (pendingSteers).
+  const steers = [];
+  const steerEvents = { queued: 0, drained: 0 };
+  const inflightSteers = new Set();
+  const observe = (params) => {
+    if (params && params.type === 'turn.steerQueued') steerEvents.queued += 1;
+    else if (params && params.type === 'turn.steerDrained') steerEvents.drained += 1;
+    if (typeof onEvent === 'function') onEvent(params);
+  };
   try {
-    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, onUserInput: userInputHook, signal });
+    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent: observe, onUserInput: userInputHook, signal });
   } catch (err) {
     if (err instanceof AppServerError) err.startup = true;
     throw err;
@@ -784,6 +814,70 @@ export async function runTaskWithModel({
   let stopRequested = false;
   let backingOff = false;
   const stopCtl = new AbortController();
+
+  // A v4/command envelope (the shape the steer probe verified).
+  function command(prefix, type, payload) {
+    const now = Date.now();
+    return { commandId: `${prefix}-${sessionId}-${now}-${++steerSeq}`, clientId: 'zcode-delegate', sessionId, type, payload, issuedAt: now };
+  }
+
+  // Once per session, before the first steer: ask ZCode to route sends during
+  // a turn as 'guide' (injected mid-turn) instead of its default 'queue'.
+  // Any answer but 'accepted' (including "method not found") is no blocker.
+  let followupModeSet = null;
+  async function setFollowupMode() {
+    try {
+      const r = await client.request('v4/command', command('followup', 'setFollowupMode', { mode: 'guide' }));
+      capabilities.followupMode = !!(r && r.status === 'accepted');
+    } catch (err) {
+      if (isGone(err)) return;
+      capabilities.followupMode = false;
+    }
+  }
+
+  async function sendSteer(text) {
+    if (!followupModeSet) followupModeSet = setFollowupMode();
+    await followupModeSet;
+    let result;
+    try {
+      result = await client.request('v4/command', command('steer', 'sendText', { text, delivery: { requested: 'guide' } }));
+    } catch (err) {
+      if (notSupported(err)) {
+        capabilities.steer = false;
+        return { status: 'not_supported' };
+      }
+      if (isGone(err)) return { status: 'rejected', reason: 'closed' };
+      throw err;
+    }
+    capabilities.steer = true;
+    if (result && result.status === 'accepted') {
+      const d = result.result && typeof result.result === 'object' ? result.result.delivery : undefined;
+      const delivery = typeof d === 'string' ? d : null;
+      steers.push({ text, delivery, delivered: false });
+      return { status: 'accepted', delivery };
+    }
+    return { status: 'rejected', reason: (result && typeof result.reasonCode === 'string' && result.reasonCode) || 'rejected' };
+  }
+
+  // Accepted steers ZCode has not worked into a turn: those it answered
+  // 'queue', plus — when it reported more turn.steerQueued than
+  // turn.steerDrained events than the queued ones explain — the newest of
+  // the others (accepted as 'guide' or without a delivery).
+  async function pendingSteers() {
+    if (inflightSteers.size) await Promise.allSettled([...inflightSteers]);
+    const open = steers.filter((e) => !e.delivered);
+    const queued = open.filter((e) => e.delivery === 'queue');
+    const others = open.filter((e) => e.delivery !== 'queue');
+    const excess = Math.min(others.length, Math.max(0, steerEvents.queued - steerEvents.drained - queued.length));
+    const late = excess > 0 ? others.slice(-excess) : [];
+    return open.filter((e) => queued.includes(e) || late.includes(e));
+  }
+
+  function markDelivered(list) {
+    for (const e of list) e.delivered = true;
+    steerEvents.queued = 0;
+    steerEvents.drained = 0;
+  }
 
   // Answers the oldest parked requestUserInput with build(params).
   function replyOldest(build) {
@@ -821,29 +915,13 @@ export async function runTaskWithModel({
       async steer(text) {
         if (capabilities.steer === false) return { status: 'not_supported' };
         if (backingOff) return { status: 'rejected', reason: 'retry' };
-        const now = Date.now();
-        const command = {
-          commandId: `steer-${sessionId}-${now}-${++steerSeq}`,
-          clientId: 'zcode-delegate',
-          sessionId,
-          type: 'sendText',
-          payload: { text, delivery: { requested: 'guide' } },
-          issuedAt: now,
-        };
-        let result;
+        const p = sendSteer(text);
+        inflightSteers.add(p);
         try {
-          result = await client.request('v4/command', command);
-        } catch (err) {
-          if (notSupported(err)) {
-            capabilities.steer = false;
-            return { status: 'not_supported' };
-          }
-          if (isGone(err)) return { status: 'rejected', reason: 'closed' };
-          throw err;
+          return await p;
+        } finally {
+          inflightSteers.delete(p);
         }
-        capabilities.steer = true;
-        if (result && result.status === 'accepted') return { status: 'accepted' };
-        return { status: 'rejected', reason: (result && typeof result.reasonCode === 'string' && result.reasonCode) || 'rejected' };
       },
       answer(text) {
         return replyOldest((params) => buildUserInputAnswer(params, text));
@@ -852,6 +930,34 @@ export async function runTaskWithModel({
         return replyOldest(() => buildUserInputDecline(reason));
       },
     };
+  }
+
+  // Delivers held steers after a completed turn: setAutoDrain lets ZCode run its
+  // queue as a new turn ({startedAt: cursor} once its turn.started arrives within
+  // autoDrainWaitMs); when that is unsupported, rejected or no turn starts, the
+  // texts go out as a new session/send ({startedAt: null, content}).
+  async function deliverPending(pending, deadline) {
+    const texts = pending.map((e) => e.text);
+    markDelivered(pending);
+    const cursor = client.eventOrdinal;
+    let accepted = false;
+    try {
+      const r = await client.request('v4/command', command('autodrain', 'setAutoDrain', { autoDrain: true }));
+      accepted = !!(r && r.status === 'accepted');
+    } catch (err) {
+      if (isGone(err)) throw err;
+    }
+    if (accepted) {
+      const left = deadline === null ? autoDrainWaitMs : Math.min(autoDrainWaitMs, deadline - Date.now());
+      if (left <= 0) throw turnTimeout(timeoutMs);
+      try {
+        await client.waitForEvent('turn.started', { timeoutMs: left, since: cursor });
+        return { startedAt: cursor, content: null };
+      } catch (err) {
+        if (!(err instanceof AppServerError && err.code === 'turn_timeout')) throw err;
+      }
+    }
+    return { startedAt: null, content: texts.join('\n\n') };
   }
 
   try {
@@ -905,9 +1011,19 @@ export async function runTaskWithModel({
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
     const base = { sessionId, catalog, model: { providerId, modelId }, reasoningSubstitution, retries };
     let content = prompt;
+    let startedAt = null; // cursor of a turn ZCode started without our session/send (auto-drain)
+    // Steers ZCode never worked into a turn are reported on the result.
+    const withUndelivered = async (out) => {
+      const left = (await pendingSteers()).map((e) => e.text);
+      return left.length ? { ...out, undeliveredSteers: left } : out;
+    };
     for (;;) {
-      const cursor = client.eventOrdinal;
-      await client.request('session/send', { sessionId, content, modelSelection });
+      let cursor = startedAt;
+      startedAt = null;
+      if (cursor === null) {
+        cursor = client.eventOrdinal;
+        await client.request('session/send', { sessionId, content, modelSelection });
+      }
       const left = deadline === null ? 0 : deadline - Date.now();
       if (deadline !== null && left <= 0) throw turnTimeout(timeoutMs);
       let event;
@@ -921,11 +1037,20 @@ export async function runTaskWithModel({
       // caller records the job cancelled even when the turn completed.
       const stopped = stopRequested;
       if (event.type === 'turn.completed') {
-        return { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null, stopped };
+        const completed = { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null, stopped };
+        // ZCode holds steers it queued (followupMode 'queue') once the turn ends:
+        // deliver them as a follow-up turn, whose outcome is then returned.
+        const pending = stopRequested ? [] : await pendingSteers();
+        if (!pending.length || stopRequested) return withUndelivered({ ...completed, stopped: stopped || stopRequested });
+        const drain = await deliverPending(pending, deadline);
+        if (stopRequested) return withUndelivered({ ...completed, stopped: true });
+        if (drain.startedAt !== null) startedAt = drain.startedAt;
+        else content = drain.content;
+        continue;
       }
       const raw = (event.payload && event.payload.error) || {};
       const error = turnError(raw);
-      const failed = (retryStop) => ({ ...base, usage, ok: false, response: null, failed: true, error, retryStop, stopped: stopped || stopRequested });
+      const failed = (retryStop) => withUndelivered({ ...base, usage, ok: false, response: null, failed: true, error, retryStop, stopped: stopped || stopRequested });
       if (stopRequested) return failed(null); // a stopped turn is never retried
       const cls = retry.classify(error) || {};
       if (!cls.transient) return failed(null);

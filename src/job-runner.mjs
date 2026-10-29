@@ -503,6 +503,8 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   }
   if (error && error.code === 'no-model') return null;
 
+  const undelivered = (res && res.undeliveredSteers) || [];
+  if (undelivered.length) warn(`steers_not_delivered:${undelivered.length}`);
   if (res && res.reasoningSubstitution) {
     warn(`reasoning_level_substituted:${res.reasoningSubstitution.requested}->${res.reasoningSubstitution.used}`);
   }

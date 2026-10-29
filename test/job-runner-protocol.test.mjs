@@ -445,9 +445,10 @@ test('an inbox entry on a running protocol job is sent as a steer and acked acce
   const ack = await waitFor(() => readAck(dir, seq), 2000);
   assert.ok(Date.now() - t0 < 2000);
   assert.equal(ack.status, 'accepted');
+  assert.equal(ack.delivery, 'guide');
   await done;
   assert.equal(readResult(dir).state, 'completed');
-  const cmd = logged(log).find((m) => m.method === 'v4/command');
+  const cmd = logged(log).find((m) => m.method === 'v4/command' && m.params.type === 'sendText');
   assert.ok(cmd, 'a steer was sent');
   assert.equal(cmd.params.payload.text, 'use port 8080');
   assert.equal(readStatus(dir).capabilities.steer, true);
@@ -623,6 +624,45 @@ test('without steer support an inbox entry is acked not_supported', async () => 
   assert.equal(ack.status, 'not_supported');
   await done;
   assert.equal(readStatus(dir).capabilities.steer, false);
+});
+
+test('a steer ZCode queues is acked with delivery queue and runs as a follow-up turn', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  process.env.FAKE_APPSERVER_UNSUPPORTED = 'followup';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const done = runJob(dir, { heartbeatMs: 50 });
+  await controlReady(dir);
+  const seq = writeInboxEntry(dir, { kind: 'send', text: 'use port 8080' });
+  const ack = await waitFor(() => readAck(dir, seq), 2000);
+  assert.deepEqual({ status: ack.status, delivery: ack.delivery }, { status: 'accepted', delivery: 'queue' });
+  await done;
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.equal(res.output, 'fake follow-up turn: use port 8080');
+  assert.equal(readStatus(dir).capabilities.followupMode, false);
+});
+
+test('a queued steer left when the job is cancelled is reported as a warning', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  process.env.FAKE_APPSERVER_UNSUPPORTED = 'followup';
+  process.env.FAKE_APPSERVER_STOP_COMPLETES = '1';
+  process.env.FAKE_APPSERVER_SLOWHANG_STARTED = '1'; // the runner steers only once the turn is under way
+  try {
+    const { dir } = mkJob({ cwd: tempCwd() });
+    const done = runJob(dir, { heartbeatMs: 50 });
+    await controlReady(dir);
+    const seq = writeInboxEntry(dir, { kind: 'send', text: 'never mind' });
+    const ack = await waitFor(() => readAck(dir, seq), 3000);
+    assert.equal(ack.delivery, 'queue');
+    writeFileSync(join(dir, 'cancel'), '');
+    await done;
+    const res = readResult(dir);
+    assert.equal(res.state, 'cancelled');
+    assert.ok(res.warnings.includes('steers_not_delivered:1'), JSON.stringify(res.warnings));
+  } finally {
+    delete process.env.FAKE_APPSERVER_STOP_COMPLETES;
+    delete process.env.FAKE_APPSERVER_SLOWHANG_STARTED;
+  }
 });
 
 test('redaction runs before the output cap: a key straddling the cap is not partly leaked', async () => {

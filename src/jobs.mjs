@@ -437,6 +437,7 @@ export async function sendToJob(jobId, text, { ackWaitMs = SEND_ACK_WAIT_MS, sig
     ok: true,
     status: ack.status,
     ...(ack.reason ? { reason: oneLine(String(ack.reason)) } : {}),
+    ...(ack.delivery === 'guide' || ack.delivery === 'queue' ? { delivery: ack.delivery } : {}),
     view: after,
   };
 }

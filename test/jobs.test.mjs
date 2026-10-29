@@ -554,10 +554,11 @@ test('sendToJob maps a rejected/finished ack to the finished error and passes ot
   setTimeout(() => writeAck(job.dir, 1, { status: 'rejected', reason: 'finished' }), 50);
   let r = await sendToJob(job.jobId, 'a', { ackWaitMs: 2000 });
   assert.deepEqual([r.ok, r.error], [false, 'job finished before the message was delivered']);
-  setTimeout(() => writeAck(job.dir, 2, { status: 'accepted' }), 50);
+  setTimeout(() => writeAck(job.dir, 2, { status: 'accepted', delivery: 'queue' }), 50);
   r = await sendToJob(job.jobId, 'b', { ackWaitMs: 2000 });
   assert.equal(r.ok, true);
   assert.equal(r.status, 'accepted');
+  assert.equal(r.delivery, 'queue');
   setTimeout(() => writeAck(job.dir, 3, { status: 'rejected', reason: 'idle' }), 50);
   r = await sendToJob(job.jobId, 'c', { ackWaitMs: 2000 });
   assert.deepEqual([r.ok, r.status, r.reason], [true, 'rejected', 'idle']);
