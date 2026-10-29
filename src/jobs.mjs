@@ -105,7 +105,7 @@ function sleepAbortable(ms, signal) {
       resolve();
     };
     const timer = setTimeout(done, ms);
-    if (signal) signal.addEventListener('abort', done, { once: true });
+    if (signal) signal.addEventListener('abort', done);
   });
 }
 
@@ -345,7 +345,7 @@ async function settle(job, dir, ms) {
   const end = Date.now() + ms;
   for (;;) {
     const s = readStatus(dir);
-    if (s && isTerminal(s.state)) return true;
+    // A terminal state is never alive, so it ends here too.
     if (!aliveFrom(job, s)) return isTerminal((readStatus(dir) || {}).state);
     const left = end - Date.now();
     if (left <= 0) return false;

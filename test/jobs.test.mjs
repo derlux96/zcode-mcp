@@ -1,16 +1,17 @@
 import { test, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
 import {
   aliveFrom, chooseJobPath, isJobAlive, startJob, getJob, waitJob, cancelJob, listJobs, REASONING_LEVELS,
-  sendToJob, SEND_ACK_WAIT_MS,
+  sendToJob, SEND_ACK_WAIT_MS, MAX_SEND_TEXT, formatCatalog, collectChanges, signalJob,
 } from '../src/jobs.mjs';
 import { validateRunArgs } from '../src/runner.mjs';
-import { createJobDir, patchStatus, readJson, readStatus, stateHome, jobsRoot } from '../src/jobstore.mjs';
+import { captureBaseline } from '../src/changes.mjs';
+import { createJobDir, patchStatus, readJson, readStatus, stateHome, jobsRoot, STOP_GRACE_MS } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey, releaseCwdLock } from '../src/locks.mjs';
 import { getProcessIdentity } from '../src/procid.mjs';
 
@@ -220,7 +221,7 @@ test('fourth concurrent job is rejected', async () => {
   const fourth = await startJob({ prompt: 'x', cwd: tempCwd(), mode: 'yolo', timeout_ms: 30000 });
   assert.equal(fourth.ok, false);
   assert.equal(fourth.error, 'too many running jobs (3)');
-  assert.ok(ids.includes(fourth.blockingJobId));
+  assert.equal(fourth.blockingJobId, ids[0], 'the oldest running job is named');
   assert.equal(listJobs().length, 3);
 });
 
@@ -616,4 +617,244 @@ test('input_timeout_ms: validateRunArgs bounds, CLI path rejection, passed to jo
   const r = await startJob({ ...base, model: 'p/m', input_timeout_ms: 60000, timeout_ms: 30000 });
   assert.equal(r.ok, true, r.error);
   assert.equal(getJob(r.jobId).job.params.input_timeout_ms, 60000);
+});
+
+// --- mutation follow-up: guards, boundaries and fallbacks ---
+
+test('aliveFrom: no job, a missing or empty token and a terminal status are never alive', () => {
+  const now = new Date().toISOString();
+  const yes = () => true;
+  assert.equal(aliveFrom(null, null, yes), false);
+  assert.equal(aliveFrom({ createdAt: now }, null, yes), false);
+  assert.equal(aliveFrom({ token: 5, createdAt: now }, null, yes), false);
+  assert.equal(aliveFrom({ token: '', createdAt: now }, null, yes), false);
+  assert.equal(aliveFrom({ token: 't', createdAt: now }, null, yes), true, 'startup grace');
+  for (const state of TERMINAL) assert.equal(aliveFrom({ token: 't', createdAt: now }, { state, pid: 123 }, yes), false, state);
+  assert.equal(aliveFrom({ token: 't', createdAt: now }, { state: 'running', pid: 123 }, yes), true);
+  assert.equal(isJobAlive(null), false);
+  assert.equal(isJobAlive(''), false);
+});
+
+test('aliveFrom passes the recorded pidStart only when it is a string', () => {
+  const seen = [];
+  const match = (e) => { seen.push(e); return true; };
+  aliveFrom({ token: 't' }, { state: 'running', pid: 7, pidStart: 'Mon Jan  1' }, match);
+  aliveFrom({ token: 't' }, { state: 'running', pid: 7, pidStart: 12 }, match);
+  aliveFrom({ token: 't' }, { state: 'running', pid: 7 }, match);
+  assert.deepEqual(seen, [
+    { pid: 7, start: 'Mon Jan  1', token: 't' },
+    { pid: 7, start: null, token: 't' },
+    { pid: 7, start: null, token: 't' },
+  ]);
+});
+
+test('waitJob until terminal does not end on needs_input; until attention ends only there', async () => {
+  const { dir, jobId, token } = handJob();
+  const pid = await spawnHolder(token);
+  patchStatus(dir, { state: 'needs_input', pid, pidStart: getProcessIdentity(pid).start, token, heartbeatAt: new Date().toISOString() });
+  let t0 = Date.now();
+  assert.equal((await waitJob(jobId, { waitMs: 400, until: 'terminal' })).state, 'needs_input');
+  assert.ok(Date.now() - t0 >= 380, 'waited out waitMs');
+  t0 = Date.now();
+  assert.equal((await waitJob(jobId, { waitMs: 3000, until: 'attention' })).state, 'needs_input');
+  assert.ok(Date.now() - t0 < 1000, 'returned at once');
+  patchStatus(dir, { state: 'running' });
+  t0 = Date.now();
+  assert.equal((await waitJob(jobId, { waitMs: 400, until: 'attention' })).state, 'running');
+  assert.ok(Date.now() - t0 >= 380, 'a running job is no reason to return');
+});
+
+test('waitJob until change also ends on a new finishedAt with the same state', async () => {
+  const { dir, jobId, token } = handJob();
+  const pid = await spawnHolder(token);
+  patchStatus(dir, { state: 'running', pid, pidStart: getProcessIdentity(pid).start, token, heartbeatAt: new Date().toISOString(), finishedAt: '2026-01-01T00:00:00.000Z' });
+  setTimeout(() => patchStatus(dir, { finishedAt: new Date().toISOString() }), 150);
+  const t0 = Date.now();
+  const v = await waitJob(jobId, { waitMs: 5000, until: 'change' });
+  assert.ok(Date.now() - t0 < 3000, 'returned on the finishedAt change');
+  assert.equal(v.state, 'running');
+});
+
+test('signalJob: identity and group checks decide which groups get signalled (fake ps, fake signal)', () => {
+  const sleeper = spawnSleep(); // a real group with a member, for the leaderless cases (only probed with signal 0)
+  const { dir, token } = handJob();
+  const job = readJson(join(dir, 'job.json'));
+  const created = Date.parse(job.createdAt);
+  const table = { 101: { lstart: 'S1', command: `node job-runner.mjs ${token}` }, 201: { lstart: 'C1', command: 'zcode' } };
+  const exec = (cmd, args) => {
+    const row = table[args[4]];
+    if (!row) throw Object.assign(new Error('no such process'), { status: 1, stdout: '' });
+    return `${row[args[2].replace('=', '')]}\n`;
+  };
+  const runner = { state: 'running', pid: 101, pidStart: 'S1', token };
+  const child = { childPid: 201, childPgid: 201, childStart: 'C1' };
+  const sig = (status, opts = {}) => {
+    writeFileSync(join(dir, 'status.json'), JSON.stringify(status));
+    const sent = [];
+    const out = signalJob(job, dir, 'SIGTERM', { exec, bootMs: 0, signal: (p) => { sent.push(p); return true; }, ...opts });
+    assert.deepEqual(out, sent);
+    return sent;
+  };
+  assert.deepEqual(sig({ ...runner, ...child }), [101, 201]);
+  assert.deepEqual(sig({ ...runner, ...child }, { runnerGroup: false }), [201]);
+  assert.deepEqual(sig({ ...runner, pidStart: 'other', ...child }), [201], 'a runner that fails the identity check is skipped');
+  assert.deepEqual(sig({ ...runner, ...child, childStart: 'C2' }), [101], 'a child with another start time is skipped');
+  assert.deepEqual(sig({ ...runner, ...child, childPgid: 1 }), [101], 'pgid 1 is never signalled');
+  assert.deepEqual(sig({ ...runner, ...child, childPgid: '201' }), [101]);
+  assert.deepEqual(sig({ ...runner, childPgid: sleeper }), [101], 'no child pid recorded');
+  // Leaderless: the child is gone (not in the ps table), its group still has a member.
+  const gone = { childPid: 999, childPgid: sleeper, childStart: 'C9' };
+  assert.deepEqual(sig({ ...runner, ...gone }, { runnerGroup: false }), [sleeper]);
+  assert.deepEqual(sig({ ...runner, ...gone, childExitedAt: new Date().toISOString() }, { runnerGroup: false }), []);
+  assert.deepEqual(sig({ ...runner, ...gone }, { runnerGroup: false, bootMs: created }), [], 'created at the boot instant is not after it');
+  assert.deepEqual(sig({ ...runner, ...gone }, { runnerGroup: false, bootMs: null }), [sleeper]);
+  const undated = { ...job, createdAt: 'garbage' };
+  writeFileSync(join(dir, 'status.json'), JSON.stringify({ ...runner, ...gone }));
+  assert.deepEqual(signalJob(undated, dir, 'SIGTERM', { exec, bootMs: 0, runnerGroup: false, signal: () => true }), []);
+  assert.equal(alive(sleeper), true);
+  writeFileSync(join(dir, 'status.json'), JSON.stringify({ state: 'failed' }));
+});
+
+test('formatCatalog keeps only entries with a provider and a model id', () => {
+  assert.deepEqual(formatCatalog('nope'), []);
+  assert.deepEqual(formatCatalog([null, {}, { ref: {} }, { ref: { providerId: 'p' } }, { ref: { modelId: 'm' } }, { ref: { providerId: 'p', modelId: 'm' } }]), ['p/m']);
+});
+
+// A spawn hook that records the call and fails like a spawn without a pid.
+function failingSpawn(seen) {
+  return (cmd, args, options) => {
+    seen.push({ cmd, args, options, job: readJson(join(args[1], 'job.json')) });
+    return { pid: undefined, on() {}, unref() {} };
+  };
+}
+
+test('startJob: providerId/modelId is split at the first slash; an empty side goes to the catalog', async () => {
+  for (const [spec, want] of [['p/m', { providerId: 'p', modelId: 'm' }], [' prov/sub/m ', { providerId: 'prov', modelId: 'sub/m' }]]) {
+    const seen = [];
+    const r = await startJob({ prompt: 'x', cwd: tempCwd(), model: spec }, { spawn: failingSpawn(seen) });
+    assert.equal(r.error, 'Could not start the job: could not spawn the job runner');
+    assert.deepEqual(seen[0].job.model, want, spec);
+  }
+  for (const spec of ['/m', 'p/']) {
+    const seen = [];
+    const r = await startJob({ prompt: 'x', cwd: tempCwd(), model: spec }, { spawn: failingSpawn(seen) });
+    assert.equal(r.ok, false);
+    assert.match(r.error, new RegExp(`^Model '${spec}' not found`), spec);
+    assert.equal(seen.length, 0, spec);
+  }
+});
+
+test('startJob spawns a detached runner with the job dir and token, and undoes everything when the spawn fails', async () => {
+  const cwd = realpathSync(tempCwd());
+  const seen = [];
+  const r = await startJob({ prompt: 'x', cwd, mode: 'yolo' }, { spawn: failingSpawn(seen) });
+  assert.equal(r.ok, false);
+  assert.equal(seen.length, 1);
+  const { cmd, args, options, job } = seen[0];
+  assert.equal(cmd, process.execPath);
+  assert.match(args[0], /job-runner\.mjs$/);
+  assert.equal(args[2], job.token);
+  assert.equal(options.detached, true);
+  assert.equal(options.stdio, 'ignore');
+  assert.equal(options.env, process.env);
+  assert.equal(existsSync(args[1]), false, 'job dir removed');
+  assert.deepEqual(listJobs(), []);
+  assert.equal(existsSync(lockFile(cwd)), false, 'lock released');
+});
+
+test('startJob: a job store that breaks during the model lookup fails cleanly', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ok';
+  const pending = startJob({ prompt: 'x', cwd: tempCwd(), model: 'small' }, { spawn: failingSpawn([]) });
+  // The writability check already ran; the catalog lookup is in flight.
+  removeDir(jobsRoot());
+  writeFileSync(jobsRoot(), 'not a directory');
+  const r = await pending;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /^Could not start the job: /);
+});
+
+test('startJob with a state home that is a file fails before spawning', async () => {
+  const file = join(process.env.ZCODE_MCP_HOME, 'home-file');
+  writeFileSync(file, '');
+  process.env.ZCODE_MCP_HOME = file;
+  const seen = [];
+  const r = await startJob({ prompt: 'x', cwd: tempCwd(), mode: 'yolo' }, { spawn: failingSpawn(seen) });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /^State directory is not writable: /);
+  assert.equal(seen.length, 0);
+});
+
+test('collectChanges: worktree summary, a broken worktree, a plain cwd, no params', async () => {
+  const repo = gitCwd();
+  const startSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  writeFileSync(join(repo, 'new.txt'), 'x');
+  const wt = await collectChanges({ worktree: { dir: repo, startSha } });
+  assert.equal(wt.available, true);
+  assert.deepEqual(wt.changedFiles, ['?? new.txt']);
+  const broken = await collectChanges({ worktree: { dir: join(repo, 'missing'), startSha } });
+  assert.deepEqual(broken, { available: false, changedFiles: [], diffStat: '' });
+  const plain = await collectChanges({ params: { cwd: repo }, baseline: captureBaseline(repo) });
+  assert.equal(plain.available, true);
+  assert.equal((await collectChanges({ baseline: null })).available, false);
+});
+
+test('cancelJob on a runner that never records a state: the manager writes the cancelled result', async () => {
+  const job = protocolHandJob({ sessionId: 'sess_keep', startedAt: new Date(Date.now() - 5000).toISOString(), warnings: ['w1'] });
+  const t0 = Date.now();
+  const v = await cancelJob(job.jobId, { stopGraceMs: 0, termGraceMs: 0 });
+  assert.equal(v.state, 'cancelled');
+  assert.equal(v.result.sessionId, 'sess_keep');
+  assert.deepEqual(v.result.warnings, ['w1', 'cancelled_by_manager']);
+  assert.ok(v.result.durationMs >= 5000 && v.result.durationMs <= 5000 + (Date.now() - t0) + 1000, String(v.result.durationMs));
+});
+
+test('cancelJob survives a status.json that vanishes while it waits', async () => {
+  const job = handJob({ createdAt: new Date(Date.now() - 60000).toISOString() });
+  const pid = await spawnHolder(job.token);
+  patchStatus(job.dir, { state: 'running', pid, pidStart: getProcessIdentity(pid).start, token: job.token, heartbeatAt: new Date().toISOString() });
+  // A protocol job: the manager first waits for the runner's graceful stop.
+  writeFileSync(join(job.dir, 'job.json'), JSON.stringify({ ...readJson(join(job.dir, 'job.json')), path: 'protocol' }));
+  setTimeout(() => rmSync(join(job.dir, 'status.json'), { force: true }), 150);
+  const v = await cancelJob(job.jobId, { stopGraceMs: 3000, termGraceMs: 0 });
+  assert.equal(v.state, 'cancelled');
+  assert.ok(v.result.warnings.includes('cancelled_by_manager'));
+  assert.equal(alive(pid), true, 'the holder lost its identity record and was never signalled');
+});
+
+test('cancelJob gives a protocol runner STOP_GRACE_MS + 2 s by default to stop gracefully', async () => {
+  const job = protocolHandJob();
+  setTimeout(() => patchStatus(job.dir, { state: 'cancelled', finishedAt: new Date().toISOString() }), STOP_GRACE_MS + 1000);
+  const v = await cancelJob(job.jobId, { termGraceMs: 0 });
+  assert.equal(v.state, 'cancelled');
+  assert.equal(v.result, null, 'the runner ended it; the manager wrote no result');
+});
+
+test('sendToJob: text of exactly MAX_SEND_TEXT characters is accepted', async () => {
+  const job = protocolHandJob();
+  const r = await sendToJob(job.jobId, 'x'.repeat(MAX_SEND_TEXT), { ackWaitMs: 50 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.status, 'queued');
+  patchStatus(job.dir, { state: 'failed' });
+});
+
+test('sendToJob: an inbox that cannot be written is an error', async () => {
+  const job = protocolHandJob();
+  writeFileSync(join(job.dir, 'inbox'), 'not a directory');
+  const r = await sendToJob(job.jobId, 'hi', { ackWaitMs: 50 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /^Could not queue the message: /);
+  patchStatus(job.dir, { state: 'failed' });
+});
+
+test('sendToJob passes delivery guide/queue through and drops anything else', async () => {
+  const { writeAck } = await import('../src/inbox.mjs');
+  const job = protocolHandJob();
+  const got = [];
+  for (const [seq, delivery] of [[1, 'guide'], [2, 'queue'], [3, 'other']]) {
+    setTimeout(() => writeAck(job.dir, seq, { status: 'accepted', delivery }), 50);
+    const r = await sendToJob(job.jobId, 'm', { ackWaitMs: 2000 });
+    got.push(r.delivery);
+  }
+  assert.deepEqual(got, ['guide', 'queue', undefined]);
+  patchStatus(job.dir, { state: 'failed' });
 });
