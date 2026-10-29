@@ -48,3 +48,17 @@ test('redactValue deep-copies and masks by key', () => {
   assert.equal(input.apiKey, 'x');
   assert.equal(redactValue(7), 7);
 });
+
+test('query params use broad substring matching', () => {
+  for (const n of ['access_key', 'secretKey', 'tokenId', 'auth_code', 'passwd', 'accessKey', 'authKey', 'secret_key']) {
+    assert.equal(redactText(`https://x.io/?${n}=V1&a=1`), `https://x.io/?${n}=[REDACTED]&a=1`, n);
+  }
+  assert.equal(redactText('https://x.io/?page=2&q=hi'), 'https://x.io/?page=2&q=hi');
+});
+
+test('sk- needs a left boundary', () => {
+  for (const s of ['task-implement-redaction-module', 'risk-assessment-report', 'task-runner-config', 'disk-usage-monitor']) {
+    assert.equal(redactText(s), s);
+  }
+  assert.equal(redactText('sk-abc123def456ghi789jkl'), '[REDACTED]');
+});

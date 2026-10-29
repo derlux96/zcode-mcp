@@ -12,10 +12,10 @@ export function isSensitiveKey(name) {
   return SENSITIVE_SUFFIXES.some((s) => norm.endsWith(s));
 }
 
-/** Query-parameter names: the key rule plus bare key/auth/sig style names. */
+/** Query-parameter names: broad substring match (old provider-check semantics). */
 export function isSensitiveParam(name) {
-  if (isSensitiveKey(name)) return true;
-  return typeof name === 'string' && ['key', 'auth', 'sig', 'signature'].includes(name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  if (typeof name !== 'string') return false;
+  return /key|token|secret|password|passwd|auth|sig/i.test(name);
 }
 
 // 40+ chars of [A-Za-z0-9_-] with a letter, a digit and a character outside
@@ -28,7 +28,7 @@ function looksHighEntropy(run) {
 export function redactText(s) {
   if (typeof s !== 'string') return '';
   return s
-    .replace(/sk-[A-Za-z0-9_-]{12,}/g, REDACTED)
+    .replace(/(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}/g, REDACTED)
     .replace(/\b(Bearer\s+)\S+/gi, `$1${REDACTED}`)
     .replace(/([?&])([^=&#\s]*)=([^&#\s]*)/g, (m, sep, name) => (isSensitiveParam(name) ? `${sep}${name}=${REDACTED}` : m))
     .replace(/[A-Za-z0-9_-]{40,}/g, (run) => (looksHighEntropy(run) ? REDACTED : run));
