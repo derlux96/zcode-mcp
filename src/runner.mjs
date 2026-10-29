@@ -69,6 +69,11 @@ export function validateRunArgs(args = {}) {
   if (maxTransientRetries !== undefined && (!Number.isInteger(maxTransientRetries) || maxTransientRetries < 0 || maxTransientRetries > MAX_TRANSIENT_RETRIES)) {
     return { ok: false, error: `max_transient_retries must be an integer between 0 and ${MAX_TRANSIENT_RETRIES}` };
   }
+  // Optional here; the caller rejects it on the CLI path (no user-input requests there).
+  const inputTimeoutMs = args.input_timeout_ms;
+  if (inputTimeoutMs !== undefined && (!Number.isInteger(inputTimeoutMs) || inputTimeoutMs < 1 || inputTimeoutMs > MAX_TIMEOUT_MS)) {
+    return { ok: false, error: `input_timeout_ms must be a positive integer up to ${MAX_TIMEOUT_MS}` };
+  }
   return {
     ok: true,
     value: {
@@ -81,6 +86,7 @@ export function validateRunArgs(args = {}) {
       idleTimeoutMs,
       isolateWorktree: args.isolate_worktree === true,
       maxTransientRetries,
+      inputTimeoutMs,
     },
   };
 }

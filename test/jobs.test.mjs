@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { makeTempDir, makeGitRepo, removeDir, fakeBin, run } from './helpers.mjs';
 import {
   aliveFrom, chooseJobPath, isJobAlive, startJob, getJob, waitJob, cancelJob, listJobs, REASONING_LEVELS,
+  sendToJob, SEND_ACK_WAIT_MS,
 } from '../src/jobs.mjs';
+import { validateRunArgs } from '../src/runner.mjs';
 import { createJobDir, patchStatus, readJson, readStatus, stateHome, jobsRoot } from '../src/jobstore.mjs';
 import { acquireCwdLock, lockKey, releaseCwdLock } from '../src/locks.mjs';
 import { getProcessIdentity } from '../src/procid.mjs';
@@ -486,4 +488,131 @@ test('aliveFrom: a null pidStart counts as alive while the pid exists and its co
   assert.equal(aliveFrom(job, status), true);
   assert.equal(aliveFrom({ ...job, token: 'not-in-any-command-line-9f3a' }, status), false);
   assert.equal(aliveFrom(job, { ...status, pid: 2 ** 22 + 12345 }), false);
+});
+
+// ---- Task 7: sendToJob, graceful cancel, input_timeout_ms ----
+
+function protocolHandJob(extra = {}) {
+  const cwd = realpathSync(tempCwd());
+  const job = createJobDir({ params: { prompt: 'x', cwd }, path: 'protocol', baseline: null, lockCwd: cwd });
+  patchStatus(job.dir, { state: 'running', warnings: [], ...extra });
+  return job;
+}
+
+test('SEND_ACK_WAIT_MS is 5000', () => {
+  assert.equal(SEND_ACK_WAIT_MS, 5000);
+});
+
+test('sendToJob: unknown id, invalid text, CLI path, terminal job', async () => {
+  let r = sendToJob('job_00000000-0000-0000-0000-000000000000', 'hi');
+  r = await r;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /^Unknown job: /);
+  const cli = handJob({ pid: process.pid, start: getProcessIdentity(process.pid).start });
+  patchStatus(cli.dir, { token: cli.token });
+  r = await sendToJob(cli.jobId, 'hi');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /not supported on the CLI path/);
+  const done = protocolHandJob();
+  patchStatus(done.dir, { state: 'completed', finishedAt: new Date().toISOString() });
+  r = await sendToJob(done.jobId, 'hi');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /already finished/);
+  const live = protocolHandJob();
+  for (const bad of ['', 5, undefined, 'x'.repeat(20001)]) {
+    r = await sendToJob(live.jobId, bad);
+    assert.equal(r.ok, false);
+    assert.match(r.error, /^Invalid arguments:/);
+  }
+});
+
+test('sendToJob without a runner ack within ackWaitMs on a live job is queued', async () => {
+  const job = protocolHandJob();
+  const pid = await spawnHolder(job.token);
+  patchStatus(job.dir, { pid, pidStart: getProcessIdentity(pid).start, token: job.token, heartbeatAt: new Date().toISOString() });
+  const r = await sendToJob(job.jobId, 'hello', { ackWaitMs: 200 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.status, 'queued');
+  assert.equal(r.view.jobId, job.jobId);
+});
+
+test('sendToJob: job turning terminal during the wait without an ack is an error', async () => {
+  const job = protocolHandJob();
+  const pid = await spawnHolder(job.token);
+  patchStatus(job.dir, { pid, pidStart: getProcessIdentity(pid).start, token: job.token, heartbeatAt: new Date().toISOString() });
+  setTimeout(() => patchStatus(job.dir, { state: 'failed', finishedAt: new Date().toISOString() }), 100);
+  const r = await sendToJob(job.jobId, 'hello', { ackWaitMs: 400 });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'job finished before the message was delivered');
+});
+
+test('sendToJob maps a rejected/finished ack to the finished error and passes other acks through', async () => {
+  const { writeAck } = await import('../src/inbox.mjs');
+  const job = protocolHandJob();
+  const pid = await spawnHolder(job.token);
+  patchStatus(job.dir, { pid, pidStart: getProcessIdentity(pid).start, token: job.token, heartbeatAt: new Date().toISOString() });
+  setTimeout(() => writeAck(job.dir, 1, { status: 'rejected', reason: 'finished' }), 50);
+  let r = await sendToJob(job.jobId, 'a', { ackWaitMs: 2000 });
+  assert.deepEqual([r.ok, r.error], [false, 'job finished before the message was delivered']);
+  setTimeout(() => writeAck(job.dir, 2, { status: 'accepted' }), 50);
+  r = await sendToJob(job.jobId, 'b', { ackWaitMs: 2000 });
+  assert.equal(r.ok, true);
+  assert.equal(r.status, 'accepted');
+  setTimeout(() => writeAck(job.dir, 3, { status: 'rejected', reason: 'idle' }), 50);
+  r = await sendToJob(job.jobId, 'c', { ackWaitMs: 2000 });
+  assert.deepEqual([r.ok, r.status, r.reason], [true, 'rejected', 'idle']);
+});
+
+test('sendToJob reaches a real protocol runner (accepted)', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  const r = await startJob({ prompt: 'x', cwd: tempCwd(), model: 'p/m', timeout_ms: 30000 });
+  assert.equal(r.ok, true, r.error);
+  await waitFor(() => getJob(r.jobId).state === 'running');
+  await sleep(200);
+  const s = await sendToJob(r.jobId, 'more please', { ackWaitMs: 1200 });
+  assert.equal(s.ok, true, s.error);
+  assert.equal(s.status, 'accepted');
+});
+
+test('cancelJob on a protocol job whose runner honours the cancel file sends no SIGTERM', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const r = await startJob({ prompt: 'x', cwd: tempCwd(), model: 'p/m', timeout_ms: 30000 });
+  assert.equal(r.ok, true, r.error);
+  await waitFor(() => getJob(r.jobId).state === 'running');
+  await sleep(500);
+  const t0 = Date.now();
+  const v = await cancelJob(r.jobId, { stopGraceMs: 8000 });
+  assert.ok(Date.now() - t0 < 5000, 'ended by the runner, not by waiting out the grace');
+  assert.equal(v.state, 'cancelled');
+  assert.ok(!(v.result.warnings || []).includes('cancelled_by_manager'));
+  assert.notEqual(v.result.errorKind, 'killed');
+  assert.ok(!/SIGTERM|SIGKILL/.test(String(v.result.errorMessage || '')));
+});
+
+test('cancelJob on a protocol job that ignores the cancel file falls back to SIGTERM after stopGraceMs', async () => {
+  const cwd = tempCwd();
+  const lockCwd = realpathSync(cwd);
+  const job = createJobDir({ params: { prompt: 'x', cwd: lockCwd }, path: 'protocol', baseline: null, lockCwd });
+  const pid = await spawnHolder(job.token);
+  patchStatus(job.dir, { state: 'running', pid, pidStart: getProcessIdentity(pid).start, token: job.token, heartbeatAt: new Date().toISOString() });
+  const t0 = Date.now();
+  const v = await cancelJob(job.jobId, { stopGraceMs: 400, termGraceMs: 300 });
+  assert.ok(Date.now() - t0 >= 400, 'waited for the graceful stop first');
+  await waitFor(() => !alive(pid), 5000);
+  assert.equal(v.state, 'cancelled');
+});
+
+test('input_timeout_ms: validateRunArgs bounds, CLI path rejection, passed to job params', async () => {
+  const base = { prompt: 'x', cwd: tempCwd() };
+  for (const bad of [-1, 0, 1.5, '5', 2 ** 40]) assert.equal(validateRunArgs({ ...base, input_timeout_ms: bad }).ok, false, String(bad));
+  const ok = validateRunArgs({ ...base, input_timeout_ms: 60000 });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.value.inputTimeoutMs, 60000);
+  const cli = await startJob({ ...base, mode: 'yolo', input_timeout_ms: 60000 });
+  assert.equal(cli.ok, false);
+  assert.match(cli.error, /input_timeout_ms/);
+  process.env.FAKE_APPSERVER_MODE = 'slowhang';
+  const r = await startJob({ ...base, model: 'p/m', input_timeout_ms: 60000, timeout_ms: 30000 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(getJob(r.jobId).job.params.input_timeout_ms, 60000);
 });

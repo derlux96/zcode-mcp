@@ -20,9 +20,13 @@ import { captureBaseline, changesSince } from './changes.mjs';
 import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktreeSummary } from './runner.mjs';
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
+import { writeInboxEntry, waitAck } from './inbox.mjs';
+import { STOP_GRACE_MS } from './job-runner.mjs';
 
 export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const MAX_RUNNING_JOBS = 3;
+export const SEND_ACK_WAIT_MS = 5000;
+export const MAX_SEND_TEXT = 20000;
 const STALL_MS = 30000;
 const STARTUP_GRACE_MS = 15000;
 const POLL_MS = 250;
@@ -186,6 +190,9 @@ function validateStart(args) {
     if (v.value.maxTransientRetries !== undefined) {
       return invalid('max_transient_retries applies only in protocol mode (model set, or no mode/resume/target given): the CLI path cannot continue a session after a provider error; rerun with resume <sess_id> instead');
     }
+    if (v.value.inputTimeoutMs !== undefined) {
+      return invalid('input_timeout_ms applies only in protocol mode (model set, or no mode/resume/target given); the CLI path cannot ask for user input');
+    }
   }
   return { ok: true, value: v.value };
 }
@@ -259,7 +266,7 @@ export async function startJob(args = {}, opts = {}) {
       params: {
         prompt: v.prompt, cwd, mode: v.mode, resume: v.resume, target: v.target,
         model: args.model, reasoning_level: args.reasoning_level,
-        timeout_ms: v.timeoutMs, idle_timeout_ms: v.idleTimeoutMs, isolate_worktree: v.isolateWorktree,
+        timeout_ms: v.timeoutMs, idle_timeout_ms: v.idleTimeoutMs, input_timeout_ms: v.inputTimeoutMs, isolate_worktree: v.isolateWorktree,
         max_transient_retries: v.maxTransientRetries,
       },
       path,
@@ -386,15 +393,49 @@ async function markCancelled(job, dir) {
   patchStatus(dir, { state: 'cancelled', warnings, errorKind: 'cancelled', finishedAt: new Date().toISOString() });
 }
 
-export async function cancelJob(jobId, { termGraceMs = 10000 } = {}) {
+export async function cancelJob(jobId, { termGraceMs = 10000, stopGraceMs = STOP_GRACE_MS + 2000 } = {}) {
   const view = getJob(jobId);
   if (!view || isTerminal(view.state)) return view;
   const { job, dir } = view;
   try { writeFileSync(join(dir, 'cancel'), '', { mode: 0o600 }); } catch { /* signals still apply */ }
+  // Protocol runners react to the cancel file with session/stop; give them the chance first.
+  if (job.path === 'protocol' && (await settle(job, dir, stopGraceMs))) return getJob(jobId);
   signalJob(job, dir, 'SIGTERM');
   if (!(await settle(job, dir, termGraceMs))) {
     signalJob(job, dir, 'SIGKILL');
     if (!(await settle(job, dir, KILL_WAIT_MS))) await markCancelled(job, dir);
   }
   return getJob(jobId);
+}
+
+const FINISHED_BEFORE_DELIVERY = 'job finished before the message was delivered';
+
+// Queues `text` for the runner and waits up to ackWaitMs for its answer. Protocol path only.
+export async function sendToJob(jobId, text, { ackWaitMs = SEND_ACK_WAIT_MS, signal } = {}) {
+  const view = getJob(jobId);
+  if (!view) return { ok: false, error: `Unknown job: ${cleanName(String(jobId))}` };
+  if (typeof text !== 'string' || text.trim() === '' || text.length > MAX_SEND_TEXT) {
+    return invalid(`text must be a non-empty string of at most ${MAX_SEND_TEXT} characters`);
+  }
+  if (view.job.path === 'cli') return { ok: false, error: 'Sending messages is not supported on the CLI path' };
+  if (isTerminal(view.state)) return { ok: false, error: `Job already finished (${view.state})` };
+  let seq;
+  try {
+    seq = writeInboxEntry(view.dir, { kind: 'send', text });
+  } catch (error) {
+    return { ok: false, error: `Could not queue the message: ${oneLine(error.message)}` };
+  }
+  const ack = await waitAck(view.dir, seq, ackWaitMs, { signal });
+  const after = getJob(jobId) || view;
+  if (!ack) {
+    if (isTerminal(after.state)) return { ok: false, error: FINISHED_BEFORE_DELIVERY };
+    return { ok: true, status: 'queued', view: after };
+  }
+  if (ack.status === 'rejected' && ack.reason === 'finished') return { ok: false, error: FINISHED_BEFORE_DELIVERY };
+  return {
+    ok: true,
+    status: ack.status,
+    ...(ack.reason ? { reason: oneLine(String(ack.reason)) } : {}),
+    view: after,
+  };
 }
