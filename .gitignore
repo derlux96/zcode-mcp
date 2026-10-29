@@ -3,3 +3,7 @@ node_modules/
 *.log
 .superpowers/
 .mimosa/
+
+# mutation testing (unclebob/mutator)
+.metrics/
+target/
