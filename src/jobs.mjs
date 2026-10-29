@@ -112,6 +112,7 @@ function sleepAbortable(ms, signal) {
 // Aborting `signal` only ends the wait; the job keeps running. until 'change'
 // ends on a change of the effective state (or finishedAt) only: heartbeat and
 // activity writes bump status.updatedAt every few seconds and must not end it.
+// until 'attention' ends on a terminal state or needs_input.
 export async function waitJob(jobId, { waitMs = 0, signal, until = 'terminal' } = {}) {
   let view = getJob(jobId);
   if (!view) return null;
@@ -120,6 +121,7 @@ export async function waitJob(jobId, { waitMs = 0, signal, until = 'terminal' } 
   const deadline = Date.now() + waitMs;
   for (;;) {
     if (isTerminal(view.state)) return view;
+    if (until === 'attention' && view.state === 'needs_input') return view;
     if (until === 'change' && (view.state !== first.state || finishedAt(view) !== first.finishedAt)) return view;
     const left = deadline - Date.now();
     if (left <= 0 || (signal && signal.aborted)) return view;

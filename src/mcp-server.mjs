@@ -64,7 +64,7 @@ const toolSchemas = {
   zcode_run: {
     name: 'zcode_run',
     description:
-      'Delegate one coding task to ZCode as a background job. ZCode runs as a full agent (it can read/edit files and run commands in cwd). Without mode/resume/target the job uses ZCode\'s app-server protocol (progress, idle detection); setting mode, resume or target uses the headless CLI. The call waits up to wait_ms: a finished job returns its result with a job_id; a job still working returns status: running with a job_id (not an error) — then follow it with zcode_status, fetch it with zcode_result, or stop it with zcode_cancel. Cancelling this call only ends the wait; the job keeps running. Inspect the returned output, changed files, and test results before accepting the result.',
+      'Delegate one coding task to ZCode as a background job. ZCode runs as a full agent (it can read/edit files and run commands in cwd). Without mode/resume/target the job uses ZCode\'s app-server protocol (progress, idle detection); setting mode, resume or target uses the headless CLI. The call waits up to wait_ms: a finished job returns its result with a job_id; a job still working returns status: running with a job_id (not an error) — then follow it with zcode_status, fetch it with zcode_result, or stop it with zcode_cancel. A protocol job that asks a question returns at once with status: needs_input, the question and a job_id; answer it with zcode_send. Cancelling this call only ends the wait; the job keeps running. Inspect the returned output, changed files, and test results before accepting the result.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -520,7 +520,8 @@ function buildRunHandler() {
     // is part of the caller's wait. Aborting ctx.signal (notifications/cancelled)
     // ends only the wait.
     const left = Math.max(0, waitMs - (Date.now() - received));
-    const view = await waitJob(started.jobId, { waitMs: left, signal: ctx.signal, until: 'terminal' });
+    // A job waiting for an answer returns at once: nothing changes until the caller sends one.
+    const view = await waitJob(started.jobId, { waitMs: left, signal: ctx.signal, until: 'attention' });
     if (!view) return failText(`job ${started.jobId} disappeared from the job store`);
     return renderJob(view);
   };

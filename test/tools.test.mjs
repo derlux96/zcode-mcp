@@ -1063,3 +1063,17 @@ test('zcode_send errors: unknown job, bad arguments, queued hint, rejected is is
   assert.equal(r.result.isError, true);
   assert.match(textOf(r), /text must be a string/);
 });
+
+test('zcode_run returns as soon as the job needs input instead of waiting out wait_ms', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const t0 = Date.now();
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 20000 });
+  const took = Date.now() - t0;
+  const text = textOf(reply);
+  const id = jobIdOf(text);
+  assert.ok(took < 10000, `returned early (${took} ms)`);
+  assert.match(text, /^status: needs_input$/m);
+  assert.match(text, /^question: Which port\?$/m);
+  assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
+  await call('zcode_send', { job_id: id, text: '8080' });
+});
