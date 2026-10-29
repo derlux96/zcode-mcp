@@ -33,6 +33,11 @@
 //             (request-timeout path after the session exists)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
+//   ask       acks send, then sends interaction/browserList (trapped: must be
+//             answered {} within 2 s) and interaction/requestUserInput
+//             (id 'server-ask', question 'Which port?', NOT trapped: the client
+//             may park it), and completes the turn with response
+//             "answer: " + JSON.stringify(<result of the requestUserInput answer>)
 //   fail-429-then-ok      the first FAKE_APPSERVER_FAIL_TIMES (default 1) turns
 //             fail with an HTTP 429 rate-limit text, every later turn completes
 //   fail-network-then-ok  same, with "TypeError: fetch failed"
@@ -162,8 +167,18 @@ function isAnyResult(msg) {
 
 let pendingCreate = null; // create request whose response waits on the trap
 let created = false;
+let askReq = null; // session/send waiting on the parked requestUserInput answer
 
 function answerArrived(msg) {
+  if (msg.id === 'server-ask') {
+    // Untrapped on purpose: the client may hold this question for a long time.
+    if (askReq) {
+      const r = askReq;
+      askReq = null;
+      emitTurn(r, null, `answer: ${JSON.stringify(msg.result ?? null)}`);
+    }
+    return true;
+  }
   const validate = openServerRequests.get(msg.id);
   if (validate === undefined) return false;
   openServerRequests.delete(msg.id);
@@ -303,6 +318,12 @@ function handleSend(req) {
     }, 25);
     return;
   }
+  if (MODE === 'ask') {
+    askReq = req;
+    sendServerRequest('server-ask-browser', 'interaction/browserList', { sessionId: SESSION_ID }, isAnyResult);
+    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: { requestId: 'req_1', sessionId: SESSION_ID, question: 'Which port?' } });
+    return;
+  }
   if (MODE === 'flood') {
     setTimeout(() => {
       for (let i = 0; i < FLOOD_EVENTS; i++) {
@@ -376,7 +397,7 @@ function handleSend(req) {
   setTimeout(() => emitTurn(req), 25);
 }
 
-function emitTurn(req, scripted = null) {
+function emitTurn(req, scripted = null, responseOverride = null) {
   const input = (req.params && req.params.content) || '';
   const n = scripted ? scripted.n : 1;
   const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001' };
@@ -431,7 +452,7 @@ function emitTurn(req, scripted = null) {
         timestamp: 1792184703455,
         type: 'turn.completed',
         payload: {
-          response: MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
+          response: responseOverride !== null ? responseOverride : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done',
           tokenCount: 32485,
           usage: { source: 'provider', modelRequestCount: 1, inputTokens: 100, outputTokens: 5, totalTokens: 105, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,

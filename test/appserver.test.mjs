@@ -14,6 +14,7 @@ import {
   getModelCatalog,
   DEFAULT_TASK_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
+  buildUserInputAnswer,
 } from '../src/appserver.mjs';
 import { DEFAULT_TIMEOUT_MS } from '../src/runner.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
@@ -437,4 +438,100 @@ test('resolveBin prefers ZCODE_APPSERVER_BIN, then discovery via ZCODE_BIN', () 
 test('timeout defaults align with runner defaults', () => {
   assert.equal(DEFAULT_TASK_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
   assert.equal(DEFAULT_REQUEST_TIMEOUT_MS, 30000);
+});
+
+// --- parked interaction/requestUserInput (mode ask) ---
+
+async function askSession(client, cwd) {
+  const created = await client.request('session/create', createParams(cwd));
+  const sessionId = created.session.sessionId;
+  await client.request('session/subscribe', { sessionId, deliveryKind: 'desktop-continuous' });
+  const cursor = client.eventOrdinal;
+  await client.request('session/send', { sessionId, content: 'go' });
+  return cursor;
+}
+
+test('requestUserInput is parked, onUserInput fires once, respond() completes the turn', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    const asked = [];
+    let client;
+    const got = new Promise((resolve) => {
+      client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: (req) => { asked.push(req); resolve(req); } });
+    });
+    try {
+      const cursor = await askSession(client, cwd);
+      const req = await got;
+      assert.equal(req.question, 'Which port?');
+      assert.equal(req.requestId, 'req_1');
+      assert.equal(req.protocolId, 'server-ask');
+      assert.equal(client.pendingUserInput, 1);
+      client.respond(req.protocolId, buildUserInputAnswer(req.params, '8080'));
+      assert.equal(client.pendingUserInput, 0);
+      const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
+      assert.equal(ev.type, 'turn.completed');
+      assert.match(ev.payload.response, /8080/);
+      assert.equal(asked.length, 1);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('a parked requestUserInput does not trip the idle timeout', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      const cursor = await askSession(client, cwd);
+      const req = await got;
+      const wait = client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 10000, idleTimeoutMs: 300, since: cursor });
+      const early = await Promise.race([wait.then(() => 'done', (e) => `rejected: ${e.message}`), new Promise((r) => setTimeout(() => r('still waiting'), 1000))]);
+      assert.equal(early, 'still waiting');
+      client.respond(req.protocolId, buildUserInputAnswer(req.params, 'x'));
+      assert.equal((await wait).type, 'turn.completed');
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('without onUserInput, requestUserInput is answered {} and other unknown requests too', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    const client = new AppServerClient({ binPath: fakeBin, cwd });
+    try {
+      const cursor = await askSession(client, cwd);
+      const ev = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: 5000, since: cursor });
+      assert.equal(ev.type, 'turn.completed');
+      assert.equal(ev.payload.response, 'answer: {}');
+      assert.equal(client.pendingUserInput, 0);
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
+});
+
+test('mode ask: interaction/browserList is still answered {} (the 2 s trap would kill the fake otherwise)', async () => {
+  await withMode('ask', async () => {
+    const cwd = makeTempDir();
+    let parked;
+    const got = new Promise((resolve) => { parked = resolve; });
+    const client = new AppServerClient({ binPath: fakeBin, cwd, onUserInput: parked });
+    try {
+      await askSession(client, cwd);
+      const req = await got;
+      await new Promise((r) => setTimeout(r, 2300)); // past the trap window
+      assert.equal(client.isRunning(), true);
+      client.respond(req.protocolId, {});
+    } finally {
+      await client.close();
+      removeDir(cwd);
+    }
+  });
 });

@@ -116,16 +116,25 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
   return { level: fallback, substitution: { requested, used: fallback } };
 }
 
+/** Wire shape of an answer to interaction/requestUserInput (single place to fix). */
+export function buildUserInputAnswer(params, text) {
+  return { requestId: params && params.requestId, answer: text };
+}
+
 // Client options beyond the basics:
 //   killGroup  spawn the app-server detached (own process group, pgid = pid)
 //              and make every kill signal the whole group
 //   onSpawn    (child) => void, called once the child has a pid; if it
 //              throws, the child is killed and the constructor throws
 //   onEvent    (params) => void, called for every session/event, in order
+//   onUserInput  ({ requestId, protocolId, question, params }) => void, called when
+//              ZCode asks interaction/requestUserInput; the request is parked
+//              (no reply) until client.respond(protocolId, result). Without
+//              the hook it is answered {} immediately.
 //   signal     AbortSignal; aborting closes the client (kills the child)
 export class AppServerClient {
   constructor({
-    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, signal,
+    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, onUserInput, signal,
   } = {}) {
     if (typeof binPath !== 'string' || binPath === '') throw new TypeError('binPath is required');
     if (typeof cwd !== 'string' || cwd === '') throw new TypeError('cwd is required');
@@ -145,6 +154,8 @@ export class AppServerClient {
     this._closePromise = null;
     this._killGroup = killGroup;
     this._onEvent = onEvent || null;
+    this._onUserInput = typeof onUserInput === 'function' ? onUserInput : null;
+    this._parkedInput = new Map(); // protocol id -> { protocolId, params }
     this._spawnChild();
     if (onSpawn && this.child.pid !== undefined) {
       try {
@@ -303,10 +314,30 @@ export class AppServerClient {
     // Known server requests get their documented result; anything unknown
     // gets an empty result so it can never hang the session.
     let result = {};
+    if (msg.method === 'interaction/requestUserInput' && this._onUserInput) {
+      const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+      this._parkedInput.set(msg.id, { protocolId: msg.id, params });
+      const question = params.question ?? params.prompt ?? params.message ?? '';
+      try {
+        this._onUserInput({ requestId: params.requestId, protocolId: msg.id, question: typeof question === 'string' ? question : String(question), params });
+      } catch { /* a failing observer must not wedge the protocol */ }
+      return;
+    }
     if (msg.method === 'session/requestRuntimePreferences') {
       result = { nativeSearchEnhancementsEnabled: false };
     }
     this._send({ id: msg.id, result });
+  }
+
+  /** Number of requestUserInput requests parked and not yet answered. */
+  get pendingUserInput() {
+    return this._parkedInput.size;
+  }
+
+  /** Answer a parked server request (see onUserInput). */
+  respond(protocolId, result) {
+    this._parkedInput.delete(protocolId);
+    this._send({ id: protocolId, result });
   }
 
   _send(obj) {
@@ -379,6 +410,11 @@ export class AppServerClient {
   _armIdle(waiter) {
     clearTimeout(waiter.idleTimer);
     waiter.idleTimer = setTimeout(() => {
+      // A parked question is the user's turn, not ZCode going quiet.
+      if (this._parkedInput.size > 0) {
+        this._armIdle(waiter);
+        return;
+      }
       waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`, { code: 'idle' }));
     }, waiter.idleMs);
   }
