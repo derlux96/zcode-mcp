@@ -255,3 +255,14 @@ held copies, so nothing runs twice), and as a last resort a `session/send` of th
 follow-up is sent after a stop. `scripts/verify-protocol.mjs --real --controls` probes the guide
 steer (`steerDrained`, and whether the marker word PINEAPPLE reaches the answer) and the auto-drain
 path (a default-delivery input held at turn end, then `setAutoDrain` with `baseRevision`).
+
+`turn.steerDrained` payload (from the 0.17.0 bundle): `{drainedInputs: [{pendingInputId, messageId,
+text, delivery, intent?}], injectedMessageIds, pendingInputIds, targetTurnId}`; zcode-delegate
+matches drained inputs to its steers by `text`.
+
+**Verified on a real run (ZCode 0.17.0, third probe):** the guide steer was acked `delivery:"queue"`,
+followed by `turn.steerQueued` and `turn.steerDrained`, and the model wrote the marker after the
+requested number in the same turn. A default-delivery input sent during a short turn was held at
+turn end (no drain, no marker in the answer); `setAutoDrain` with a stale `baseRevision` (3) got
+`stale` with `revisionAtDecision` 13, the retry with 13 was accepted and ZCode started a second turn
+(`turn.started`) that answered the held input.

@@ -146,7 +146,7 @@ test('probeSteer: requestedDelivery guide (no setFollowupMode), drained mid-turn
     assert.equal(typeof r.v4CommandResult.revisionAtDecision, 'number');
     assert.equal(r.steerDrained, true);
     assert.equal(r.markerInAnswer, true);
-    assert.match(r.response, new RegExp(`steered: After the number 20 write the word ${STEER_MARKER} once\\.`));
+    assert.match(r.response, new RegExp(`steered: After the number 5 write the word ${STEER_MARKER} once\\.`));
     const cmds = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((m) => m.method === 'v4/command');
     assert.deepEqual(cmds.map((m) => m.params.type), ['sendText']);
     assert.equal(cmds[0].params.payload.requestedDelivery, 'guide');

@@ -168,9 +168,9 @@ export async function probeSteer(cwd, o) {
   try {
     s = await startSession(cwd);
     const { request } = v4Commands(s);
-    await s.send('Count slowly from 1 to 30, one number per line, one line per second.');
+    await s.send('Count slowly from 1 to 12, one number per line, one line per second.');
     await sleep(o.steerAfterMs);
-    const steerResult = await request('sendText', { text: `After the number 20 write the word ${STEER_MARKER} once.`, requestedDelivery: 'guide' });
+    const steerResult = await request('sendText', { text: `After the number 5 write the word ${STEER_MARKER} once.`, requestedDelivery: 'guide' });
     let waitError = null;
     try {
       await s.client.waitForEvent(TERMINAL, { timeoutMs: o.turnTimeoutMs, idleTimeoutMs: o.idleTimeoutMs });
@@ -319,7 +319,7 @@ async function probeUserInput(cwd, o) {
 
 /** Runs the steer, auto-drain, stop and user-input probes sequentially, each in a fresh session. */
 export async function runControlProbes(cwd, opts = {}) {
-  const o = { turnTimeoutMs: 180000, idleTimeoutMs: 90000, steerAfterMs: 3000, queueAfterMs: 300, stopAfterMs: 3000, autoDrainWaitMs: 10000, ...opts };
+  const o = { turnTimeoutMs: 300000, idleTimeoutMs: 90000, steerAfterMs: 3000, queueAfterMs: 300, stopAfterMs: 3000, autoDrainWaitMs: 10000, ...opts };
   const out = {};
   for (const [name, fn] of [['steer', probeSteer], ['autoDrain', probeAutoDrain], ['stop', probeStop], ['userInput', probeUserInput]]) {
     try {

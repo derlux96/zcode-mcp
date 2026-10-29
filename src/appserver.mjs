@@ -796,13 +796,14 @@ export async function runTaskWithModel({
     ? (req) => { capabilities.userInput = true; onUserInput(req); }
     : undefined;
   // Accepted steers, oldest first: { text, delivered }. A turn.steerDrained
-  // marks the oldest undelivered one (by text when the event names one);
-  // drains seen before their steer's ack resolved are kept as credit.
+  // (ZCode 0.17.0: payload.drainedInputs[{pendingInputId, text, delivery}])
+  // marks each drained input's steer, matched by text, else the oldest
+  // undelivered one; drains seen before their steer's ack resolved are kept
+  // as credit.
   const steers = [];
   let drainCredit = 0;
   const inflightSteers = new Set();
-  function noteDrained(payload) {
-    const text = payload && typeof payload.text === 'string' ? payload.text : null;
+  function noteDrainedInput(text) {
     const open = steers.filter((e) => !e.delivered);
     if (text !== null) {
       const same = open.find((e) => e.text === text);
@@ -812,6 +813,10 @@ export async function runTaskWithModel({
     }
     if (open.length) open[0].delivered = true;
     else drainCredit += 1;
+  }
+  function noteDrained(payload) {
+    const inputs = payload && Array.isArray(payload.drainedInputs) && payload.drainedInputs.length ? payload.drainedInputs : [payload];
+    for (const i of inputs) noteDrainedInput(i && typeof i.text === 'string' ? i.text : null);
   }
   const observe = (params) => {
     if (params && params.type === 'turn.steerDrained') noteDrained(params.payload);

@@ -630,7 +630,7 @@ function flushDrains() {
   for (const text of texts) {
     revision += 1;
     guided.push(text);
-    steerEvent('turn.steerDrained', { text, delivery: 'guide' });
+    steerEvent('turn.steerDrained', { drainedInputs: [{ pendingInputId: `pi_${revision}`, messageId: `msg_${revision}`, text, delivery: 'guide' }] });
   }
 }
 
