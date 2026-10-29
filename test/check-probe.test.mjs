@@ -1,7 +1,7 @@
 // zcode_check: probe_model (one tiny real model request) and the provider config check.
 import { test, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { createProtocol } from '../src/protocol.mjs';
 import { buildTools } from '../src/mcp-server.mjs';
@@ -270,7 +270,7 @@ test('probeModel runs one killGroup turn without retries in a dir it removes, fi
   const { cwd, signal, binPath, ...rest } = seen[0];
   assert.equal(typeof binPath, 'string');
   assert.ok(signal instanceof AbortSignal);
-  assert.ok(cwd.startsWith(ctx.tmpRoot));
+  assert.ok(cwd.startsWith(realpathSync(ctx.tmpRoot)), cwd); // macOS: /var -> /private/var
   assert.deepEqual(rest, { prompt: PROBE_PROMPT, timeoutMs: 1234, idleTimeoutMs: 567, killGroup: true, transientRetry: { maxRetries: 0 } });
   // afterEach asserts the work dir is gone although it was not empty.
 });
