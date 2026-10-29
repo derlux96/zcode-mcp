@@ -925,12 +925,18 @@ test('zcode_check reports jobs.writable', async () => {
 });
 
 test('zcode_check warns for an unknown ZCode version', async () => {
-  process.env.FAKE_ZCODE_VERSION = '0.17.0';
+  process.env.FAKE_ZCODE_VERSION = '0.18.0';
   const reply = await call('zcode_check', {});
   assert.equal(reply.result.isError, undefined);
   const payload = JSON.parse(textOf(reply));
   assert.equal(payload.ok, true);
-  assert.deepEqual(payload.warnings, ['ZCode version 0.17.0 is not in the verified list (0.16.9); protocol behaviour may differ']);
+  assert.deepEqual(payload.warnings, ['ZCode version 0.18.0 is not in the verified list (0.16.9, 0.17.0); protocol behaviour may differ']);
+});
+
+test('zcode_check does not warn for ZCode 0.17.0 (probed 2026-10-29)', async () => {
+  process.env.FAKE_ZCODE_VERSION = '0.17.0';
+  const payload = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.deepEqual(payload.warnings, []);
 });
 
 test('control characters in changed file names cannot forge lines', async () => {
