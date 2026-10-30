@@ -69,6 +69,11 @@ export function validateRunArgs(args = {}) {
   if (maxTransientRetries !== undefined && (!Number.isInteger(maxTransientRetries) || maxTransientRetries < 0 || maxTransientRetries > MAX_TRANSIENT_RETRIES)) {
     return { ok: false, error: `max_transient_retries must be an integer between 0 and ${MAX_TRANSIENT_RETRIES}` };
   }
+  // Optional here; the caller rejects it on the CLI path (no user-input requests there).
+  const inputTimeoutMs = args.input_timeout_ms;
+  if (inputTimeoutMs !== undefined && (!Number.isInteger(inputTimeoutMs) || inputTimeoutMs < 1 || inputTimeoutMs > MAX_TIMEOUT_MS)) {
+    return { ok: false, error: `input_timeout_ms must be a positive integer up to ${MAX_TIMEOUT_MS}` };
+  }
   return {
     ok: true,
     value: {
@@ -81,6 +86,7 @@ export function validateRunArgs(args = {}) {
       idleTimeoutMs,
       isolateWorktree: args.isolate_worktree === true,
       maxTransientRetries,
+      inputTimeoutMs,
     },
   };
 }
@@ -195,7 +201,7 @@ export async function runZCodeArgs(binPath, cliArgs, {
     const onAbort = () => stop('cancelled');
     if (signal) {
       if (signal.aborted) onAbort();
-      else signal.addEventListener('abort', onAbort, { once: true });
+      else signal.addEventListener('abort', onAbort);
     }
     let pipeTimer = null;
     const cleanup = () => {
@@ -223,10 +229,8 @@ export async function runZCodeArgs(binPath, cliArgs, {
     });
     // On 'exit' (not 'close'): a leftover that inherited stdout/stderr keeps the
     // pipes open, so 'close' would only come once the sweep has ended it.
-    let exitCode = null;
     let sweep = Promise.resolve(false);
-    child.on('exit', (code) => {
-      exitCode = code;
+    child.on('exit', () => {
       exited = true;
       // The sweep can last a while: a cancel/idle/total timer firing in it must not
       // report a ZCode that already exited as cancelled/timeout.
@@ -250,7 +254,7 @@ export async function runZCodeArgs(binPath, cliArgs, {
       resolve({
         stdout: cap(stdout),
         stderr: cap(stderr),
-        code: code ?? exitCode,
+        code,
         timedOut,
         timeoutKind,
         sessionId: extractSessionId(stdout),

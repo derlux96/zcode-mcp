@@ -18,7 +18,7 @@ function ps(field, pid, exec) {
     })).trim();
     return out || null;
   } catch (err) {
-    if (err && err.status === 1 && !String(err.stdout ?? '').trim()) return null;
+    if (err && err.status === 1 && !err.stdout?.toString().trim()) return null;
     return UNKNOWN;
   }
 }
@@ -77,11 +77,11 @@ export function signalGroup(pgid, signal) {
 }
 
 // True while the process group `pgid` has at least one member (EPERM: a member
-// exists but belongs to someone else).
-export function groupHasMembers(pgid) {
+// exists but belongs to someone else). opts.kill: test hook (a fake process.kill).
+export function groupHasMembers(pgid, { kill = (p, sig) => process.kill(p, sig) } = {}) {
   if (!Number.isInteger(pgid) || pgid <= 1) return false;
   try {
-    process.kill(-pgid, 0);
+    kill(-pgid, 0);
     return true;
   } catch (err) {
     return err.code === 'EPERM';

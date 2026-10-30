@@ -10,12 +10,15 @@ import {
   readdirSync, rmSync, statSync, chmodSync,
 } from 'node:fs';
 
+// Graceful cancel: after session/stop the turn gets this long to end before the group is killed.
+export const STOP_GRACE_MS = 10000;
+
 export const TERMINAL_STATES = ['completed', 'failed', 'timeout', 'cancelled', 'lost'];
 
 export function stateHome() {
   if (process.env.ZCODE_MCP_HOME) return process.env.ZCODE_MCP_HOME;
-  // Read HOME from the env (not os.homedir(), cached per process) so tests can redirect it.
-  return join(process.env.HOME || homedir(), '.zcode-mcp');
+  // os.homedir() reads $HOME on every call (POSIX), so tests can redirect it.
+  return join(homedir(), '.zcode-mcp');
 }
 
 export function jobsRoot() {
@@ -117,6 +120,12 @@ function idKey(name) {
   return { time: parseInt(time, 36) || 0, rand };
 }
 
+// Oldest first: by the base36 time, then by the random part.
+export function compareJobIds(a, b) {
+  const x = idKey(a), y = idKey(b);
+  return x.time - y.time || (x.rand < y.rand ? -1 : x.rand > y.rand ? 1 : 0);
+}
+
 export function listJobDirs() {
   const root = jobsRoot();
   let names;
@@ -127,9 +136,6 @@ export function listJobDirs() {
   } catch {
     return [];
   }
-  names.sort((a, b) => {
-    const x = idKey(a), y = idKey(b);
-    return x.time - y.time || (x.rand < y.rand ? -1 : x.rand > y.rand ? 1 : 0);
-  });
+  names.sort(compareJobIds);
   return names.map((n) => join(root, n));
 }

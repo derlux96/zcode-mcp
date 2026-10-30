@@ -10,6 +10,8 @@
 //     {nativeSearchEnhancementsEnabled:false} or session/create hangs
 //     (15 s server-side timeout). Unknown server requests are answered
 //     with {id, result:{}} so they can never wedge a session.
+//   - interaction/requestUserInput (AskUserQuestion) answers follow ZCode's
+//     strict schema {action, content?, reason?} (verified on 0.17.0)
 //   - session/create takes workspace:{workspacePath,workspaceKey} (both
 //     required; no top-level cwd key)
 //   - session/subscribe gates session/event delivery
@@ -88,7 +90,7 @@ export function entryReasoningLevels(entry) {
     ? entry.reasoning.levels
     : [];
   return levels
-    .map((l) => (typeof l === 'string' ? l : l && typeof l === 'object' && typeof l.value === 'string' ? l.value : null))
+    .map((l) => (typeof l === 'string' ? l : l && l.value))
     .filter((v) => typeof v === 'string');
 }
 
@@ -116,16 +118,67 @@ export function resolveReasoningLevel(catalog, providerId, modelId, requested) {
   return { level: fallback, substitution: { requested, used: fallback } };
 }
 
+// The questions of an interaction/requestUserInput (ZCode 0.17.0 AskUserQuestion:
+// params.questions, mirrored in params.input.questions); [] when there are none.
+// Empty entries are dropped; the callers only read string fields of the rest.
+function userInputQuestions(params) {
+  if (!params || typeof params !== 'object') return [];
+  const top = Array.isArray(params.questions) ? params.questions : null;
+  const nested = params.input && Array.isArray(params.input.questions) ? params.input.questions : null;
+  return (top && top.length ? top : nested || []).filter(Boolean);
+}
+
+/**
+ * Wire shape of an answer to interaction/requestUserInput (single place to fix).
+ * ZCode 0.17.0 validates it against a strict schema {action, content?, reason?}
+ * and AskUserQuestion reads content.answers[q.question] (then content.answer_<i>,
+ * then content.answer for a single question): the text answers every question.
+ */
+export function buildUserInputAnswer(params, text) {
+  const keyed = userInputQuestions(params).filter((q) => typeof q.question === 'string');
+  if (!keyed.length) return { action: 'accept', content: { answer: text } };
+  const answers = {};
+  for (const q of keyed) answers[q.question] = text;
+  return { action: 'accept', content: { answers } };
+}
+
+/** Answer that declines an interaction/requestUserInput (the model is told it was declined and continues). */
+export function buildUserInputDecline(reason) {
+  return typeof reason === 'string' && reason !== '' ? { action: 'decline', reason } : { action: 'decline' };
+}
+
+/**
+ * The question of an interaction/requestUserInput as shown to users: one line
+ * per question "<question> [options: a | b]" joined with " / "; without
+ * questions the first string among params.question / prompt / message, else ''.
+ */
+export function describeUserInputQuestion(params) {
+  const lines = userInputQuestions(params).map((q) => {
+    const text = typeof q.question === 'string' ? q.question : '';
+    const labels = (Array.isArray(q.options) ? q.options : [])
+      .map((o) => (typeof o === 'string' ? o : o && (typeof o.label === 'string' ? o.label : o.value)))
+      .filter((l) => typeof l === 'string' && l !== '');
+    return [text, labels.length ? `[options: ${labels.join(' | ')}]` : ''].filter(Boolean).join(' ');
+  }).filter(Boolean);
+  if (lines.length) return lines.join(' / ');
+  const p = params && typeof params === 'object' ? params : {};
+  return [p.question, p.prompt, p.message].find((v) => typeof v === 'string') || '';
+}
+
 // Client options beyond the basics:
 //   killGroup  spawn the app-server detached (own process group, pgid = pid)
 //              and make every kill signal the whole group
 //   onSpawn    (child) => void, called once the child has a pid; if it
 //              throws, the child is killed and the constructor throws
 //   onEvent    (params) => void, called for every session/event, in order
+//   onUserInput  ({ requestId, protocolId, question, params }) => void, called when
+//              ZCode asks interaction/requestUserInput; the request is parked
+//              (no reply) until client.respond(protocolId, result). Without
+//              the hook it is answered {action:'cancel'} immediately.
 //   signal     AbortSignal; aborting closes the client (kills the child)
 export class AppServerClient {
   constructor({
-    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, signal,
+    binPath, cwd, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, spawnFn, killGroup = false, onSpawn, onEvent, onUserInput, signal,
   } = {}) {
     if (typeof binPath !== 'string' || binPath === '') throw new TypeError('binPath is required');
     if (typeof cwd !== 'string' || cwd === '') throw new TypeError('cwd is required');
@@ -145,13 +198,14 @@ export class AppServerClient {
     this._closePromise = null;
     this._killGroup = killGroup;
     this._onEvent = onEvent || null;
+    this._onUserInput = typeof onUserInput === 'function' ? onUserInput : null;
+    this._parkedInput = new Map(); // protocol id -> { protocolId, params }
     this._spawnChild();
     if (onSpawn && this.child.pid !== undefined) {
       try {
         onSpawn(this.child);
       } catch (err) {
         this._kill('SIGKILL');
-        this._closed = true;
         throw err;
       }
     }
@@ -159,11 +213,13 @@ export class AppServerClient {
       this._signal = signal;
       this._onAbort = () => { this.close(); };
       if (signal.aborted) this.close();
-      else signal.addEventListener('abort', this._onAbort, { once: true });
+      else signal.addEventListener('abort', this._onAbort); // close() removes it
     }
   }
 
-  // Signal the child, or its whole process group when killGroup is set.
+  // Signal the child, or its whole process group when killGroup is set. The pid
+  // check repeats signalGroup's own guard on purpose: a second safety net on a
+  // kill path (a mutant of one guard must never reach process.kill(-1)).
   _kill(sig) {
     const pid = this.child.pid;
     if (this._killGroup && Number.isInteger(pid) && pid > 1) {
@@ -238,6 +294,7 @@ export class AppServerClient {
   _onChildGone(message) {
     if (this._exited) return;
     this._exited = true;
+    this._parkedInput.clear(); // nobody is left to read an answer
     this._failAll(new AppServerError(message, { code: 'child_exited' }));
     this._resolveExit();
   }
@@ -254,7 +311,7 @@ export class AppServerClient {
     } catch {
       return; // tolerate stray non-JSON output on stdout
     }
-    if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+    if (!msg) return; // null; other primitives and arrays carry neither method nor id
     if (typeof msg.method === 'string') {
       if (msg.id !== undefined) this._handleServerRequest(msg);
       else this._handleNotification(msg);
@@ -303,10 +360,55 @@ export class AppServerClient {
     // Known server requests get their documented result; anything unknown
     // gets an empty result so it can never hang the session.
     let result = {};
+    if (msg.method === 'interaction/requestUserInput' && this._onUserInput) {
+      const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+      this._parkedInput.set(msg.id, { protocolId: msg.id, params });
+      // Never "[object Object]": only string texts are shown.
+      const question = describeUserInputQuestion(params);
+      try {
+        this._onUserInput({ requestId: params.requestId, protocolId: msg.id, question, params });
+      } catch { /* a failing observer must not wedge the protocol */ }
+      return;
+    }
     if (msg.method === 'session/requestRuntimePreferences') {
       result = { nativeSearchEnhancementsEnabled: false };
+    } else if (msg.method === 'interaction/requestUserInput') {
+      // Nobody can answer: a valid cancel (ZCode's answer schema is strict; {} fails it).
+      result = { action: 'cancel' };
     }
     this._send({ id: msg.id, result });
+  }
+
+  /** Number of requestUserInput requests parked and not yet answered. */
+  get pendingUserInput() {
+    return this._parkedInput.size;
+  }
+
+  /** Parked requestUserInput requests, oldest first: [{ protocolId, params }]. */
+  get parkedUserInput() {
+    return [...this._parkedInput.values()];
+  }
+
+  /**
+   * Answer a parked server request (see onUserInput). Sends only when the id
+   * is still parked (so a late second answer for the same question is
+   * dropped); returns true when sent, false otherwise.
+   */
+  /**
+   * Drops every parked requestUserInput without answering it (the attempt that
+   * asked has ended). Returns how many were dropped.
+   */
+  abandonParked() {
+    const n = this._parkedInput.size;
+    this._parkedInput.clear();
+    return n;
+  }
+
+  respond(protocolId, result) {
+    if (!this._parkedInput.has(protocolId)) return false;
+    this._parkedInput.delete(protocolId);
+    this._send({ id: protocolId, result });
+    return true;
   }
 
   _send(obj) {
@@ -379,6 +481,11 @@ export class AppServerClient {
   _armIdle(waiter) {
     clearTimeout(waiter.idleTimer);
     waiter.idleTimer = setTimeout(() => {
+      // A parked question is the user's turn, not ZCode going quiet.
+      if (this._parkedInput.size > 0) {
+        this._armIdle(waiter);
+        return;
+      }
       waiter.reject(new AppServerError(`timed out: no activity for ${waiter.idleMs} ms waiting for session/event ${waiter.wanted.join('|')}`, { code: 'idle' }));
     }, waiter.idleMs);
   }
@@ -434,6 +541,7 @@ export class AppServerClient {
   close() {
     if (this._closePromise) return this._closePromise;
     this._closed = true;
+    this._parkedInput.clear();
     if (this._signal) this._signal.removeEventListener('abort', this._onAbort);
     this._closePromise = (async () => {
       if (!this._exited) {
@@ -450,8 +558,27 @@ export class AppServerClient {
   }
 }
 
+const USAGE_FIELDS = ['inputTokens', 'outputTokens', 'reasoningTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'modelRequestCount'];
+
+/**
+ * Adds one turn's payload.usage to the running total. Non-object u leaves acc
+ * unchanged (null stays null); missing or non-finite fields count as 0.
+ */
+export function addUsage(acc, u) {
+  if (!u || typeof u !== 'object' || Array.isArray(u)) return acc;
+  const out = {};
+  for (const k of USAGE_FIELDS) {
+    const v = Number(u[k]);
+    out[k] = (acc ? acc[k] : 0) + (Number.isFinite(v) ? v : 0);
+  }
+  return out;
+}
+
 export const DEFAULT_RETRY_DELAYS_MS = [30000, 60000, 120000, 300000, 600000, 900000];
 export const DEFAULT_MAX_TRANSIENT_RETRIES = 6;
+// How long a setAutoDrain may take to start the follow-up turn before the held
+// steers are sent with session/send instead.
+export const DEFAULT_AUTO_DRAIN_WAIT_MS = 10000;
 
 // Abortable wait for a backoff; the timer is cleared when `signal` aborts.
 function abortableSleep(ms, signal) {
@@ -463,7 +590,7 @@ function abortableSleep(ms, signal) {
       resolve();
     };
     const timer = setTimeout(done, ms);
-    if (signal) signal.addEventListener('abort', done, { once: true });
+    if (signal) signal.addEventListener('abort', done); // done removes it
   });
 }
 
@@ -483,25 +610,38 @@ function turnError(raw) {
   return error;
 }
 
-// The backoff wait: ends early when the caller aborts or the app-server exits
-// (a dead app-server has no session left to continue).
-async function backoff(client, retry, delayMs, signal) {
+// The backoff wait: ends early when the caller aborts, control.stop() is
+// called, or the app-server exits (a dead app-server has no session left to continue).
+async function backoff(client, retry, delayMs, signals) {
   const ctl = new AbortController();
   const stop = () => ctl.abort();
-  if (signal) {
-    if (signal.aborted) stop();
-    else signal.addEventListener('abort', stop, { once: true });
+  const live = signals.filter(Boolean);
+  for (const s of live) {
+    if (s.aborted) stop();
+    else s.addEventListener('abort', stop); // removed in the finally below
   }
   client.exited.then(stop);
   try {
     await retry.sleep(delayMs, ctl.signal);
   } finally {
-    if (signal) signal.removeEventListener('abort', stop);
+    for (const s of live) s.removeEventListener('abort', stop);
   }
 }
 
+// A JSON-RPC answer meaning "this server does not know the method".
+function notSupported(err) {
+  return err instanceof AppServerError && (err.code === -32601 || /method not found|unknown method/i.test(err.message));
+}
+
+// The request failed because the client or its child is gone.
+function isGone(err) {
+  return err instanceof AppServerError && (err.code === 'closed' || err.code === 'child_exited');
+}
+
+let steerSeq = 0; // keeps commandIds unique when Date.now() repeats
+
 function retryOptions(transientRetry) {
-  const o = transientRetry && typeof transientRetry === 'object' ? transientRetry : {};
+  const o = transientRetry || {};
   const delaysMs = Array.isArray(o.delaysMs) && o.delaysMs.length && o.delaysMs.every((d) => Number.isFinite(d) && d >= 0)
     ? o.delaysMs
     : DEFAULT_RETRY_DELAYS_MS;
@@ -514,6 +654,20 @@ function retryOptions(transientRetry) {
     onRetry: typeof o.onRetry === 'function' ? o.onRetry : null,
     sleep: typeof o.sleep === 'function' ? o.sleep : abortableSleep,
   };
+}
+
+// cwd must be an absolute path to an existing directory (TypeError otherwise).
+function checkCwd(cwd) {
+  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
+    throw new TypeError('cwd must be an absolute path');
+  }
+  let isDir = false;
+  try {
+    isDir = statSync(cwd).isDirectory();
+  } catch {
+    // reported below
+  }
+  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
 }
 
 /**
@@ -547,6 +701,55 @@ function retryOptions(transientRetry) {
  * app-server exits (rejecting with code 'child_exited'). The returned `error`
  * carries code, message and the payload's other diagnostic fields (type, detail,
  * underlyingErrorMessage, statusCode, statusMessage, retryable, ...).
+ * Job control: onControl(control) is called once, right after session/subscribe
+ * succeeds and before the first session/send, with
+ *   control.stop()      -> Promise<'accepted'|'not_supported'>; sends session/stop.
+ *                          The turn that ends after a stop is returned as failed
+ *                          without any retry, whatever its error looks like, and
+ *                          a running backoff ends at once. Other request errors
+ *                          (e.g. request_timeout) reject.
+ *   control.steer(text) -> Promise<{status:'accepted', delivery:'guide'} | {status:'rejected'|'not_supported', reason?}>;
+ *                          sends v4/command sendText {text, requestedDelivery:'guide'}
+ *                          (no CAS: no baseRevision). ZCode acks an accepted steer
+ *                          with result.delivery 'queue' (it joined the pending list)
+ *                          and works it into the running turn at the next model
+ *                          step, which a turn.steerDrained event confirms.
+ *                          rejected 'retry' during a backoff, else the server's
+ *                          reasonCode. Other request errors reject.
+ *                          Steers without a turn.steerDrained when a turn
+ *                          completes (counted oldest first) are held by ZCode
+ *                          (autoDrain false) and delivered as a follow-up turn:
+ *                          CAS setAutoDrain {autoDrain:true}, then the turn ZCode
+ *                          starts within autoDrainWaitMs (default 10 s); when that
+ *                          is rejected, unsupported or no turn starts, one sendText
+ *                          {text: the texts joined by a blank line, requestedDelivery:
+ *                          'startNow', heldQueueDisposition:'clearQueueAndSend'}
+ *                          (clears ZCode's held copies, so nothing runs twice); when
+ *                          that is refused too, a session/send of the joined texts.
+ *                          The last turn's outcome is returned (usage summed).
+ *                          Not after a stop: steers left over are then returned
+ *                          as undeliveredSteers (string[], only when non-empty).
+ *                          CAS commands carry a top-level baseRevision: the
+ *                          revisionAtDecision of the latest v4/command answer (0
+ *                          before any); a 'stale' answer is retried once with the
+ *                          revisionAtDecision it carries.
+ *   control.answer(text) -> {status:'accepted'|'rejected', reason?}; answers the
+ *                          oldest parked requestUserInput (needs onUserInput),
+ *                          rejected 'no_question' when nothing is parked.
+ *   control.decline(reason) -> same, but declines the question
+ *                          ({action:'decline', reason}); ZCode tells the model
+ *                          it was declined and the turn goes on.
+ *   control.capabilities -> {stop, steer, userInput}: null until known; stop and
+ *                          steer turn false on the first "method not found"
+ *                          answer (later calls then return not_supported without
+ *                          a request), true on any other answer; userInput turns
+ *                          true when a question is parked.
+ * The control is only useful while the task runs: after the client is closed,
+ * stop() answers 'not_supported', steer() {status:'rejected', reason:'closed'}
+ * and answer() rejected 'no_question'. onUserInput is passed to the client
+ * (parking interaction/requestUserInput); without it questions are answered {action:'cancel'}.
+ * When a failed turn is retried, parked questions are dropped unanswered and
+ * onUserInputAbandoned() is called (the asking attempt has ended).
  * timeoutMs > 0 is a deadline for the whole task from the first send: every
  * wait gets the remaining time and a backoff that would pass it is not
  * started. The result carries retries [{at, attempt, delayMs, reason}] and
@@ -564,11 +767,15 @@ export async function runTaskWithModel({
   idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
-  killGroup = false,
+  killGroup,
   onSpawn,
   onEvent,
+  onUserInput,
+  onUserInputAbandoned,
+  onControl,
   signal,
   transientRetry,
+  autoDrainWaitMs = DEFAULT_AUTO_DRAIN_WAIT_MS,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new TypeError('prompt must be a non-empty string');
@@ -580,16 +787,7 @@ export async function runTaskWithModel({
   if (explicitModel && (typeof modelId !== 'string' || modelId.trim() === '')) {
     throw new TypeError('modelId must be a non-empty string');
   }
-  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
-    throw new TypeError('cwd must be an absolute path');
-  }
-  let isDir = false;
-  try {
-    isDir = statSync(cwd).isDirectory();
-  } catch {
-    // reported below
-  }
-  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+  checkCwd(cwd);
   if (typeof reasoningLevel !== 'string' || reasoningLevel.trim() === '') {
     throw new TypeError('reasoningLevel must be a non-empty string');
   }
@@ -598,8 +796,41 @@ export async function runTaskWithModel({
   const turnTimeout = (ms) => new AppServerError(`timed out after ${ms} ms waiting for session/event turn.completed|turn.failed`, { code: 'turn_timeout' });
   if (signal && signal.aborted) throw aborted();
   let client;
+  const capabilities = { stop: null, steer: null, userInput: null };
+  // Only hook requestUserInput when the caller listens; otherwise the client
+  // answers {} at once and nothing can be left parked forever.
+  const userInputHook = typeof onUserInput === 'function'
+    ? (req) => { capabilities.userInput = true; onUserInput(req); }
+    : undefined;
+  // Accepted steers, oldest first: { text, delivered }. A turn.steerDrained
+  // (ZCode 0.17.0: payload.drainedInputs[{pendingInputId, text, delivery}])
+  // marks each drained input's steer, matched by text, else the oldest
+  // undelivered one; drains seen before their steer's ack resolved are kept
+  // as credit.
+  const steers = [];
+  let drainCredit = 0;
+  const inflightSteers = new Set();
+  function noteDrainedInput(text) {
+    const open = steers.filter((e) => !e.delivered);
+    if (text !== null) {
+      const same = open.find((e) => e.text === text);
+      if (same) { same.delivered = true; return; }
+      // a drain of a steer already delivered (e.g. by a follow-up turn)
+      if (steers.some((e) => e.text === text)) return;
+    }
+    if (open.length) open[0].delivered = true;
+    else drainCredit += 1;
+  }
+  function noteDrained(payload) {
+    const inputs = payload && Array.isArray(payload.drainedInputs) && payload.drainedInputs.length ? payload.drainedInputs : [payload];
+    for (const i of inputs) noteDrainedInput(i && typeof i.text === 'string' ? i.text : null);
+  }
+  const observe = (params) => {
+    if (params && params.type === 'turn.steerDrained') noteDrained(params.payload);
+    if (typeof onEvent === 'function') onEvent(params);
+  };
   try {
-    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent, signal });
+    client = new AppServerClient({ binPath, cwd, timeoutMs: requestTimeoutMs, spawnFn, killGroup, onSpawn, onEvent: observe, onUserInput: userInputHook, signal });
   } catch (err) {
     if (err instanceof AppServerError) err.startup = true;
     throw err;
@@ -608,6 +839,171 @@ export async function runTaskWithModel({
   let sessionId = null;
   const retry = retryOptions(transientRetry);
   const retries = [];
+  let usage = null;
+  let stopRequested = false;
+  let backingOff = false;
+  const stopCtl = new AbortController();
+
+  // A v4/command envelope (ZCode 0.17.0): {commandId, clientId, sessionId,
+  // baseRevision?, type, payload, issuedAt}; baseRevision is top level.
+  function command(prefix, type, payload, baseRevision) {
+    const now = Date.now();
+    return {
+      commandId: `${prefix}-${sessionId}-${now}-${++steerSeq}`, clientId: 'zcode-delegate', sessionId,
+      ...(baseRevision === undefined ? {} : { baseRevision }), type, payload, issuedAt: now,
+    };
+  }
+
+  // Every v4/command answer (accepted, rejected, stale) carries the
+  // conversation's current revision as revisionAtDecision.
+  let lastRevision = 0;
+  async function v4(prefix, type, payload, baseRevision) {
+    const r = await client.request('v4/command', command(prefix, type, payload, baseRevision));
+    if (r && typeof r.revisionAtDecision === 'number') lastRevision = r.revisionAtDecision;
+    return r;
+  }
+
+  // CAS commands (setAutoDrain, setFollowupMode, sendQueuedNow, ...) need
+  // baseRevision; a stale one is retried once with the server's revision.
+  async function casCommand(type, payload) {
+    let r = await v4('cas', type, payload, lastRevision);
+    if (r && r.status === 'stale' && typeof r.revisionAtDecision === 'number') {
+      r = await v4('cas', type, payload, r.revisionAtDecision);
+    }
+    return r;
+  }
+
+  async function sendSteer(text) {
+    let result;
+    try {
+      result = await v4('steer', 'sendText', { text, requestedDelivery: 'guide' });
+    } catch (err) {
+      if (notSupported(err)) {
+        capabilities.steer = false;
+        return { status: 'not_supported' };
+      }
+      if (isGone(err)) return { status: 'rejected', reason: 'closed' };
+      throw err;
+    }
+    capabilities.steer = true;
+    if (result && result.status === 'accepted') {
+      // result.result.delivery is 'queue' even for a guide steer (it joined
+      // the pending list); only turn.steerDrained shows it reached the turn.
+      const entry = { text, delivered: false };
+      if (drainCredit > 0) {
+        drainCredit -= 1;
+        entry.delivered = true;
+      }
+      steers.push(entry);
+      return { status: 'accepted', delivery: 'guide' };
+    }
+    return { status: 'rejected', reason: (result && typeof result.reasonCode === 'string' && result.reasonCode) || 'rejected' };
+  }
+
+  // Accepted steers ZCode has not worked into a turn (no turn.steerDrained).
+  async function pendingSteers() {
+    if (inflightSteers.size) await Promise.allSettled([...inflightSteers]);
+    return steers.filter((e) => !e.delivered);
+  }
+
+  // No credit can be left here: a credit is only kept while no steer is open.
+  function markDelivered(list) {
+    for (const e of list) e.delivered = true;
+  }
+
+  // Answers the oldest parked requestUserInput with build(params).
+  function replyOldest(build) {
+    const oldest = client.parkedUserInput[0];
+    if (!oldest || !client.respond(oldest.protocolId, build(oldest.params))) {
+      return { status: 'rejected', reason: 'no_question' };
+    }
+    return { status: 'accepted' };
+  }
+
+  // The job-control handle given to onControl (see the doc comment above).
+  function makeControl() {
+    return {
+      capabilities,
+      async stop() {
+        if (capabilities.stop === false) return 'not_supported';
+        // Set before the request: the server may end the turn before it answers.
+        const wasRequested = stopRequested;
+        stopRequested = true;
+        try {
+          await client.request('session/stop', { sessionId });
+        } catch (err) {
+          stopRequested = wasRequested;
+          if (notSupported(err)) {
+            capabilities.stop = false;
+            return 'not_supported';
+          }
+          if (isGone(err)) return 'not_supported';
+          throw err;
+        }
+        capabilities.stop = true;
+        stopCtl.abort(); // end a running backoff at once
+        return 'accepted';
+      },
+      async steer(text) {
+        if (capabilities.steer === false) return { status: 'not_supported' };
+        if (backingOff) return { status: 'rejected', reason: 'retry' };
+        const p = sendSteer(text);
+        inflightSteers.add(p);
+        try {
+          return await p;
+        } finally {
+          inflightSteers.delete(p);
+        }
+      },
+      answer(text) {
+        return replyOldest((params) => buildUserInputAnswer(params, text));
+      },
+      decline(reason) {
+        return replyOldest(() => buildUserInputDecline(reason));
+      },
+    };
+  }
+
+  // Delivers held steers after a completed turn. CAS setAutoDrain lets ZCode
+  // run its held queue as a new turn ({startedAt: cursor} once its
+  // turn.started arrives within autoDrainWaitMs). When that is rejected,
+  // unsupported or no turn starts: sendText startNow + clearQueueAndSend with
+  // the joined texts ({startedAt: cursor}; the held copies are dropped, so
+  // nothing runs twice), else the texts go out as a new session/send
+  // ({startedAt: null, content}).
+  async function deliverPending(pending, deadline) {
+    const texts = pending.map((e) => e.text);
+    const joined = texts.join('\n\n');
+    markDelivered(pending);
+    let cursor = client.eventOrdinal;
+    let accepted = false;
+    try {
+      const r = await casCommand('setAutoDrain', { autoDrain: true });
+      accepted = !!(r && r.status === 'accepted');
+    } catch (err) {
+      if (isGone(err)) throw err;
+    }
+    if (accepted) {
+      const left = deadline === null ? autoDrainWaitMs : Math.min(autoDrainWaitMs, deadline - Date.now());
+      if (left <= 0) throw turnTimeout(timeoutMs);
+      try {
+        await client.waitForEvent('turn.started', { timeoutMs: left, since: cursor });
+        return { startedAt: cursor, content: null };
+      } catch (err) {
+        if (err.code !== 'turn_timeout') throw err; // waitForEvent rejects with AppServerErrors only
+      }
+    }
+    if (stopRequested) return { startedAt: null, content: joined };
+    cursor = client.eventOrdinal;
+    try {
+      const r = await v4('drain', 'sendText', { text: joined, requestedDelivery: 'startNow', heldQueueDisposition: 'clearQueueAndSend' });
+      if (r && r.status === 'accepted') return { startedAt: cursor, content: null };
+    } catch (err) {
+      if (isGone(err)) throw err;
+    }
+    return { startedAt: null, content: joined };
+  }
+
   try {
     await client.settle();
 
@@ -646,6 +1042,12 @@ export async function runTaskWithModel({
     // Gates session/event delivery on the real server (notes §4).
     await client.request('session/subscribe', { sessionId, deliveryKind: 'desktop-continuous' });
 
+    if (typeof onControl === 'function') {
+      try {
+        onControl(makeControl());
+      } catch { /* an observer must not end the task */ }
+    }
+
     // ACK-only: acceptance says nothing about model validity; the turn
     // outcome arrives as a session/event notification (notes §5/§6).
     startup = false; // from here on the task may be running: never retry
@@ -653,23 +1055,47 @@ export async function runTaskWithModel({
     const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
     const base = { sessionId, catalog, model: { providerId, modelId }, reasoningSubstitution, retries };
     let content = prompt;
+    let startedAt = null; // cursor of a turn ZCode started without our session/send (auto-drain)
+    // Steers ZCode never worked into a turn are reported on the result.
+    const withUndelivered = async (out) => {
+      const left = (await pendingSteers()).map((e) => e.text);
+      return left.length ? { ...out, undeliveredSteers: left } : out;
+    };
     for (;;) {
-      const cursor = client.eventOrdinal;
-      await client.request('session/send', { sessionId, content, modelSelection });
+      let cursor = startedAt;
+      startedAt = null;
+      if (cursor === null) {
+        cursor = client.eventOrdinal;
+        await client.request('session/send', { sessionId, content, modelSelection });
+      }
       const left = deadline === null ? 0 : deadline - Date.now();
       if (deadline !== null && left <= 0) throw turnTimeout(timeoutMs);
       let event;
       try {
         event = await client.waitForEvent(['turn.completed', 'turn.failed'], { timeoutMs: left, idleTimeoutMs, since: cursor });
       } catch (err) {
-        throw err instanceof AppServerError && err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
+        throw err.code === 'turn_timeout' ? turnTimeout(timeoutMs) : err;
       }
+      usage = addUsage(usage, event.payload && event.payload.usage);
+      // stopped: a session/stop was sent before this terminal event arrived; the
+      // caller records the job cancelled even when the turn completed.
+      const stopped = stopRequested;
       if (event.type === 'turn.completed') {
-        return { ...base, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null };
+        const completed = { ...base, usage, ok: true, response: (event.payload && event.payload.response) ?? '', failed: false, error: null, retryStop: null, stopped };
+        // Steers the turn ended before draining are held by ZCode (autoDrain
+        // false): deliver them as a follow-up turn, whose outcome is then returned.
+        const pending = stopRequested ? [] : await pendingSteers();
+        if (!pending.length || stopRequested) return withUndelivered({ ...completed, stopped: stopped || stopRequested });
+        const drain = await deliverPending(pending, deadline);
+        if (stopRequested) return withUndelivered({ ...completed, stopped: true });
+        if (drain.startedAt !== null) startedAt = drain.startedAt;
+        else content = drain.content;
+        continue;
       }
       const raw = (event.payload && event.payload.error) || {};
       const error = turnError(raw);
-      const failed = (retryStop) => ({ ...base, ok: false, response: null, failed: true, error, retryStop });
+      const failed = (retryStop) => withUndelivered({ ...base, usage, ok: false, response: null, failed: true, error, retryStop, stopped: stopped || stopRequested });
+      if (stopRequested) return failed(null); // a stopped turn is never retried
       const cls = retry.classify(error) || {};
       if (!cls.transient) return failed(null);
       const classCap = Number.isInteger(cls.maxRetries) ? cls.maxRetries : Infinity;
@@ -685,14 +1111,25 @@ export async function runTaskWithModel({
       const at = new Date().toISOString();
       const reason = describeTurnError(error);
       const klass = cls.klass ?? null;
+      // A pending user-input request ends with the failed attempt: the retry
+      // starts a new turn that never sees an answer to it.
+      if (client.abandonParked() > 0 && typeof onUserInputAbandoned === 'function') {
+        try { onUserInputAbandoned(); } catch { /* an observer must not end the task */ }
+      }
       retries.push({ at, attempt, delayMs, reason, klass });
       if (retry.onRetry) {
         try {
           retry.onRetry({ attempt, maxRetries: retry.maxRetries, classAttempt, classMaxRetries, klass, delayMs, reason, at });
         } catch { /* an observer must not end the task */ }
       }
-      await backoff(client, retry, delayMs, signal);
+      backingOff = true;
+      try {
+        await backoff(client, retry, delayMs, [signal, stopCtl.signal]);
+      } finally {
+        backingOff = false;
+      }
       if (signal && signal.aborted) throw aborted();
+      if (stopRequested) return failed(null);
       if (!client.isRunning()) {
         throw new AppServerError('app-server child exited during the backoff after a transient error', { code: 'child_exited' });
       }
@@ -701,8 +1138,12 @@ export async function runTaskWithModel({
   } catch (err) {
     const out = signal && signal.aborted ? aborted() : err;
     if (startup && out instanceof AppServerError && out.code !== 'no-model' && out.code !== 'aborted') out.startup = true;
-    if (sessionId && out && typeof out === 'object') out.sessionId = sessionId;
-    if (retries.length && out && typeof out === 'object') out.retries = retries;
+    if (out && typeof out === 'object') {
+      if (sessionId) out.sessionId = sessionId;
+      if (retries.length) out.retries = retries;
+      out.usage = usage;
+      out.stopped = stopRequested;
+    }
     throw out;
   } finally {
     await client.close();
@@ -722,16 +1163,7 @@ export async function getModelCatalog({
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   spawnFn,
 } = {}) {
-  if (typeof cwd !== 'string' || !cwd.startsWith('/')) {
-    throw new TypeError('cwd must be an absolute path');
-  }
-  let isDir = false;
-  try {
-    isDir = statSync(cwd).isDirectory();
-  } catch {
-    // reported below
-  }
-  if (!isDir) throw new TypeError(`cwd does not exist or is not a directory: ${cwd}`);
+  checkCwd(cwd);
 
   const client = new AppServerClient({ binPath, cwd, spawnFn });
   try {

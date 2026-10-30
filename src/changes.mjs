@@ -88,7 +88,7 @@ export function changesSince(cwd, baseline) {
   const gitRoot = baseline.gitRoot;
   try {
     const before = new Map((baseline.dirty ?? []).map((d) => [d.path, d.hash]));
-    const baseHead = baseline.head ?? null;
+    const baseHead = baseline.head;
     const current = readStatus(gitRoot);
     const seen = new Set(current.map((e) => e.path));
     const merged = new Map();

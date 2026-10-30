@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { providerConfigPath } from '../../src/provider-check.mjs';
 
 export const REPORT_KEYS = ['ok', 'version', 'user', 'home', 'steps', 'registered', 'files', 'nextSteps'];
-export const TOOL_NAMES = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel'];
+export const TOOL_NAMES = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel', 'zcode_send'];
 
 // ZCode path variables set while installing are written into the registration so
 // the client starts the server with them; secrets (ZCODE_CREDENTIAL_SECRET) never.
@@ -107,7 +107,7 @@ export function evaluateSession(session, { probe, keys = new Map(), providerFile
   const missing = TOOL_NAMES.filter((t) => !names.includes(t));
   steps.push(missing.length
     ? { name: 'selftest:tools', ok: false, detail: `tools/list lacks ${missing.join(', ')}`, fix: 'The server file is not this version of zcode-mcp: re-run the installer from an up-to-date clone.' }
-    : { name: 'selftest:tools', ok: true, detail: `tools/list has all six tools (${TOOL_NAMES.join(', ')})` });
+    : { name: 'selftest:tools', ok: true, detail: `tools/list has all seven tools (${TOOL_NAMES.join(', ')})` });
 
   const p = parseCheckText(session.check && session.check.text);
   if (!p) {

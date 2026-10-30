@@ -83,12 +83,13 @@ test('completed job writes result with sessionId and changedFiles', async () => 
   assert.equal(res.changesAvailable, true);
   assert.deepEqual(res.warnings, []);
   assert.equal(res.errorKind, null);
+  assert.equal(res.errorMessage, null);
   assert.equal(res.exitCode, 0);
   assert.match(res.output, /fake task done/);
   assert.equal(res.outputLogPath, join(dir, 'output.log'));
   assert.equal(readFileSync(res.outputLogPath, 'utf8'), res.output);
   assert.equal(statSync(res.outputLogPath).mode & 0o777, 0o600);
-  assert.equal(typeof res.durationMs, 'number');
+  assert.ok(res.durationMs >= 0 && res.durationMs < 60000, `durationMs ${res.durationMs}`);
   const entry = new SessionStore(process.env.ZCODE_MCP_STATE).list().find((e) => e.id === 'sess_fake123');
   assert.ok(entry, 'session store entry written');
   assert.equal(entry.kind, 'session');
@@ -156,7 +157,7 @@ test('crash-mid ends failed with errorKind crash', async () => {
   assert.equal(res.state, 'failed');
   assert.equal(res.errorKind, 'crash');
   assert.equal(res.exitCode, 1);
-  assert.equal(typeof res.errorMessage, 'string');
+  assert.equal(res.errorMessage, 'ZCode exited with code 1');
   const entry = new SessionStore(process.env.ZCODE_MCP_STATE).list().at(-1);
   assert.equal(entry.kind, 'run');
   assert.equal(entry.status, 'failed');
@@ -478,6 +479,7 @@ test('ZCode killed without a cancel request still ends failed with errorKind cra
   const res = readResult(dir);
   assert.equal(res.state, 'failed');
   assert.equal(res.errorKind, 'crash');
+  assert.equal(res.errorMessage, 'ZCode did not exit normally (no exit code)');
 });
 
 test('a runner started after the manager already ended the job writes nothing', async () => {
@@ -594,5 +596,219 @@ test('identity stays unknown: job still completes, pidStart/childStart null, war
   assert.equal(st.state, 'completed');
   assert.equal(st.pidStart, null);
   assert.ok(st.warnings.includes('identity_unrecorded'));
+  assert.equal(st.childStart, null);
   assert.equal(readResult(dir).state, 'completed');
+});
+
+import { unlinkSync } from 'node:fs';
+import { killActiveChild, writeCrashState } from '../src/job-runner.mjs';
+
+const KNOWN = (pid, start = 'Mon Jan  1 00:00:00 2024') => ({ pid, start, command: 'x' });
+
+test('the child identity is retried in the background: 1 + 4 samples, then identity_unrecorded', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty'; // alive ~1.5 s: long enough for every retry
+  const { dir } = mkJob({ cwd: tempCwd() });
+  let childCalls = 0;
+  const identity = (pid) => (pid === process.pid ? KNOWN(pid) : (++childCalls, { pid, unknown: true }));
+  await runJob(dir, { identity, identityRetryDelayMs: 5 });
+  assert.equal(childCalls, 5);
+  const st = readStatus(dir);
+  assert.equal(st.pidStart, 'Mon Jan  1 00:00:00 2024');
+  assert.equal(st.childStart, null);
+  assert.deepEqual(st.warnings, ['identity_unrecorded']);
+});
+
+test('a child identity that becomes known on retry is recorded, without a warning', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty';
+  const { dir } = mkJob({ cwd: tempCwd() });
+  let childCalls = 0;
+  const identity = (pid) => {
+    if (pid === process.pid) return KNOWN(pid);
+    return ++childCalls === 1 ? { pid, unknown: true } : KNOWN(pid, 'Tue Jan  2 00:00:00 2024');
+  };
+  await runJob(dir, { identity, identityRetryDelayMs: 5 });
+  assert.equal(childCalls, 2);
+  const st = readStatus(dir);
+  assert.equal(st.childStart, 'Tue Jan  2 00:00:00 2024');
+  assert.deepEqual(st.warnings, []);
+});
+
+test('a child that ps no longer finds is recorded without childStart and without a warning', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const patches = [];
+  const identity = (pid) => (pid === process.pid ? KNOWN(pid) : null);
+  await runJob(dir, { identity, identityRetryDelayMs: 5, onStatus: (_s, p) => patches.push(p) });
+  const running = patches.find((p) => p.state === 'running');
+  assert.ok(Number.isInteger(running.childPid));
+  assert.equal(running.childStart, null);
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.deepEqual(res.warnings, []);
+});
+
+test('the runner identity is sampled 5 times without delay, then identity_unrecorded', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const selfCalls = [];
+  const identity = (pid) => {
+    if (pid !== process.pid) return KNOWN(pid);
+    selfCalls.push(Date.now());
+    return { pid, unknown: true };
+  };
+  await runJob(dir, { identity, identityRetryDelayMs: 0 });
+  assert.equal(selfCalls.length, 5);
+  const gaps = selfCalls.slice(1).map((t, i) => t - selfCalls[i]);
+  assert.ok(Math.max(...gaps) < 80, `retry delay 0 is honoured (gaps ${gaps})`);
+  const st = readStatus(dir);
+  assert.equal(st.pidStart, null);
+  assert.equal(st.childStart, 'Mon Jan  1 00:00:00 2024');
+  assert.deepEqual(st.warnings, ['identity_unrecorded']);
+  assert.equal(readResult(dir).state, 'completed');
+});
+
+test('a runner identity ps cannot find is a warning, not a crash', async () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  const identity = (pid) => (pid === process.pid ? null : KNOWN(pid));
+  await runJob(dir, { identity, identityRetryDelayMs: 0 });
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.deepEqual(res.warnings, ['identity_unrecorded']);
+  assert.equal(readStatus(dir).pidStart, null);
+});
+
+test('CLI output writes lastActivityAt at most once per second', async () => {
+  process.env.FAKE_ZCODE_MODE = 'chatty'; // 11 stdout chunks over ~1.5 s
+  const { dir } = mkJob({ cwd: tempCwd() });
+  let activityWrites = 0;
+  await runJob(dir, { onStatus: (_s, p) => { if (p.lastActivityAt && !p.state) activityWrites++; } });
+  assert.equal(readResult(dir).state, 'completed');
+  assert.ok(activityWrites >= 1 && activityWrites <= 3, `${activityWrites} activity writes`);
+});
+
+test('result.output of exactly OUTPUT_CAP characters is whole; longer output keeps its head', async () => {
+  const bin = join(tempCwd(), 'print.cjs');
+  writeFileSync(bin, "process.stdout.write('a' + 'x'.repeat(Number(process.env.FAKE_OUT_LEN) - 1));");
+  const saved = process.env.ZCODE_BIN;
+  process.env.ZCODE_BIN = bin;
+  try {
+    process.env.FAKE_OUT_LEN = String(OUTPUT_CAP);
+    const exact = mkJob({ cwd: tempCwd() });
+    await runJob(exact.dir);
+    assert.equal(readResult(exact.dir).output, 'a' + 'x'.repeat(OUTPUT_CAP - 1));
+    process.env.FAKE_OUT_LEN = String(OUTPUT_CAP + 10);
+    const over = mkJob({ cwd: tempCwd() });
+    await runJob(over.dir);
+    assert.equal(readResult(over.dir).output, `a${'x'.repeat(OUTPUT_CAP - 1)}\n[... output truncated at ${OUTPUT_CAP} chars]`);
+  } finally {
+    process.env.ZCODE_BIN = saved;
+    delete process.env.FAKE_OUT_LEN;
+  }
+});
+
+test('a job.json without a cwd ends failed (crash) without running ZCode', async () => {
+  const { dir } = createJobDir({ params: { prompt: 'do it' }, path: 'cli', baseline: null });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'crash');
+  assert.match(res.errorMessage, /missing or incomplete/);
+});
+
+test('idle_timeout_ms applies on the CLI path', async () => {
+  process.env.FAKE_ZCODE_MODE = 'silent';
+  const { dir } = mkJob({ cwd: tempCwd(), idle_timeout_ms: 500 });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'timeout');
+  assert.equal(res.errorKind, 'timeout_idle');
+  assert.equal(res.errorMessage, 'No activity for 500 ms');
+});
+
+test('the session store entry carries mode and the first 80 prompt characters', async () => {
+  const prompt = `P${'q'.repeat(120)}`;
+  const { dir } = mkJob({ cwd: tempCwd(), mode: 'plan', prompt });
+  const saved = process.env.ZCODE_MCP_STATE;
+  const store = join(tempCwd(), 'own-sessions.json'); // not the default path under ZCODE_MCP_HOME
+  process.env.ZCODE_MCP_STATE = store;
+  try {
+    await runJob(dir);
+  } finally {
+    process.env.ZCODE_MCP_STATE = saved;
+  }
+  const entries = new SessionStore(store).list();
+  assert.equal(entries.length, 1);
+  const entry = entries[0];
+  assert.equal(entry.mode, 'plan');
+  assert.equal(entry.promptPreview, prompt.slice(0, 80));
+  assert.equal(entry.status, 'completed');
+});
+
+test('a worktree job without a baseline reports its changes and no shared_repo', async () => {
+  const wt = gitCwd();
+  const startSha = run(wt, 'git', ['rev-parse', 'HEAD']).trim();
+  writeFileSync(join(wt, 'wt.txt'), 'x\n');
+  const { dir } = mkJob({ cwd: tempCwd(), isolate_worktree: true }, { worktree: { branch: 'zcode/t', dir: wt, startSha } });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'completed');
+  assert.equal(res.changesAvailable, true);
+  assert.deepEqual(res.changedFiles, ['?? wt.txt']);
+  assert.deepEqual(res.warnings, []);
+});
+
+test('a worktree that cannot be summarised reports changes unavailable', async () => {
+  const gone = join(tempCwd(), 'no-such-worktree');
+  const { dir } = mkJob({ cwd: tempCwd(), isolate_worktree: true }, { worktree: { branch: 'zcode/t', dir: gone, startSha: 'HEAD' } });
+  await runJob(dir);
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed'); // ZCode cannot start in a missing directory
+  assert.equal(res.changesAvailable, false);
+  assert.deepEqual(res.changedFiles, []);
+});
+
+test('killActiveChild without a running child signals nothing and says so', () => {
+  assert.equal(killActiveChild(), false);
+});
+
+test('writeCrashState records a crash for a job that has no status yet', () => {
+  const { dir } = mkJob({ cwd: tempCwd() });
+  writeCrashState(dir, null, 'plain string failure', { startedMs: Date.now() - 1000 });
+  const res = readResult(dir);
+  assert.equal(res.state, 'failed');
+  assert.equal(res.errorKind, 'crash');
+  assert.equal(res.errorMessage, 'plain string failure');
+  assert.equal(res.changesAvailable, false);
+  assert.equal(res.outputLogPath, null);
+  assert.ok(res.durationMs >= 1000 && res.durationMs < 60000, `durationMs ${res.durationMs}`);
+  assert.equal(readStatus(dir).state, 'failed');
+});
+
+test('runnerEnvOptions: heartbeat 0 is unset, 1 is clamped; retry delays may be 0; fatal 1 counts', () => {
+  assert.equal(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '0' }).heartbeatMs, undefined);
+  assert.equal(runnerEnvOptions({ ZCODE_MCP_HEARTBEAT_MS: '1' }).heartbeatMs, 1000);
+  assert.equal(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_HEARTBEAT_MS: '1' }).heartbeatMs, 1);
+  assert.deepEqual(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_TEST_RETRY_DELAYS_MS: '0,5' }).retryDelaysMs, [0, 5]);
+  assert.equal(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_TEST_RETRY_DELAYS_MS: '' }).retryDelaysMs, undefined);
+  assert.equal(runnerEnvOptions({ NODE_ENV: 'test', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '1' }).fatalAfterMs, 1);
+});
+
+test('a fatal runner error still records the crash when status.json is gone', async () => {
+  const { dir, token } = mkJob({ cwd: tempCwd() });
+  const { child, exited } = spawnRunner(dir, token, {
+    FAKE_ZCODE_MODE: 'silent', ZCODE_MCP_TEST_FATAL_AFTER_SPAWN: '800', NODE_ENV: 'test',
+  });
+  let st;
+  try {
+    st = await waitFor(() => (readStatus(dir)?.state === 'running' ? readStatus(dir) : null));
+    unlinkSync(join(dir, 'status.json'));
+    const { code } = await exited;
+    assert.equal(code, 1);
+    const res = readResult(dir);
+    assert.equal(res.state, 'failed');
+    assert.match(res.errorMessage, /test fatal after spawn/);
+    assert.equal(res.durationMs, null); // startedAt went with status.json
+    await waitFor(() => !alive(st.childPid), 2000);
+  } finally {
+    safeSignal(child.pid, 'SIGKILL', { marker: 'job-runner.mjs', group: true }); // the detached runner we spawned
+    if (st) safeSignal(st.childPid, 'SIGKILL', { marker: 'fake-zcode' });
+  }
 });

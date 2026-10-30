@@ -109,7 +109,7 @@ client.notify('notifications/initialized');
 
 const list = await client.request('tools/list', {});
 const names = list.result.tools.map((t) => t.name).sort();
-assertThat(JSON.stringify(names) === JSON.stringify(['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']), 'exposes exactly 6 tools');
+assertThat(JSON.stringify(names) === JSON.stringify(['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_send', 'zcode_sessions', 'zcode_status']), 'exposes exactly 7 tools');
 
 const check = await client.request('tools/call', { name: 'zcode_check', arguments: {} });
 assertThat(/"ok": true/.test(check.result.content[0].text), 'zcode_check ok with fake binary');

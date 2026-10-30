@@ -63,17 +63,19 @@ function readLock(path) {
     const data = JSON.parse(raw);
     if (data && typeof data.jobId === 'string') return { jobId: data.jobId };
   } catch {}
-  let ageMs = 0;
-  try { ageMs = Date.now() - statSync(path).mtimeMs; } catch { return null; }
-  return { corrupt: true, ageMs };
+  try { return { corrupt: true, ageMs: Date.now() - statSync(path).mtimeMs }; } catch { return null; }
 }
 
 const isStale = (held, isAlive) => (held.corrupt ? held.ageMs > CORRUPT_GRACE_MS : !isAlive(held.jobId));
 
-function pidAlive(pid) {
+// The job holding a lock as reported to the caller: 'unknown' for a corrupt or vanished lock.
+const holder = (held) => held?.jobId || 'unknown';
+
+// kill: test hook (a fake process.kill); production never passes it.
+export function pidAlive(pid, kill = (p, sig) => process.kill(p, sig)) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    process.kill(pid, 0);
+    kill(pid, 0);
     return true;
   } catch (err) {
     return err.code === 'EPERM'; // exists, owned by someone else; ESRCH means gone
@@ -117,7 +119,7 @@ function withClaim(path, fn) {
   const nonce = randomBytes(8).toString('hex');
   if (!createExclusive(claim, { pid: process.pid, createdAt: new Date().toISOString(), nonce })) {
     const data = readClaim(claim);
-    let abandoned = false;
+    let abandoned; // stays undefined (not abandoned) when the claim vanished meanwhile
     let judged = { nonce: undefined };
     if (data) {
       judged = data;
@@ -146,25 +148,24 @@ export function acquireCwdLock(cwd, jobId, isAlive) {
     if (createExclusive(path, lockContent(jobId))) return { ok: true };
     const held = readLock(path);
     if (held === null) continue; // vanished meanwhile: try again
-    if (!isStale(held, isAlive)) return { ok: false, blockingJobId: held.corrupt ? 'unknown' : held.jobId };
+    if (!isStale(held, isAlive)) return { ok: false, blockingJobId: holder(held) };
     const result = withClaim(path, (owns) => {
       // Re-check under the claim; only claim holders and the owner ever unlink the lock.
       const cur = readLock(path);
       if (cur !== null) {
-        if (!isStale(cur, isAlive)) return { ok: false, blockingJobId: cur.corrupt ? 'unknown' : cur.jobId };
+        if (!isStale(cur, isAlive)) return { ok: false, blockingJobId: holder(cur) };
         if (!owns()) return { ok: false, blockingJobId: 'unknown' };
         tryUnlink(path);
       }
       if (createExclusive(path, lockContent(jobId))) return { ok: true };
-      const third = readLock(path); // a third process created a live lock in the gap
-      return { ok: false, blockingJobId: third && third.jobId ? third.jobId : 'unknown' };
+      // A third process created a live lock in the gap.
+      return { ok: false, blockingJobId: holder(readLock(path)) };
     });
     if (result === 'busy') sleepMs(20 + Math.floor(Math.random() * 30));
     else return result;
   }
   // Retries exhausted (heavy contention on a takeover): report whoever holds it now.
-  const last = readLock(path);
-  return { ok: false, blockingJobId: last && last.jobId ? last.jobId : 'unknown' };
+  return { ok: false, blockingJobId: holder(readLock(path)) };
 }
 
 // Removes the lock of `cwd` only if it is stale (same claim protocol). True if one was removed.

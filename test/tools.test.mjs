@@ -13,6 +13,7 @@ import { getJob, waitJob, cancelJob, listJobs } from '../src/jobs.mjs';
 import { reap } from '../src/reaper.mjs';
 import { createJobDir, patchStatus, readStatus, writeResult, jobsRoot } from '../src/jobstore.mjs';
 import { captureBaseline } from '../src/changes.mjs';
+import { OUTPUT_CAP } from '../src/runner.mjs';
 import { makeTempDir, removeDir, fakeBin, makeGitRepo, run, safeSignal } from './helpers.mjs';
 
 const fakeAppserverBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
@@ -86,10 +87,10 @@ after(() => {
   for (const d of temps) removeDir(d);
 });
 
-test('exposes exactly the six spec tools with object schemas', async () => {
+test('exposes exactly the seven spec tools with object schemas', async () => {
   const reply = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = reply.result.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_sessions', 'zcode_status']);
+  assert.deepEqual(names, ['zcode_cancel', 'zcode_check', 'zcode_result', 'zcode_run', 'zcode_send', 'zcode_sessions', 'zcode_status']);
   for (const t of reply.result.tools) {
     assert.equal(t.inputSchema.type, 'object');
     assert.ok(t.description.length > 20);
@@ -154,6 +155,7 @@ test('zcode_run without mode runs the protocol path (status names protocol)', as
   assert.match(text, /^status: completed \(protocol\)$/m);
   assert.match(text, /^session_id: sess_fakeB1$/m);
   assert.match(text, /fake model task done/);
+  assert.match(text, /^usage: 105 tokens \(in 100, out 5, reasoning 0, cache read 0\), 1 requests$/m);
 });
 
 test('zcode_run records a non-resumable job id when the CLI prints no session id', async () => {
@@ -924,12 +926,18 @@ test('zcode_check reports jobs.writable', async () => {
 });
 
 test('zcode_check warns for an unknown ZCode version', async () => {
-  process.env.FAKE_ZCODE_VERSION = '0.17.0';
+  process.env.FAKE_ZCODE_VERSION = '0.18.0';
   const reply = await call('zcode_check', {});
   assert.equal(reply.result.isError, undefined);
   const payload = JSON.parse(textOf(reply));
   assert.equal(payload.ok, true);
-  assert.deepEqual(payload.warnings, ['ZCode version 0.17.0 is not in the verified list (0.16.9); protocol behaviour may differ']);
+  assert.deepEqual(payload.warnings, ['ZCode version 0.18.0 is not in the verified list (0.16.9, 0.17.0); protocol behaviour may differ']);
+});
+
+test('zcode_check does not warn for ZCode 0.17.0 (probed 2026-10-29)', async () => {
+  process.env.FAKE_ZCODE_VERSION = '0.17.0';
+  const payload = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.deepEqual(payload.warnings, []);
 });
 
 test('control characters in changed file names cannot forge lines', async () => {
@@ -1010,4 +1018,326 @@ test('a pass in flight for more than 5 minutes no longer blocks a new one', asyn
   assert.equal(pending.length, 2, 'the late settle did not clear the newer pass');
   pending[1]({ lost: [], deleted: [], killed: [] });
   await flush();
+});
+
+// --- Task 8: zcode_send, needs_input rendering ---
+
+test('zcode_send schema requires job_id and text; zcode_run documents input_timeout_ms', async () => {
+  const reply = await proto.handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  const send = reply.result.tools.find((t) => t.name === 'zcode_send');
+  assert.deepEqual(send.inputSchema.required, ['job_id', 'text']);
+  assert.equal(send.inputSchema.properties.text.type, 'string');
+  assert.match(send.description, /needs_input/);
+  const run = reply.result.tools.find((t) => t.name === 'zcode_run');
+  assert.match(run.inputSchema.properties.input_timeout_ms.description, /1800000/);
+  const cancel = reply.result.tools.find((t) => t.name === 'zcode_cancel');
+  assert.match(cancel.description, /graceful/i);
+});
+
+test('a needs_input job renders state, question, deadline and the zcode_send hint', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 0 });
+  const id = jobIdOf(textOf(reply));
+  await waitFor(() => getJob(id)?.state === 'needs_input');
+  const text = textOf(await call('zcode_status', { job_id: id }));
+  assert.match(text, /^status: needs_input$/m);
+  assert.match(text, /^question: Which port\? \[options: 3000 \(Recommended\) \| 8080\]$/m);
+  assert.match(text, /^input_deadline: \d{4}-\d\d-\d\dT/m);
+  assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
+  const sent = await call('zcode_send', { job_id: id, text: '8080' });
+  assert.notEqual(sent.result.isError, true);
+  assert.match(textOf(sent), /^send: accepted$/m);
+  assert.ok(textOf(sent).includes(`job_id: ${id}`));
+  assert.match(textOf(sent), /^status: \S+$/m);
+});
+
+test('zcode_send on a running protocol job is accepted', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'chatty';
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 0 });
+  const id = jobIdOf(textOf(reply));
+  await waitFor(() => getJob(id)?.state === 'running');
+  const sent = await call('zcode_send', { job_id: id, text: 'please also add tests' });
+  assert.match(textOf(sent), /^send: (accepted|queued)$/m);
+  if (/^send: accepted$/m.test(textOf(sent))) assert.match(textOf(sent), /^delivery: guide \(into the running turn at its next step; a follow-up turn if the turn ends first\)$/m);
+});
+
+test('zcode_send errors: unknown job, bad arguments, queued hint, rejected is isError', async () => {
+  let r = await call('zcode_send', { job_id: 'job_00000000-0000-0000-0000-000000000000', text: 'hi' });
+  assert.equal(r.result.isError, true);
+  assert.match(textOf(r), /Unknown job/);
+  r = await call('zcode_send', { job_id: 5, text: 'hi' });
+  assert.equal(r.result.isError, true);
+  r = await call('zcode_send', { job_id: 'job_x', text: 5 });
+  assert.equal(r.result.isError, true);
+  assert.match(textOf(r), /text must be a string/);
+});
+
+test('zcode_run returns as soon as the job needs input instead of waiting out wait_ms', async () => {
+  process.env.FAKE_APPSERVER_MODE = 'ask';
+  const t0 = Date.now();
+  const reply = await call('zcode_run', { prompt: 'x', cwd: tempCwd(), wait_ms: 20000 });
+  const took = Date.now() - t0;
+  const text = textOf(reply);
+  const id = jobIdOf(text);
+  assert.ok(took < 10000, `returned early (${took} ms)`);
+  assert.match(text, /^status: needs_input$/m);
+  assert.match(text, /^question: Which port\? \[options: 3000 \(Recommended\) \| 8080\]$/m);
+  assert.ok(text.includes(`answer with zcode_send ${id} "<text>"`));
+  await call('zcode_send', { job_id: id, text: '8080' });
+});
+
+// --- mutation follow-up: rendering details, reaper bounds, zcode_check fields ---
+
+const BASE_RESULT = {
+  state: 'completed', output: '', changedFiles: [], diffStat: '', changesAvailable: false,
+  exitCode: 0, timeoutKind: null, stderr: '', warnings: [],
+};
+const resultText = async (state, result, status = {}) => {
+  const j = handJob({ status: { ...DEAD_RUNNER, state, ...status }, result: { ...BASE_RESULT, state, ...result } });
+  return textOf(await call('zcode_result', { job_id: j.jobId }));
+};
+const headOf = (text) => text.split(MARKER)[0];
+const handlerOf = (tools, name) => tools.find((t) => t.name === name).handler;
+
+test('zcode_check: doctor result, reaper stats before any pass, a version without x.y.z, a missing binary', async () => {
+  const hung = () => new Promise(() => {});
+  const check = handlerOf(buildTools({ store, reapFn: hung }), 'zcode_check');
+  const payload = JSON.parse((await check({}, {})).content[0].text);
+  assert.deepEqual(payload.doctor, { ok: true, excerpt: 'fake doctor: all good' });
+  assert.deepEqual(payload.reaper, { lastRunAt: null, lost: 0, deleted: 0, killed: 0 });
+  process.env.FAKE_ZCODE_VERSION = 'nightly';
+  const odd = JSON.parse(textOf(await call('zcode_check', {})));
+  assert.deepEqual(odd.warnings, ['ZCode version zcode nightly (fake) is not in the verified list (0.16.9, 0.17.0); protocol behaviour may differ']);
+  const saved = process.env.ZCODE_BIN;
+  process.env.ZCODE_BIN = join(tempCwd(), 'no-zcode');
+  try {
+    const reply = await call('zcode_check', {});
+    assert.equal(reply.result.isError, true);
+    const missing = JSON.parse(textOf(reply).split('\nInstall ZCode')[0]);
+    assert.equal(missing.ok, false);
+    assert.equal(missing.problem, 'binary-not-found');
+  } finally {
+    process.env.ZCODE_BIN = saved;
+  }
+});
+
+test('reaper stats count arrays only; a failed pass is logged and keeps the last stats', async () => {
+  let t = 2_000_000;
+  const outs = [
+    () => ({ lost: ['a'], deleted: ['b', 'c'], killed: [1, 2, 3] }),
+    () => ({ lost: 'x', deleted: null, killed: {} }),
+    () => null,
+    () => { throw 'boom'; }, // eslint-disable-line no-throw-literal
+  ];
+  const p2 = createProtocol({ tools: buildTools({ store, reapFn: async () => outs.shift()(), now: () => t }) });
+  const stats = async () => JSON.parse(textOf(await callOn(p2, 'zcode_check'))).reaper;
+  await callOn(p2, 'zcode_sessions');
+  await flush();
+  assert.deepEqual(await stats(), { lastRunAt: new Date(t).toISOString(), lost: 1, deleted: 2, killed: 3 });
+  t += 31000;
+  await callOn(p2, 'zcode_sessions');
+  await flush();
+  assert.deepEqual(await stats(), { lastRunAt: new Date(t).toISOString(), lost: 0, deleted: 0, killed: 0 });
+  t += 31000;
+  await callOn(p2, 'zcode_sessions');
+  await flush();
+  const last = await stats();
+  assert.deepEqual(last, { lastRunAt: new Date(t).toISOString(), lost: 0, deleted: 0, killed: 0 });
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (s) => { written.push(String(s)); return true; };
+  try {
+    t += 31000;
+    await callOn(p2, 'zcode_sessions');
+    await flush();
+    await flush();
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.deepEqual(written, ['[zcode-delegate] reaper pass failed: boom\n']);
+  assert.deepEqual(await stats(), last, 'a failed pass keeps the stats');
+});
+
+test('the reaper throttle and the stale bound are inclusive', async () => {
+  let t = 3_000_000;
+  const pending = [];
+  const p2 = createProtocol({ tools: buildTools({ store, reapFn: () => new Promise((resolve) => pending.push(resolve)), now: () => t }) });
+  await callOn(p2, 'zcode_sessions');
+  t += 5 * 60 * 1000;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 1, 'exactly 5 minutes old still blocks');
+  t += 1;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 2, 'older than 5 minutes is stale');
+  pending[1]({ lost: [], deleted: [], killed: [] });
+  await flush();
+  t += 30000;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 2, 'exactly 30 s after the last start is still throttled');
+  t += 1;
+  await callOn(p2, 'zcode_sessions');
+  assert.equal(pending.length, 3);
+  pending[0]({ lost: [], deleted: [], killed: [] });
+  pending[2]({ lost: [], deleted: [], killed: [] });
+  await flush();
+});
+
+test('a lost job rendered while the forced reaper pass is cut short by the request signal carries the stale note', async () => {
+  const tools = buildTools({ store, reapFn: () => new Promise(() => {}), reapWaitMs: 60000 });
+  const status = handlerOf(tools, 'zcode_status');
+  const j = handJob({ status: { ...DEAD_RUNNER, state: 'running' } });
+  try {
+    const aborted = new AbortController();
+    aborted.abort();
+    let t0 = Date.now();
+    let text = (await status({ job_id: j.jobId }, { signal: aborted.signal })).content[0].text;
+    assert.ok(Date.now() - t0 < 2000);
+    assert.match(text, /^reaper: still running; state may be stale$/m, 'already aborted');
+    const later = new AbortController();
+    setTimeout(() => later.abort(), 100);
+    t0 = Date.now();
+    text = (await status({ job_id: j.jobId }, { signal: later.signal })).content[0].text;
+    assert.ok(Date.now() - t0 < 2000);
+    assert.match(text, /^reaper: still running; state may be stale$/m, 'aborted while waiting');
+  } finally {
+    patchStatus(j.dir, { state: 'failed' });
+  }
+});
+
+test('the login hint looks at the error message and at stderr, for errorKind model only', async () => {
+  const hint = /^hint: often caused by a missing, expired or misconfigured ZCode login/m;
+  assert.match(await resultText('failed', { errorKind: 'model', errorMessage: 'Model creation failed' }), hint);
+  assert.match(await resultText('failed', { errorKind: 'model', errorMessage: 'x', stderr: 'Error: Model creation failed' }), hint);
+  assert.doesNotMatch(await resultText('failed', { errorKind: 'auth', errorMessage: 'Model creation failed' }), hint);
+});
+
+test('a body of exactly OUTPUT_CAP characters is not truncated', async () => {
+  const j = handJob({ status: { ...DEAD_RUNNER, state: 'completed' }, result: BASE_RESULT });
+  const base = textOf(await call('zcode_result', { job_id: j.jobId })).length;
+  writeResult(j.dir, { ...BASE_RESULT, output: 'x'.repeat(OUTPUT_CAP - base) });
+  const exact = textOf(await call('zcode_result', { job_id: j.jobId }));
+  assert.equal(exact.length, OUTPUT_CAP);
+  assert.ok(!exact.includes('[... output truncated'));
+  writeResult(j.dir, { ...BASE_RESULT, output: 'x'.repeat(OUTPUT_CAP - base + 1) });
+  assert.ok(textOf(await call('zcode_result', { job_id: j.jobId })).endsWith(`[... output truncated at ${OUTPUT_CAP} chars]`));
+});
+
+test('diff_stat: untracked entries are split off only when they end the stat', async () => {
+  const stat = async (changedFiles, diffStat) => headOf(await resultText('completed', { changesAvailable: true, changedFiles, diffStat })).split('diff_stat:\n')[1];
+  assert.equal(await stat(['M a.txt', '?? new.txt'], ' a.txt | 1 +\n 1 file changed\n?? new.txt'), ' a.txt | 1 +\n 1 file changed\n?? new.txt\n');
+  assert.equal(await stat(['?? z'], ' a.txt | 1 +'), ' a.txt | 1 +\n');
+  assert.equal(await stat([7, '?? z'], ' a.txt | 1 +\n?? z'), ' a.txt | 1 +\n?? z\n');
+});
+
+test('output_log is named for a truncated output or a result-less job only', async () => {
+  const withLog = await resultText('completed', { output: 'short', outputLogPath: '/tmp/some/output.log' });
+  assert.doesNotMatch(withLog, /^output_log:/m);
+  const lost = handJob({ status: { ...DEAD_RUNNER, state: 'running' } });
+  assert.doesNotMatch(textOf(await call('zcode_result', { job_id: lost.jobId })), /^output_log:/m);
+  writeFileSync(join(lost.dir, 'output.log'), 'partial');
+  assert.match(textOf(await call('zcode_result', { job_id: lost.jobId })), new RegExp(`^output_log: ${join(lost.dir, 'output.log')}$`, 'm'));
+});
+
+test('a job without result.json renders its status fields, a lost one says so', async () => {
+  const failed = handJob({ status: { ...DEAD_RUNNER, state: 'failed', sessionId: 'sess_fb1', errorKind: 'crash' } });
+  const text = headOf(textOf(await call('zcode_result', { job_id: failed.jobId })));
+  assert.match(text, /^session_id: sess_fb1$/m);
+  assert.match(text, /^error_kind: crash$/m);
+  assert.match(text, /^error: the job recorded no result$/m);
+  const lost = handJob({ status: { ...DEAD_RUNNER, state: 'running' } });
+  assert.match(textOf(await call('zcode_result', { job_id: lost.jobId })), /^error: the job runner ended without recording a result \(job lost\)$/m);
+  const cwd = realpathSync(tempCwd());
+  const bare = createJobDir({
+    params: { prompt: 'x', cwd, mode: 'yolo' }, path: 'cli', baseline: null,
+    createdAt: new Date(Date.now() - 60000).toISOString(),
+    worktree: { branch: 'zcode/wt-1', dir: cwd, startSha: 'abc' },
+  });
+  const bareText = textOf(await call('zcode_result', { job_id: bare.jobId }));
+  assert.match(bareText, /^status: lost$/m, 'no status.json at all');
+  assert.match(bareText, /^worktree_branch: zcode\/wt-1$/m);
+});
+
+test('running render: elapsed from startedAt, last activity, the retry backoff line', async () => {
+  const j = handJob({
+    status: {
+      state: 'running', startedAt: new Date(Date.now() - 100000).toISOString(), lastActivityAt: new Date(Date.now() - 7000).toISOString(),
+      retry: { attempt: 1, maxRetries: 3, nextAt: new Date(Date.now() + 10000).toISOString(), reason: 0 },
+    },
+  });
+  let text = textOf(await call('zcode_status', { job_id: j.jobId }));
+  assert.match(text, /^elapsed: 100s$/m);
+  assert.match(text, /^last_activity: 7s ago$/m);
+  assert.match(text, /^retrying: attempt 1\/3 in (9|10)s \(0\)$/m);
+  for (const retry of ['soon', null]) {
+    patchStatus(j.dir, { retry, startedAt: new Date().toISOString() });
+    text = textOf(await call('zcode_status', { job_id: j.jobId }));
+    assert.doesNotMatch(text, /^retrying:/m, String(retry));
+    assert.match(text, /^elapsed: 0s$/m);
+  }
+  patchStatus(j.dir, { state: 'failed' });
+});
+
+test('retries, usage, timeout and stderr lines appear only when they carry something', async () => {
+  let text = await resultText('completed', {});
+  assert.doesNotMatch(text, /^retries:/m);
+  assert.match(await resultText('completed', { retries: [{}], retryOutcome: 'recovered' }), /^retries: 1 \(recovered\)$/m);
+  assert.match(await resultText('completed', { retries: [{}, {}] }), /^retries: 2 \(unknown\)$/m);
+  assert.doesNotMatch(await resultText('completed', { usage: 'garbage' }), /^usage:/m);
+  assert.doesNotMatch(await resultText('completed', { timeoutKind: 'idle' }), /^timeout:/m);
+  assert.match(await resultText('timeout', { timeoutKind: 'idle' }), /^timeout: idle$/m);
+  assert.match(await resultText('timeout', { timeoutKind: 'total' }), /^timeout: total$/m);
+  assert.doesNotMatch(await resultText('timeout', { timeoutKind: 'cancelled' }), /^timeout:/m);
+  text = await resultText('failed', { stderr: '   ' });
+  assert.ok(!text.includes('--- zcode stderr ---'));
+});
+
+test('zcode_run accepts wait_ms 300000 (the bound is inclusive)', async () => {
+  const reply = await call('zcode_run', { cwd: tempCwd(), wait_ms: 300000 });
+  assert.equal(reply.result.isError, true);
+  assert.doesNotMatch(textOf(reply), /wait_ms/);
+  assert.match(textOf(reply), /prompt must be a non-empty string/);
+});
+
+test('zcode_sessions marks only run entries as not resumable', async () => {
+  const at = new Date().toISOString();
+  store.append({ id: 'sess_ok1', kind: 'session', cwd: '/a', mode: 'yolo', promptPreview: 'p', startedAt: at, status: 'completed' });
+  store.append({ id: 'run_1', kind: 'run', cwd: '/a', mode: 'yolo', promptPreview: 'p', startedAt: at, status: 'completed' });
+  const lines = textOf(await call('zcode_sessions', {})).split('\n');
+  assert.match(lines.find((l) => l.startsWith('sess_ok1')), /^sess_ok1 \| resumable \|/);
+  assert.match(lines.find((l) => l.startsWith('run_1')), /^run_1 \| NOT-RESUMABLE \|/);
+});
+
+test('buildTools without a store reads ZCODE_MCP_STATE', async () => {
+  store.append({ id: 'sess_env1', kind: 'session', cwd: '/a', mode: 'yolo', promptPreview: 'p', startedAt: new Date().toISOString(), status: 'completed' });
+  const p2 = createProtocol({ tools: buildTools({ reapFn: noReap }) });
+  assert.match(textOf(await callOn(p2, 'zcode_sessions')), /^sess_env1 \| resumable/m);
+});
+
+test('zcode_status list: age from finishedAt, else updatedAt, else createdAt; elapsed from startedAt', async () => {
+  const cwd = realpathSync(tempCwd());
+  const done = handJob({ status: { ...DEAD_RUNNER, state: 'completed', finishedAt: new Date(Date.now() - 10000).toISOString() } });
+  const old = createJobDir({ params: { prompt: 'x', cwd, mode: 'yolo' }, path: 'cli', baseline: null, createdAt: new Date(Date.now() - 50000).toISOString() });
+  patchStatus(old.dir, { ...DEAD_RUNNER, token: old.token, state: 'failed' }); // updatedAt: now
+  const running = handJob({ status: { state: 'running', startedAt: new Date(Date.now() - 20000).toISOString() } });
+  const text = textOf(await call('zcode_status', {}));
+  const row = (id) => text.split('\n').find((l) => l.startsWith(id));
+  assert.match(row(done.jobId), /\| age 10s \|/);
+  assert.match(row(old.jobId), /\| age 0s \|/);
+  assert.match(row(running.jobId), /\| elapsed 20s \|/);
+  patchStatus(running.dir, { state: 'failed' });
+});
+
+test('zcode_send: accepted has no queued hint; rejected and not_supported are tool errors', async () => {
+  const { writeAck } = await import('../src/inbox.mjs');
+  const cwd = realpathSync(tempCwd());
+  const job = createJobDir({ params: { prompt: 'x', cwd }, path: 'protocol', baseline: null, lockCwd: cwd });
+  patchStatus(job.dir, { state: 'running', warnings: [] });
+  const got = [];
+  for (const [seq, status] of [[1, 'accepted'], [2, 'rejected'], [3, 'not_supported']]) {
+    setTimeout(() => writeAck(job.dir, seq, { status }), 50);
+    const reply = await call('zcode_send', { job_id: job.jobId, text: 'm' });
+    got.push([textOf(reply).split('\n')[0], reply.result.isError === true, /will be delivered/.test(textOf(reply))]);
+  }
+  assert.deepEqual(got, [['send: accepted', false, false], ['send: rejected', true, false], ['send: not_supported', true, false]]);
+  patchStatus(job.dir, { state: 'failed' });
 });

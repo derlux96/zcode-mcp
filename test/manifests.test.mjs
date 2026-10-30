@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const json = (rel) => JSON.parse(readFileSync(root + rel, 'utf8'));
-const TOOLS = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel'];
+const TOOLS = ['zcode_check', 'zcode_run', 'zcode_sessions', 'zcode_status', 'zcode_result', 'zcode_cancel', 'zcode_send'];
 
 function frontmatter(rel) {
   const text = readFileSync(root + rel, 'utf8');

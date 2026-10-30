@@ -14,7 +14,9 @@
 //   fail      same as ok, but the turn ends in turn.failed with
 //             payload.error.message "fake model failure"
 //   slowhang  answers create + subscribe, acks send, then never emits the
-//             turn event (client timeout path)
+//             turn event (client timeout path); with
+//             FAKE_APPSERVER_SLOWHANG_STARTED=1 it emits turn.started first
+//             (the turn is visibly under way, but never ends)
 //   flood     acks send, then emits 2005 model.streaming session/event
 //             notifications before turn.completed — exceeds the client's
 //             EVENT_BUFFER_CAP (2000) while a waiter is live (regression
@@ -25,12 +27,36 @@
 //             150 ms for 1.5 s before turn.completed (idle-timeout tests)
 //   tools     acks send, then emits six tool.updated session/events
 //             (toolName T0..T5, kind 'scheduled') before the ok turn
+//   secret    like ok, but the turn response contains sk-abc123def456ghi789jkl
+//             (redaction tests)
 //   no-model  like ok, but session/create carries no current model and an
 //             empty catalog (runner falls back to the CLI path)
 //   nosendack answers create + subscribe, but never answers session/send
 //             (request-timeout path after the session exists)
 //   die       startup noise, then exit(1) immediately without ever reading
 //             input (child-death path; nothing is answered)
+//   ask       acks send, then sends interaction/browserList (trapped: must be
+//             answered {} within 2 s) and interaction/requestUserInput
+//             (id 'server-ask', NOT trapped: the client may park it) with the
+//             real ZCode 0.17.0 AskUserQuestion params (see askParams below:
+//             one question 'Which port?', options '3000 (Recommended)' and
+//             '8080', in both params.questions and params.input.questions).
+//             The answer is validated against ZCode's STRICT zod schema
+//             {action:'accept'|'decline'|'cancel', content?:object, reason?:string}
+//             (no other keys): an invalid answer completes the turn with
+//             "permission request failed: <answer JSON>". A valid one is mapped
+//             the way AskUserQuestion does it: action !== 'accept' -> response
+//             "AskUserQuestion was <cancelled|declined>" (+ ": <reason>" when
+//             given); accept -> for each question q (index i) the value
+//             content.answers?.[q.question] ?? content['answer_'+i] ??
+//             (one question ? content.answer : undefined), a string (trimmed) or
+//             a string[] (joined ', '); response "answers: " + JSON.stringify(
+//             {[q.question]: value}) (questions without a value are left out)
+//   ask-fail-then-hang  first send: parks interaction/requestUserInput (id
+//             'server-ask-1', same params as ask, not trapped), then ends the
+//             turn after 300 ms in a transient turn.failed (HTTP 429) without
+//             waiting for the answer; later sends are acked and hang silently
+//             (a pending question must end with the failed attempt)
 //   fail-429-then-ok      the first FAKE_APPSERVER_FAIL_TIMES (default 1) turns
 //             fail with an HTTP 429 rate-limit text, every later turn completes
 //   fail-network-then-ok  same, with "TypeError: fetch failed"
@@ -43,6 +69,8 @@
 //   fail-zh-model-creation  the real model_not_found payload (localized message,
 //             detail "Model creation failed")
 //   fail-auth             every turn fails with an HTTP 401 invalid api key
+//   fail-status-401-always  every turn fails with only statusCode 401 (no text
+//             field: the cause is the HTTP status alone)
 //   fail-model-request-failed  every turn fails with the generic
 //             "Model request failed." (what a wrong baseUrl produces)
 //   fail-model-creation   every turn fails with "Model creation failed"
@@ -62,6 +90,86 @@
 // FAKE_APPSERVER_LOG: path; every received message is appended as one JSON
 // line (lets tests assert exact wire params the client sent).
 //
+// FAKE_APPSERVER_RESPONSE: JSON string used as the turn.completed response of
+// the non-scripted modes (ok, chatty, tools, flood) instead of the default.
+//
+// FAKE_APPSERVER_ASK_QUESTION: JSON value used as the question text of mode
+// ask's requestUserInput instead of 'Which port?' (non-string question tests).
+// FAKE_APPSERVER_ASK_NO_QUESTIONS=1: the requestUserInput carries no questions
+// (neither params.questions nor params.input.questions) — only the prompt.
+//
+// Job control:
+//   session/stop  answers {}; if a turn is in flight (any mode, including
+//             slowhang and chatty) that turn ends in turn.failed with
+//             payload.error {code:'aborted', message:'429 rate limit'} —
+//             deliberately transient-looking, so a client that retries after
+//             a stop is caught.
+//             FAKE_APPSERVER_STOP_COMPLETES=1: the in-flight turn ends in
+//             turn.completed instead (the model finished as the stop landed).
+//   v4/command    models ZCode 0.17.0's follow-up routing (read from the
+//             bundle and probed live). Envelope {commandId, clientId, sessionId,
+//             baseRevision?, type, payload, issuedAt}. The conversation has a
+//             revision (starts 0, +1 on every state change: a send, an accepted
+//             command, a drained steer, a turn end); every answer carries it as
+//             revisionAtDecision (the revision after the decision).
+//             sendText {text, requestedDelivery?, heldQueueDisposition?}
+//             (payload.delivery.requested is ignored; the default is 'queue'):
+//               turn in flight, 'guide' or 'queue' -> {status:'accepted',
+//               revisionAtDecision, result:{type:'inputAccepted',
+//               delivery:'queue', inputId}} and a turn.steerQueued event (an
+//               accepted steer always acks 'queue': it joins the pending list).
+//               A 'guide' item is drained 10 ms later while the turn still runs
+//               (turn.steerDrained; the turn.completed response gets
+//               "\nsteered: <texts joined ' | '>"); 'queue' items, and guide
+//               items the turn ended before draining, are held. A turn that ends
+//               with held items sets autoDrain false (no new turn).
+//               turn in flight, 'startNow' -> the running turn is preempted
+//               (turn.failed {code:'preempted'}) and a new turn runs the text.
+//               no turn in flight, held items and no heldQueueDisposition ->
+//               {status:'rejected', reasonCode:'queue.choiceRequired'};
+//               'startNow' (+ 'clearQueueAndSend' clears the held items,
+//               'keepQueueAndSend' keeps them) -> accepted delivery 'startNow'
+//               and a new turn whose response is "fake startNow turn: " + text.
+//               no turn in flight otherwise -> {status:'rejected', reasonCode:'idle'}.
+//             CAS commands (setFollowupMode {mode}, setAutoDrain {autoDrain},
+//             sendQueuedNow {queueItemId}) need a top-level baseRevision:
+//               missing -> {status:'rejected', reasonCode:'proto.invalidPayload',
+//               message:'CAS commands require baseRevision and baseLogEpoch'};
+//               != revision -> {status:'stale', reasonCode:'proto.staleRevision',
+//               revisionAtDecision}; else accepted. setAutoDrain true with held
+//               items and no turn in flight starts a new turn (no session/send)
+//               whose response is "fake follow-up turn: " + the held texts joined
+//               with "\n\n". sendQueuedNow runs the oldest held item the same way.
+//             Other command types -> {status:'rejected', reasonCode:'unknown_command'}.
+// FAKE_APPSERVER_UNSUPPORTED: comma list of 'stop', 'steer', 'followup',
+// 'autodrain'; session/stop, v4/command (all types), and the v4/command types
+// setFollowupMode / setAutoDrain answer error -32601 "Method not found".
+// FAKE_APPSERVER_AUTODRAIN_NOOP=1: setAutoDrain is accepted but never starts a turn.
+// FAKE_APPSERVER_AUTODRAIN_REJECT=1: setAutoDrain answers {status:'rejected',
+// reasonCode:'proto.forbidden'}.
+// FAKE_APPSERVER_STARTNOW_REJECT=1: sendText 'startNow' is rejected
+// (reasonCode 'proto.invalidPayload').
+// FAKE_APPSERVER_NO_DRAIN=1: guide items are never drained (the model is past
+// its last step), so they are held when the turn ends.
+// FAKE_APPSERVER_DRAIN_LIMIT=n: only the first n guide items are drained; later
+// ones are held like with FAKE_APPSERVER_NO_DRAIN.
+// FAKE_APPSERVER_CAS_STALE=n: the first n CAS commands answer stale whatever
+// their baseRevision.
+// FAKE_APPSERVER_CAS_FRESH=1: a CAS command with any numeric baseRevision is
+// never stale.
+// FAKE_APPSERVER_DRAIN_SKIP=n: the first n guide items are held (never
+// drained), later ones are drained (out-of-order drains).
+// FAKE_APPSERVER_DRAIN_TWICE=1: every turn.steerDrained is sent twice.
+// FAKE_APPSERVER_DRAIN_PAYLOAD: JSON value sent as the payload of every
+// turn.steerDrained instead of {drainedInputs:[...]} (null: no payload).
+// FAKE_APPSERVER_STEER_ACK_DELAY_MS: delays every sendText answer (the item's
+// drain can then arrive before its ack).
+// FAKE_APPSERVER_SENDTEXT_NO_REVISION=1: sendText answers carry no
+// revisionAtDecision.
+//
+// FAKE_APPSERVER_MODEL_SETTINGS: JSON value sent as settings.model of the
+// session/create response instead of the catalog and current model.
+//
 // Trap enforcement: server-initiated requests must be answered with their
 // documented result within 2 s or this process FAILS the connection
 // (exit 1) — mirroring the real server, where an unanswered
@@ -76,6 +184,7 @@ const readline = require('node:readline');
 const MODE = process.env.FAKE_APPSERVER_MODE || 'ok';
 const LOG_PATH = process.env.FAKE_APPSERVER_LOG || '';
 const SESSION_ID = 'sess_fakeB1';
+const UNSUPPORTED = new Set((process.env.FAKE_APPSERVER_UNSUPPORTED || '').split(',').map((s) => s.trim()).filter(Boolean));
 
 if (!process.argv.includes('app-server')) {
   // Executed directly (e.g. by `node --test` discovery, which runs every
@@ -160,8 +269,35 @@ function isAnyResult(msg) {
 
 let pendingCreate = null; // create request whose response waits on the trap
 let created = false;
+let askReq = null; // session/send waiting on the parked requestUserInput answer
+let inFlight = null; // session/send whose turn has not ended yet
+let chattyTimer = null;
+const stoppedSends = new Set(); // send ids whose turn was ended by session/stop
+// v4/command follow-up routing state (see the header).
+let revision = 0;
+let followupMode = 'queue';
+let autoDrain = true;
+const heldTexts = []; // texts held in ZCode's queue, waiting for a drain
+let guided = []; // guide texts drained into the current turn
+let undrained = []; // guide texts accepted in the current turn, not drained yet
+let drainTimer = null;
+let drainTurns = 0;
+let inputs = 0;
+let forcedStale = Number(process.env.FAKE_APPSERVER_CAS_STALE) || 0;
+let drainSkip = Number(process.env.FAKE_APPSERVER_DRAIN_SKIP) || 0;
+let drainsLeft = process.env.FAKE_APPSERVER_NO_DRAIN === '1' ? 0
+  : process.env.FAKE_APPSERVER_DRAIN_LIMIT !== undefined ? Number(process.env.FAKE_APPSERVER_DRAIN_LIMIT) : Infinity;
 
 function answerArrived(msg) {
+  if (msg.id === 'server-ask') {
+    // Untrapped on purpose: the client may hold this question for a long time.
+    if (askReq) {
+      const r = askReq;
+      askReq = null;
+      emitTurn(r, null, askUserQuestionResponse(askParams(), msg.result));
+    }
+    return true;
+  }
   const validate = openServerRequests.get(msg.id);
   if (validate === undefined) return false;
   openServerRequests.delete(msg.id);
@@ -177,6 +313,71 @@ function answerArrived(msg) {
     else sendCreateResponse(req);
   }
   return true;
+}
+
+// --- AskUserQuestion (ZCode 0.17.0, verified on the owner's Mac) ---
+
+// The real interaction/requestUserInput params of the AskUserQuestion tool.
+function askParams() {
+  const question = process.env.FAKE_APPSERVER_ASK_QUESTION ? JSON.parse(process.env.FAKE_APPSERVER_ASK_QUESTION) : 'Which port?';
+  const base = {
+    requestId: 'perm_fake1',
+    sessionId: SESSION_ID,
+    turnId: 'turn_fake1',
+    toolCallId: 'call_ask1',
+    toolName: 'AskUserQuestion',
+    schema: { toolName: 'AskUserQuestion' },
+    prompt: 'Tool AskUserQuestion requires user interaction',
+  };
+  if (process.env.FAKE_APPSERVER_ASK_NO_QUESTIONS === '1') return base;
+  return {
+    ...base,
+    input: {
+      questions: [{
+        question,
+        header: 'Port',
+        options: [{ label: '3000 (Recommended)', description: 'the default dev port' }, { label: '8080', description: 'the alternative' }],
+        multiSelect: false,
+      }],
+    },
+    questions: [{
+      question,
+      header: 'Port',
+      multiSelect: false,
+      options: [{ label: '3000 (Recommended)', value: '3000 (Recommended)', description: 'the default dev port' }, { label: '8080', value: '8080', description: 'the alternative' }],
+    }],
+  };
+}
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+// ZCode's strict zod schema for the answer: {action, content?, reason?}, nothing else.
+function validUserInputAnswer(r) {
+  if (!isPlainObject(r)) return false;
+  if (Object.keys(r).some((k) => !['action', 'content', 'reason'].includes(k))) return false;
+  if (!['accept', 'decline', 'cancel'].includes(r.action)) return false;
+  if (r.content !== undefined && !isPlainObject(r.content)) return false;
+  if (r.reason !== undefined && typeof r.reason !== 'string') return false;
+  return true;
+}
+
+// The turn response AskUserQuestion's mapping of the answer leads to.
+function askUserQuestionResponse(params, r) {
+  if (!validUserInputAnswer(r)) return `permission request failed: ${JSON.stringify(r ?? null)}`;
+  if (r.action !== 'accept') {
+    const word = r.action === 'cancel' ? 'cancelled' : 'declined';
+    return `AskUserQuestion was ${word}${r.reason ? `: ${r.reason}` : ''}`;
+  }
+  const content = r.content || {};
+  const qs = Array.isArray(params.questions) ? params.questions : [];
+  const answers = {};
+  qs.forEach((q, i) => {
+    const byQuestion = isPlainObject(content.answers) ? content.answers[q.question] : undefined;
+    const v = byQuestion ?? content[`answer_${i}`] ?? (qs.length === 1 ? content.answer : undefined);
+    if (typeof v === 'string') answers[q.question] = v.trim();
+    else if (Array.isArray(v)) answers[q.question] = v.join(', ');
+  });
+  return `answers: ${JSON.stringify(answers)}`;
 }
 
 // --- request handlers ---
@@ -211,8 +412,8 @@ function sendCreateResponse(req) {
       },
       settings: {
         mode: { current: 'build' },
-        model: MODE === 'no-model'
-          ? { available: [] }
+        model: process.env.FAKE_APPSERVER_MODEL_SETTINGS !== undefined ? JSON.parse(process.env.FAKE_APPSERVER_MODEL_SETTINGS)
+          : MODE === 'no-model' ? { available: [] }
           : {
               available: CATALOG,
               current: { providerId: 'glm-test', modelId: 'small', options: { reasoningLevel: 'high' } },
@@ -252,6 +453,7 @@ const FAIL_MODES = {
   'fail-1113-always': [plain(MSG_1113), Infinity],
   'fail-status-1113-always': [{ type: 'provider_error', statusCode: 429, statusMessage: '[1113][Insufficient balance or no resource package. Please recharge.][req_fake]', retryable: false }, Infinity],
   'fail-auth': [plain('HTTP 401 Unauthorized: invalid api key'), Infinity],
+  'fail-status-401-always': [{ statusCode: 401 }, Infinity],
   'fail-model-request-failed': [plain('Model request failed.'), Infinity],
   'fail-model-creation': [plain('Model creation failed'), Infinity],
   'fail-zh-model-creation': [{ type: 'unknown_error', code: 'model_not_found', message: ZH_NOT_FOUND, detail: 'Model creation failed', underlyingErrorMessage: ZH_NOT_FOUND, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' }, Infinity],
@@ -286,7 +488,22 @@ function handleSend(req) {
   const n = countSend();
   // Send is ACK-only (notes §5): acceptance says nothing about the turn.
   send({ id: req.id, result: { accepted: true, sessionId: SESSION_ID, stateRevision: n } });
-  if (MODE === 'slowhang') return;
+  revision += 1;
+  inFlight = req;
+  guided = [];
+  if (MODE === 'slowhang') {
+    if (process.env.FAKE_APPSERVER_SLOWHANG_STARTED === '1') {
+      send({
+        method: 'session/event',
+        params: {
+          deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001',
+          eventId: `evt_slow_${n}`, seq: 10, timestamp: Date.now(), type: 'turn.started',
+          payload: { executionStartedAt: Date.now(), turnNumber: 0, input: (req.params && req.params.content) || '', inputId: `in_slow${n}` },
+        },
+      });
+    }
+    return;
+  }
   if (FAIL_MODES[MODE]) {
     // Later sends continue the same session: no second prefs/auth probe.
     if (n === 1) {
@@ -299,6 +516,18 @@ function handleSend(req) {
       emitTurn(req, { n, failure });
       if (failure && process.env.FAKE_APPSERVER_EXIT_AFTER_FAIL === '1') setTimeout(() => process.exit(1), 100);
     }, 25);
+    return;
+  }
+  if (MODE === 'ask-fail-then-hang') {
+    if (n > 1) return;
+    send({ id: 'server-ask-1', method: 'interaction/requestUserInput', params: askParams() });
+    setTimeout(() => emitTurn(req, { n, failure: plain(MSG_429) }), 300);
+    return;
+  }
+  if (MODE === 'ask') {
+    askReq = req;
+    sendServerRequest('server-ask-browser', 'interaction/browserList', { sessionId: SESSION_ID }, isAnyResult);
+    send({ id: 'server-ask', method: 'interaction/requestUserInput', params: askParams() });
     return;
   }
   if (MODE === 'flood') {
@@ -362,9 +591,11 @@ function handleSend(req) {
       });
       if (++n === 10) {
         clearInterval(t);
+        chattyTimer = null;
         emitTurn(req);
       }
     }, 150);
+    chattyTimer = t;
     return;
   }
   // Notes §2: a second prefs request (scope user-execution) arrives at first
@@ -374,7 +605,177 @@ function handleSend(req) {
   setTimeout(() => emitTurn(req), 25);
 }
 
-function emitTurn(req, scripted = null) {
+function handleStop(req) {
+  send({ id: req.id, result: {} });
+  if (!inFlight) return;
+  const turn = inFlight;
+  inFlight = null;
+  if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
+  if (askReq === turn) askReq = null;
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+  heldTexts.push(...undrained.splice(0));
+  if (process.env.FAKE_APPSERVER_STOP_COMPLETES === '1') {
+    emitTurn(turn);
+    stoppedSends.add(turn.id);
+    return;
+  }
+  stoppedSends.add(turn.id);
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_stopped', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_stop_${turn.id}`, seq: 900, timestamp: Date.now(), type: 'turn.failed',
+      payload: { error: { code: 'aborted', message: '429 rate limit' }, turnPhase: 'model_request', inputId: 'in_stopped' },
+    },
+  });
+}
+
+function steerEvent(type, payload) {
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_fake1', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_${type}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, seq: 500, timestamp: Date.now(), type, payload,
+    },
+  });
+}
+
+function flushDrains() {
+  drainTimer = null;
+  if (!inFlight) return;
+  const texts = undrained;
+  undrained = [];
+  for (const text of texts) {
+    revision += 1;
+    guided.push(text);
+    const payload = process.env.FAKE_APPSERVER_DRAIN_PAYLOAD !== undefined ? JSON.parse(process.env.FAKE_APPSERVER_DRAIN_PAYLOAD)
+      : { drainedInputs: [{ pendingInputId: `pi_${revision}`, messageId: `msg_${revision}`, text, delivery: 'guide' }] };
+    steerEvent('turn.steerDrained', payload);
+    if (process.env.FAKE_APPSERVER_DRAIN_TWICE === '1') steerEvent('turn.steerDrained', payload);
+  }
+}
+
+// Starts a turn ZCode runs without a session/send (auto-drain, startNow).
+function startTurn(content, response) {
+  const turn = { id: `drain-${++drainTurns}`, params: { content } };
+  inFlight = turn;
+  guided = [];
+  undrained = [];
+  setTimeout(() => emitTurn(turn, null, response), 25);
+}
+
+const CAS = new Set(['setFollowupMode', 'setAutoDrain', 'sendQueuedNow']);
+
+function handleCommand(req) {
+  const p = req.params || {};
+  const payload = p.payload && typeof p.payload === 'object' ? p.payload : {};
+  const unsupported = () => send({ id: req.id, error: { code: -32601, message: `Method not found: v4/command ${p.type}` } });
+  const answer = (result) => {
+    const msg = { id: req.id, result: { ...result, revisionAtDecision: revision } };
+    if (p.type !== 'sendText') return send(msg);
+    if (process.env.FAKE_APPSERVER_SENDTEXT_NO_REVISION === '1') delete msg.result.revisionAtDecision;
+    const delay = Number(process.env.FAKE_APPSERVER_STEER_ACK_DELAY_MS) || 0;
+    if (delay > 0) setTimeout(() => send(msg), delay);
+    else send(msg);
+  };
+  const accept = (result = {}) => { revision += 1; answer({ status: 'accepted', ...result }); };
+  if (p.type === 'sendText') {
+    const text = typeof payload.text === 'string' ? payload.text : '';
+    const requested = typeof payload.requestedDelivery === 'string' ? payload.requestedDelivery : 'queue';
+    const inputId = `in_cmd${++inputs}`;
+    if (requested === 'startNow') {
+      if (process.env.FAKE_APPSERVER_STARTNOW_REJECT === '1') return answer({ status: 'rejected', reasonCode: 'proto.invalidPayload' });
+      if (!inFlight && heldTexts.length && !payload.heldQueueDisposition) return answer({ status: 'rejected', reasonCode: 'queue.choiceRequired' });
+      if (payload.heldQueueDisposition === 'clearQueueAndSend') heldTexts.splice(0);
+      if (inFlight) preempt();
+      accept({ result: { type: 'inputAccepted', delivery: 'startNow', inputId } });
+      return startTurn(text, `fake startNow turn: ${text}`);
+    }
+    if (!inFlight) {
+      if (heldTexts.length && !payload.heldQueueDisposition) return answer({ status: 'rejected', reasonCode: 'queue.choiceRequired' });
+      return answer({ status: 'rejected', reasonCode: 'idle' });
+    }
+    accept({ result: { type: 'inputAccepted', delivery: 'queue', inputId } });
+    steerEvent('turn.steerQueued', { text, delivery: requested === 'guide' ? 'guide' : 'queue' });
+    if (requested === 'guide') {
+      if (drainSkip > 0) {
+        drainSkip -= 1;
+        heldTexts.push(text);
+      } else if (drainsLeft > 0) {
+        drainsLeft -= 1;
+        undrained.push(text);
+        if (!drainTimer) drainTimer = setTimeout(flushDrains, 10);
+      } else {
+        heldTexts.push(text);
+      }
+    } else {
+      heldTexts.push(text);
+    }
+    return;
+  }
+  if (CAS.has(p.type)) {
+    if (p.type === 'setFollowupMode' && UNSUPPORTED.has('followup')) return unsupported();
+    if (p.type === 'setAutoDrain' && UNSUPPORTED.has('autodrain')) return unsupported();
+    if (typeof p.baseRevision !== 'number') {
+      return answer({ status: 'rejected', reasonCode: 'proto.invalidPayload', message: 'CAS commands require baseRevision and baseLogEpoch' });
+    }
+    if (forcedStale > 0 || (p.baseRevision !== revision && process.env.FAKE_APPSERVER_CAS_FRESH !== '1')) {
+      if (forcedStale > 0) forcedStale -= 1;
+      return answer({ status: 'stale', reasonCode: 'proto.staleRevision' });
+    }
+  }
+  if (p.type === 'setFollowupMode') {
+    followupMode = payload.mode;
+    return accept();
+  }
+  if (p.type === 'setAutoDrain') {
+    if (process.env.FAKE_APPSERVER_AUTODRAIN_REJECT === '1') return answer({ status: 'rejected', reasonCode: 'proto.forbidden' });
+    autoDrain = payload.autoDrain === true;
+    accept();
+    if (autoDrain && heldTexts.length && !inFlight && process.env.FAKE_APPSERVER_AUTODRAIN_NOOP !== '1') {
+      const content = heldTexts.splice(0).join('\n\n');
+      startTurn(content, `fake follow-up turn: ${content}`);
+    }
+    return;
+  }
+  if (p.type === 'sendQueuedNow') {
+    if (!heldTexts.length || inFlight) return answer({ status: 'rejected', reasonCode: 'queue.itemNotFound' });
+    accept();
+    const content = heldTexts.shift();
+    return startTurn(content, `fake follow-up turn: ${content}`);
+  }
+  answer({ status: 'rejected', reasonCode: 'unknown_command' });
+}
+
+// requestedDelivery 'startNow' during a turn cancels it.
+function preempt() {
+  const turn = inFlight;
+  inFlight = null;
+  if (chattyTimer) { clearInterval(chattyTimer); chattyTimer = null; }
+  stoppedSends.add(turn.id);
+  heldTexts.push(...undrained.splice(0));
+  revision += 1;
+  send({
+    method: 'session/event',
+    params: {
+      deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: 'turn_preempted', traceId: 'ebd62caf-0000-4000-8000-000000000001',
+      eventId: `evt_preempt_${turn.id}`, seq: 950, timestamp: Date.now(), type: 'turn.failed',
+      payload: { error: { code: 'preempted', message: 'turn preempted by a startNow input' }, turnPhase: 'model_request', inputId: 'in_preempted' },
+    },
+  });
+}
+
+function emitTurn(req, scripted = null, responseOverride = null) {
+  if (stoppedSends.has(req.id)) return; // the stop already ended this turn
+  if (inFlight === req) inFlight = null;
+  // Guide texts the turn ended before draining stay in ZCode's queue; ZCode
+  // holds a queue left at turn end (autoDrain false: no automatic new turn).
+  if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+  heldTexts.push(...undrained.splice(0));
+  revision += 1;
+  if (heldTexts.length) autoDrain = false;
+  const steered = guided.length ? `\nsteered: ${guided.join(' | ')}` : '';
+  guided = [];
   const input = (req.params && req.params.content) || '';
   const n = scripted ? scripted.n : 1;
   const base = { deliveryKind: 'desktop-continuous', sessionId: SESSION_ID, turnId: `turn_fake${n}`, traceId: 'ebd62caf-0000-4000-8000-000000000001' };
@@ -400,12 +801,13 @@ function emitTurn(req, scripted = null) {
       payload: { assistantMessageId: 'msg_fake0001', delta: 'fake ', done: false, kind: 'reasoning_delta' },
     },
   });
+  const FAKE_USAGE = { inputTokens: 100, outputTokens: 5, totalTokens: 105, modelRequestCount: 1 };
   const FAILURES = { fail: 'fake model failure', 'rate-limit': '429 rate limit', 'auth-fail': 'project_token_login_failed' };
   const failMsg = FAILURES[MODE];
   if (scripted) {
     const tail = scripted.failure
-      ? { type: 'turn.failed', payload: { error: scripted.failure, turnPhase: 'model_request', inputId: `in_fake${n}` } }
-      : { type: 'turn.completed', payload: { response: `fake model task done after ${n} turn(s)`, resultType: 'success', inputId: `in_fake${n}` } };
+      ? { type: 'turn.failed', payload: { error: scripted.failure, turnPhase: 'model_request', usage: FAKE_USAGE, inputId: `in_fake${n}` } }
+      : { type: 'turn.completed', payload: { response: `fake model task done after ${n} turn(s)`, resultType: 'success', usage: FAKE_USAGE, inputId: `in_fake${n}` } };
     send({ method: 'session/event', params: { ...base, eventId: `evt_fake_${n}_3`, seq: 10 * n + 2, timestamp: Date.now(), ...tail } });
     return;
   }
@@ -418,6 +820,7 @@ function emitTurn(req, scripted = null) {
         payload: {
           error: { type: 'unknown_error', code: 'model_not_found', message: failMsg, detail: 'Model creation failed', underlyingErrorMessage: failMsg, stack: 'Error: Model creation failed\n    at fake (zcode.cjs:1:1)' },
           turnPhase: 'model_creation',
+          usage: FAKE_USAGE,
           inputId: 'in_fake0001',
         },
       }
@@ -427,9 +830,11 @@ function emitTurn(req, scripted = null) {
         timestamp: 1792184703455,
         type: 'turn.completed',
         payload: {
-          response: 'fake model task done',
+          response: (responseOverride !== null ? responseOverride
+            : process.env.FAKE_APPSERVER_RESPONSE ? JSON.parse(process.env.FAKE_APPSERVER_RESPONSE)
+            : MODE === 'secret' ? 'leaked sk-abc123def456ghi789jkl here' : 'fake model task done') + steered,
           tokenCount: 32485,
-          usage: { source: 'provider', modelRequestCount: 1, inputTokens: 32467, outputTokens: 18, totalTokens: 32485, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 14, webFetchRequests: 0, webSearchRequests: 0 },
+          usage: { source: 'provider', modelRequestCount: 1, inputTokens: 100, outputTokens: 5, totalTokens: 105, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, webFetchRequests: 0, webSearchRequests: 0 },
           toolCallCount: 0,
           historyRoundCount: 1,
           duration: 12532,
@@ -479,6 +884,14 @@ rl.on('line', (line) => {
     case 'session/subscribe': handleSubscribe(msg); break;
     case 'session/send': handleSend(msg); break;
     case 'noop/hang': break; // deliberately never answered: per-request timeout path
+    case 'session/stop':
+      if (UNSUPPORTED.has('stop')) send({ id: msg.id, error: { code: -32601, message: 'Method not found' } });
+      else handleStop(msg);
+      break;
+    case 'v4/command':
+      if (UNSUPPORTED.has('steer')) send({ id: msg.id, error: { code: -32601, message: 'Method not found' } });
+      else handleCommand(msg);
+      break;
     default:
       send({ id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } });
   }

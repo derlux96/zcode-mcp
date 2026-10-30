@@ -8,7 +8,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   TERMINAL_STATES, stateHome, jobsRoot, createJobDir, readJson, readStatus, readResult,
-  patchStatus, writeResult, listJobDirs, isJobId, jobDir, ensurePrivateDir,
+  patchStatus, writeResult, listJobDirs, isJobId, jobDir, ensurePrivateDir, STOP_GRACE_MS,
 } from './jobstore.mjs';
 import { acquireCwdLock, releaseCwdLock } from './locks.mjs';
 import {
@@ -20,9 +20,12 @@ import { captureBaseline, changesSince } from './changes.mjs';
 import { validateRunArgs, assertGitRepo, createWorktree, removeWorktree, worktreeSummary } from './runner.mjs';
 import { resolveBin, getModelCatalog, resolveModel, entryReasoningLevels } from './appserver.mjs';
 import { oneLine, cleanName } from './sanitize.mjs';
+import { writeInboxEntry, waitAck } from './inbox.mjs';
 
 export const REASONING_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const MAX_RUNNING_JOBS = 3;
+export const SEND_ACK_WAIT_MS = 5000;
+export const MAX_SEND_TEXT = 20000;
 const STALL_MS = 30000;
 const STARTUP_GRACE_MS = 15000;
 const POLL_MS = 250;
@@ -102,13 +105,14 @@ function sleepAbortable(ms, signal) {
       resolve();
     };
     const timer = setTimeout(done, ms);
-    if (signal) signal.addEventListener('abort', done, { once: true });
+    if (signal) signal.addEventListener('abort', done);
   });
 }
 
 // Aborting `signal` only ends the wait; the job keeps running. until 'change'
 // ends on a change of the effective state (or finishedAt) only: heartbeat and
 // activity writes bump status.updatedAt every few seconds and must not end it.
+// until 'attention' ends on a terminal state or needs_input.
 export async function waitJob(jobId, { waitMs = 0, signal, until = 'terminal' } = {}) {
   let view = getJob(jobId);
   if (!view) return null;
@@ -117,6 +121,7 @@ export async function waitJob(jobId, { waitMs = 0, signal, until = 'terminal' } 
   const deadline = Date.now() + waitMs;
   for (;;) {
     if (isTerminal(view.state)) return view;
+    if (until === 'attention' && view.state === 'needs_input') return view;
     if (until === 'change' && (view.state !== first.state || finishedAt(view) !== first.finishedAt)) return view;
     const left = deadline - Date.now();
     if (left <= 0 || (signal && signal.aborted)) return view;
@@ -185,6 +190,9 @@ function validateStart(args) {
     }
     if (v.value.maxTransientRetries !== undefined) {
       return invalid('max_transient_retries applies only in protocol mode (model set, or no mode/resume/target given): the CLI path cannot continue a session after a provider error; rerun with resume <sess_id> instead');
+    }
+    if (v.value.inputTimeoutMs !== undefined) {
+      return invalid('input_timeout_ms applies only in protocol mode (model set, or no mode/resume/target given); the CLI path cannot ask for user input');
     }
   }
   return { ok: true, value: v.value };
@@ -259,7 +267,7 @@ export async function startJob(args = {}, opts = {}) {
       params: {
         prompt: v.prompt, cwd, mode: v.mode, resume: v.resume, target: v.target,
         model: args.model, reasoning_level: args.reasoning_level,
-        timeout_ms: v.timeoutMs, idle_timeout_ms: v.idleTimeoutMs, isolate_worktree: v.isolateWorktree,
+        timeout_ms: v.timeoutMs, idle_timeout_ms: v.idleTimeoutMs, input_timeout_ms: v.inputTimeoutMs, isolate_worktree: v.isolateWorktree,
         max_transient_retries: v.maxTransientRetries,
       },
       path,
@@ -337,7 +345,7 @@ async function settle(job, dir, ms) {
   const end = Date.now() + ms;
   for (;;) {
     const s = readStatus(dir);
-    if (s && isTerminal(s.state)) return true;
+    // A terminal state is never alive, so it ends here too.
     if (!aliveFrom(job, s)) return isTerminal((readStatus(dir) || {}).state);
     const left = end - Date.now();
     if (left <= 0) return false;
@@ -386,15 +394,50 @@ async function markCancelled(job, dir) {
   patchStatus(dir, { state: 'cancelled', warnings, errorKind: 'cancelled', finishedAt: new Date().toISOString() });
 }
 
-export async function cancelJob(jobId, { termGraceMs = 10000 } = {}) {
+export async function cancelJob(jobId, { termGraceMs = 10000, stopGraceMs = STOP_GRACE_MS + 2000 } = {}) {
   const view = getJob(jobId);
   if (!view || isTerminal(view.state)) return view;
   const { job, dir } = view;
   try { writeFileSync(join(dir, 'cancel'), '', { mode: 0o600 }); } catch { /* signals still apply */ }
+  // Protocol runners react to the cancel file with session/stop; give them the chance first.
+  if (job.path === 'protocol' && (await settle(job, dir, stopGraceMs))) return getJob(jobId);
   signalJob(job, dir, 'SIGTERM');
   if (!(await settle(job, dir, termGraceMs))) {
     signalJob(job, dir, 'SIGKILL');
     if (!(await settle(job, dir, KILL_WAIT_MS))) await markCancelled(job, dir);
   }
   return getJob(jobId);
+}
+
+const FINISHED_BEFORE_DELIVERY = 'job finished before the message was delivered';
+
+// Queues `text` for the runner and waits up to ackWaitMs for its answer. Protocol path only.
+export async function sendToJob(jobId, text, { ackWaitMs = SEND_ACK_WAIT_MS, signal } = {}) {
+  const view = getJob(jobId);
+  if (!view) return { ok: false, error: `Unknown job: ${cleanName(String(jobId))}` };
+  if (typeof text !== 'string' || text.trim() === '' || text.length > MAX_SEND_TEXT) {
+    return invalid(`text must be a non-empty string of at most ${MAX_SEND_TEXT} characters`);
+  }
+  if (view.job.path === 'cli') return { ok: false, error: 'Sending messages is not supported on the CLI path' };
+  if (isTerminal(view.state)) return { ok: false, error: `Job already finished (${view.state})` };
+  let seq;
+  try {
+    seq = writeInboxEntry(view.dir, { kind: 'send', text });
+  } catch (error) {
+    return { ok: false, error: `Could not queue the message: ${oneLine(error.message)}` };
+  }
+  const ack = await waitAck(view.dir, seq, ackWaitMs, { signal });
+  const after = getJob(jobId) || view;
+  if (!ack) {
+    if (isTerminal(after.state)) return { ok: false, error: FINISHED_BEFORE_DELIVERY };
+    return { ok: true, status: 'queued', view: after };
+  }
+  if (ack.status === 'rejected' && ack.reason === 'finished') return { ok: false, error: FINISHED_BEFORE_DELIVERY };
+  return {
+    ok: true,
+    status: ack.status,
+    ...(ack.reason ? { reason: oneLine(String(ack.reason)) } : {}),
+    ...(ack.delivery === 'guide' || ack.delivery === 'queue' ? { delivery: ack.delivery } : {}),
+    view: after,
+  };
 }

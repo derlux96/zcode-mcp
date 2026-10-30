@@ -30,8 +30,8 @@ export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } 
   const inFlight = new Map();
 
   async function callTool(id, params) {
-    const tool = byName.get(params && params.name);
-    if (!tool) return fail(id, INVALID_PARAMS, `Unknown tool: ${params && params.name}`);
+    const tool = byName.get(params?.name);
+    if (!tool) return fail(id, INVALID_PARAMS, `Unknown tool: ${params?.name}`);
     const ctl = new AbortController();
     inFlight.set(id, ctl);
     try {
@@ -58,8 +58,8 @@ export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } 
       }
     },
     async handleMessage(msg) {
-      if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
-        return msg && msg.id !== undefined ? fail(msg.id, INVALID_REQUEST, 'Invalid Request') : null;
+      if (msg?.jsonrpc !== '2.0') {
+        return msg?.id !== undefined ? fail(msg.id, INVALID_REQUEST, 'Invalid Request') : null;
       }
       if (msg.id === undefined) { // notification: never answered
         if (msg.method === 'notifications/cancelled') {
@@ -89,7 +89,7 @@ export function createProtocol({ tools = [], serverInfo = DEFAULT_SERVER_INFO } 
             return fail(id, METHOD_NOT_FOUND, `Method not found: ${method}`);
         }
       } catch (error) {
-        return fail(id, INTERNAL_ERROR, error && error.message ? error.message : String(error));
+        return fail(id, INTERNAL_ERROR, error?.message || String(error));
       }
     },
   };

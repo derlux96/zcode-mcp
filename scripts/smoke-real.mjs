@@ -5,7 +5,7 @@
 // Spends real ZCode quota: run only with --real.
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from '../src/is-main.mjs';
 import {
   startCli, tempDir, initRepo, writeFiles, gitStatus, realServer, stopServer, runJob,
   firstActivityMs, assertNothingLeft, writeReport, percentile, isAbortKind,
@@ -231,7 +231,7 @@ async function main() {
   return report.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main().then((code) => process.exit(code), (error) => {
     process.stderr.write(`smoke-real: ${error && error.stack ? error.stack : error}\n`);
     process.exit(1);

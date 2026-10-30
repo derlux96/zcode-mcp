@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AppServerClient, AppServerError, runTaskWithModel, DEFAULT_CONTINUE_PROMPT } from '../src/appserver.mjs';
+import { AppServerClient, AppServerError, runTaskWithModel, addUsage, DEFAULT_CONTINUE_PROMPT } from '../src/appserver.mjs';
 import { makeTempDir, removeDir } from './helpers.mjs';
 
 const fakeBin = fileURLToPath(new URL('./fake-appserver.cjs', import.meta.url));
@@ -165,6 +165,51 @@ test('maxRetries 0 disables the retry', async () => {
   assert.match(res.error.message, /HTTP 429/);
   assert.equal(res.retryStop, null);
   assert.equal(sends().length, 1);
+});
+
+test('maxRetries 1: one retry, then exhausted', async () => {
+  const { cwd, sends } = setup('fail-429-always');
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, transientRetry: { maxRetries: 1, delaysMs: [5], jitter: 0, sleep: async () => {} },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.retryStop, 'exhausted');
+  assert.equal(sends().length, 2);
+});
+
+test('a question parked by the failed attempt is abandoned: onUserInputAbandoned fires once', async () => {
+  const { cwd } = setup('ask-fail-then-hang');
+  let abandoned = 0;
+  const err = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 2000,
+    onUserInput: () => {}, onUserInputAbandoned: () => { abandoned += 1; },
+    transientRetry: { delaysMs: [5], jitter: 0, sleep: async () => {} },
+  }).catch((e) => e);
+  assert.equal(err.code, 'turn_timeout', 'the continue turn hangs until the deadline');
+  assert.equal(err.retries.length, 1);
+  assert.equal(abandoned, 1);
+});
+
+test('a retry with nothing parked does not call onUserInputAbandoned', async () => {
+  const { cwd } = setup('fail-429-then-ok');
+  let abandoned = 0;
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    onUserInput: () => {}, onUserInputAbandoned: () => { abandoned += 1; },
+    transientRetry: { delaysMs: [5], jitter: 0, sleep: async () => {} },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.retries.length, 1);
+  assert.equal(abandoned, 0);
+});
+
+test('a non-object rejection (here from a custom sleep) is passed through unchanged', async () => {
+  const { cwd } = setup('fail-429-always');
+  const err = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    transientRetry: { delaysMs: [5], jitter: 0, sleep: () => Promise.reject('no sleep') },
+  }).catch((e) => e);
+  assert.equal(err, 'no sleep');
 });
 
 test('a numeric retry-after replaces the scheduled delay, capped at the largest delay', async () => {
@@ -375,4 +420,80 @@ test('class bookkeeping: delays and attempt k/N count within the class; history 
     [1, 'rate_limit', 1, 6], [2, 'rate_limit', 2, 6], [3, 'balance', 1, 2], [4, 'balance', 2, 2],
   ]);
   assert.deepEqual(res.retries.map((r) => [r.attempt, r.klass]), [[1, 'rate_limit'], [2, 'rate_limit'], [3, 'balance'], [4, 'balance']]);
+});
+
+test('addUsage: null stays null, missing fields become 0, adds sum', () => {
+  assert.equal(addUsage(null, undefined), null);
+  assert.equal(addUsage(null, 'x'), null);
+  const a = addUsage(null, { inputTokens: 10, totalTokens: 12 });
+  assert.deepEqual(a, { inputTokens: 10, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 12, modelRequestCount: 0 });
+  const b = addUsage(a, { inputTokens: 1, modelRequestCount: 1 });
+  assert.equal(b.inputTokens, 11);
+  assert.equal(b.totalTokens, 12);
+  assert.equal(b.modelRequestCount, 1);
+});
+
+test('usage is summed across the failed and the completed turn', async () => {
+  const { cwd } = setup('fail-429-then-ok');
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', providerId: 'p', modelId: 'm', timeoutMs: 10000,
+    transientRetry: { delaysMs: [1], jitter: 0, sleep: async () => {} },
+  });
+  assert.equal(res.usage.totalTokens, 210);
+  assert.equal(res.usage.inputTokens, 200);
+  assert.equal(res.usage.modelRequestCount, 2);
+});
+
+test('stop(): a transient-looking aborted failure after stop is returned without any retry', async () => {
+  const { cwd, sends } = setup('slowhang');
+  const s = fakeSleep();
+  let control;
+  let stopped;
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000, idleTimeoutMs: 0,
+    transientRetry: { delaysMs: [10], jitter: 0, sleep: s.sleep },
+    onControl: (c) => { control = c; stopped = new Promise((r) => setTimeout(r, 200)).then(() => c.stop()); },
+  });
+  assert.equal(await stopped, 'accepted');
+  assert.equal(res.failed, true);
+  assert.equal(res.error.message, '429 rate limit');
+  assert.equal(res.retries.length, 0);
+  assert.equal(res.retryStop, null);
+  assert.deepEqual(s.waits, []);
+  assert.equal(sends().length, 1);
+  assert.equal(control.capabilities.stop, true);
+});
+
+test('stop() during a backoff ends the wait and returns the failure without the continue send', async () => {
+  const { cwd, sends } = setup('fail-429-always');
+  let control;
+  let stopped;
+  const t0 = Date.now();
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 20000,
+    transientRetry: { delaysMs: [5000], jitter: 0, onRetry: () => { stopped = new Promise((r) => setTimeout(r, 100)).then(() => control.stop()); } },
+    onControl: (c) => { control = c; },
+  });
+  assert.equal(await stopped, 'accepted');
+  assert.ok(Date.now() - t0 < 4000, 'the backoff ended early');
+  assert.equal(res.failed, true);
+  assert.equal(res.stopped, true, 'the stop came after the failed turn, during the backoff');
+  assert.equal(res.retries.length, 1);
+  assert.equal(sends().length, 1);
+});
+
+test('steer() during a retry backoff is rejected with reason retry', async () => {
+  const { cwd } = setup('fail-429-then-ok');
+  let control;
+  let steered;
+  const res = await runTaskWithModel({
+    binPath: fakeBin, cwd, prompt: 'x', timeoutMs: 10000,
+    transientRetry: { delaysMs: [300], jitter: 0, onRetry: () => { steered = new Promise((r) => setTimeout(r, 100)).then(() => control.steer('hint')); } },
+    onControl: (c) => { control = c; },
+  });
+  assert.equal(res.ok, true);
+  assert.deepEqual(await steered, { status: 'rejected', reason: 'retry' });
+  assert.deepEqual(await control.steer('late'), { status: 'rejected', reason: 'closed' }, 'the backoff is over');
+  const log = readFileSync(join(cwd, 'rx.log'), 'utf8');
+  assert.equal(log.includes('v4/command'), false);
 });

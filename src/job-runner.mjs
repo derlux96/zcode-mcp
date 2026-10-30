@@ -5,10 +5,11 @@
 // (cancel file, SIGTERM, SIGINT) and always ends with a terminal state.
 // job.path 'cli' runs the headless CLI; 'protocol' runs the app-server protocol,
 // whose event stream allows an idle timeout and progress lines.
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES } from './jobstore.mjs';
+import { isMain } from './is-main.mjs';
+import { redactText } from './redact.mjs';
+import { readJson, readStatus, patchStatus, writeResult, listJobDirs, TERMINAL_STATES, STOP_GRACE_MS } from './jobstore.mjs';
 import { getProcessIdentity, signalGroup } from './procid.mjs';
 import { changesSince } from './changes.mjs';
 import { classifyError } from './errorkind.mjs';
@@ -20,6 +21,7 @@ import { SessionStore, defaultStatePath } from './state.mjs';
 import { discoverZCode } from './discover.mjs';
 import { oneLine } from './sanitize.mjs';
 import { describeTurnError, errorText } from './transient.mjs';
+import { readPending, writeAck } from './inbox.mjs';
 
 const DEFAULT_HEARTBEAT_MS = 5000;
 const CANCEL_POLL_MS = 250;
@@ -29,6 +31,11 @@ const IDENTITY_RETRY_DELAY_MS = 100;
 const ACTIVITY_WRITE_MS = 1000;
 const PROGRESS_LINES = 5;
 const RETRY_REASON_MAX = 200;
+// STOP_GRACE_MS lives in jobstore.mjs (leaf module, no jobs <-> job-runner cycle); re-exported here.
+export { STOP_GRACE_MS };
+// A parked user-input request is declined after this long, with INPUT_TIMEOUT_ANSWER as the reason.
+export const DEFAULT_INPUT_TIMEOUT_MS = 1800000;
+export const INPUT_TIMEOUT_ANSWER = 'No answer available, decide yourself and continue';
 
 // Process group of the ZCode child while it runs (null before spawn / after exit).
 // A fatal error in the runner kills this group before the lock is released.
@@ -68,7 +75,7 @@ export function writeCrashState(dir, job, err, { startedMs, warnings = [], onSta
     changesAvailable: false,
     warnings,
     errorKind: 'crash',
-    errorMessage: err && err.message ? err.message : String(err),
+    errorMessage: redactText(err && err.message ? err.message : String(err)),
     timeoutKind: null,
     exitCode: null,
     stderr: '',
@@ -263,19 +270,17 @@ async function runCli({ params, runCwd, signal, setStatus, warn, outputLogPath, 
 // Transient provider errors (src/transient.mjs) continue the same session after a
 // backoff: status.retry shows the pending retry (cleared when the next turn starts),
 // a progress line names it, and the history lands in result.json.
-async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs, identity, identityRetryDelayMs, retryDelaysMs }) {
+async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs, identity, identityRetryDelayMs, retryDelaysMs, abort, hooks, inbox, stopGraceMs }) {
   const binPath = resolveBin();
   const eventsLog = join(dir, 'events.log');
   const progress = [];
   let eventSession = null;
   let lastEventMs = 0;
   let lastWriteMs = 0;
-  let dirty = false;
   let flushTimer = null;
+  // Called at once or from the timer an event armed: there is always something to write.
   const flush = () => {
     flushTimer = null;
-    if (!dirty) return;
-    dirty = false;
     lastWriteMs = Date.now();
     try {
       setStatus({ lastActivityAt: new Date(lastEventMs).toISOString(), progress: progress.slice() });
@@ -307,6 +312,10 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   };
   const onEvent = (event) => {
     lastEventMs = Date.now();
+    if (control && !turnLive) {
+      turnLive = true;
+      pollInbox();
+    }
     if (!eventSession && typeof event.sessionId === 'string') eventSession = event.sessionId;
     if (retryPending && event.type === 'turn.started') {
       retryPending = false;
@@ -314,7 +323,6 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     }
     const line = describeEvent(event);
     if (line) addProgress(line, lastEventMs);
-    dirty = true;
     if (flushTimer) return;
     const wait = lastWriteMs + ACTIVITY_WRITE_MS - lastEventMs;
     if (wait <= 0) {
@@ -324,6 +332,122 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
       flushTimer.unref();
     }
   };
+  // --- job control (inbox, needs_input, graceful cancel) ---
+  let control = null;
+  let turnLive = false; // a session/event arrived after control: the turn is under way
+  let closed = false;
+  let inboxBusy = false;
+  let stopSent = false;
+  let graceTimer = null;
+  let inputTimer = null;
+  const questions = []; // parked questions, oldest first (mirrors the client's queue)
+  const inputTimeoutMs = Number.isInteger(params.input_timeout_ms) && params.input_timeout_ms > 0
+    ? params.input_timeout_ms : DEFAULT_INPUT_TIMEOUT_MS;
+  const writeCaps = () => {
+    if (!control) return;
+    try { setStatus({ capabilities: { ...control.capabilities } }); } catch { /* best effort */ }
+  };
+  const clearInputTimer = () => {
+    clearTimeout(inputTimer);
+    inputTimer = null;
+  };
+  // Shows the oldest parked question (needs_input) or, with none left, running.
+  const showQuestion = () => {
+    clearInputTimer();
+    if (closed) return;
+    if (!questions.length) {
+      try { setStatus({ state: 'running', question: null, inputDeadline: null }); } catch { /* best effort */ }
+      return;
+    }
+    const inputDeadline = new Date(Date.now() + inputTimeoutMs).toISOString();
+    try {
+      setStatus({ state: 'needs_input', question: questions[0], inputDeadline, ...(control ? { capabilities: { ...control.capabilities } } : {}) });
+    } catch { /* best effort */ }
+    inputTimer = setTimeout(() => {
+      inputTimer = null;
+      if (closed || !control) return;
+      replyQuestion(() => control.decline(INPUT_TIMEOUT_ANSWER));
+    }, inputTimeoutMs);
+  };
+  // Replies to the oldest parked question via reply(); false when the client has none (any more).
+  const replyQuestion = (reply) => {
+    let r;
+    try { r = reply(); } catch { r = { status: 'rejected', reason: 'no_question' }; }
+    if (r.status === 'accepted') { // answer/decline/the catch always give an object
+      questions.shift();
+      showQuestion();
+      return true;
+    }
+    if (questions.length) {
+      questions.length = 0; // the client holds none: the mirror is stale
+      showQuestion();
+    }
+    return false;
+  };
+  const onUserInput = ({ question }) => {
+    questions.push(oneLine(redactText(String(question ?? ''))));
+    if (questions.length === 1) showQuestion();
+  };
+  // The attempt that asked failed and is retried: its questions are gone.
+  const onUserInputAbandoned = () => {
+    questions.length = 0;
+    showQuestion();
+  };
+  // A steer request that fails otherwise (e.g. request timeout) is a rejection.
+  const steer = async (text) => {
+    try {
+      const r = await control.steer(text);
+      return r.status ? r : { status: 'rejected', reason: 'error' }; // a non-object r throws: caught below
+    } catch {
+      return { status: 'rejected', reason: 'error' };
+    }
+  };
+  // Entries in seq order: a parked question gets the text as its answer,
+  // otherwise it is a steer. Entries are left alone until control exists and
+  // the turn is under way (a steer before the first send would be rejected idle).
+  const pollInbox = async () => {
+    if (!control || closed || inboxBusy || !(turnLive || questions.length)) return;
+    inboxBusy = true;
+    try {
+      let pending;
+      try { pending = readPending(dir, inbox.seq); } catch { return; }
+      for (const e of pending) {
+        if (closed) break; // the final cleanup answers what is left
+        let ack;
+        if (e.kind !== 'send') ack = { status: 'rejected', reason: 'unknown_kind' };
+        else if (questions.length && replyQuestion(() => control.answer(e.text))) ack = { status: 'accepted' };
+        else ack = await steer(e.text);
+        writeCaps();
+        try { writeAck(dir, e.seq, ack); } catch { warn('inbox_ack_failed'); }
+        inbox.seq = e.seq;
+      }
+    } finally {
+      inboxBusy = false;
+    }
+  };
+  const inboxPoll = setInterval(() => { pollInbox(); }, CANCEL_POLL_MS);
+  inboxPoll.unref();
+  // Cancel file: session/stop first, the kill after stopGraceMs (or at once
+  // without control, without stop support or when the stop request fails).
+  hooks.gracefulStop = () => {
+    if (stopSent) return;
+    stopSent = true;
+    if (!control || closed) {
+      abort();
+      return;
+    }
+    graceTimer = setTimeout(abort, stopGraceMs);
+    graceTimer.unref();
+    control.stop().then(
+      (r) => { writeCaps(); if (r !== 'accepted') abort(); },
+      () => { writeCaps(); abort(); },
+    );
+  };
+  const onControl = (c) => {
+    control = c;
+    writeCaps();
+  };
+
   const model = job.model || {};
   const call = () => runTaskWithModel({
     binPath,
@@ -339,6 +463,9 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     signal,
     onSpawn: childRecorder(setStatus, warn, identity, identityRetryDelayMs),
     onEvent,
+    onUserInput,
+    onUserInputAbandoned,
+    onControl,
     transientRetry: {
       maxRetries: params.max_transient_retries ?? DEFAULT_MAX_TRANSIENT_RETRIES,
       ...(retryDelaysMs ? { delaysMs: retryDelaysMs } : {}),
@@ -363,16 +490,23 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
   } finally {
     clearTimeout(flushTimer);
     flushTimer = null;
+    closed = true;
+    clearInterval(inboxPoll);
+    clearInputTimer();
+    clearTimeout(graceTimer);
+    hooks.gracefulStop = null;
     // runTaskWithModel closed the client: the app-server and its group are gone.
     childExited(setStatus);
   }
   if (error && error.code === 'no-model') return null;
 
+  const undelivered = (res && res.undeliveredSteers) || [];
+  if (undelivered.length) warn(`steers_not_delivered:${undelivered.length}`);
   if (res && res.reasoningSubstitution) {
     warn(`reasoning_level_substituted:${res.reasoningSubstitution.requested}->${res.reasoningSubstitution.used}`);
   }
   const text = (res && res.response) || '';
-  try { writeFileSync(outputLogPath, text); } catch { warn('output_log_failed'); }
+  try { writeFileSync(outputLogPath, redactText(text)); } catch { warn('output_log_failed'); }
   const result = protocolOutcome(res, error, params);
   const stop = res && res.retryStop;
   let retryOutcome = null;
@@ -397,13 +531,17 @@ async function runProtocol({ job, params, runCwd, signal, setStatus, warn, dir, 
     progress,
     retries,
     retryOutcome,
+    usage: (res && res.usage) || (error && error.usage) || null,
+    stopped: !!((res && res.stopped) || (error && error.stopped)),
+    controlled: true,
   };
 }
 
 // opts.heartbeatMs: heartbeat interval; opts.signal: external abort (the CLI's
 // early signal handlers); opts.onStatus(merged, patch): test hook seeing every status write;
 // opts.requestTimeoutMs: protocol request timeout (test hook; default 30 s);
-// opts.retryDelaysMs: backoff schedule for transient provider errors (test hook).
+// opts.retryDelaysMs: backoff schedule for transient provider errors (test hook);
+// opts.stopGraceMs: wait after session/stop before the kill (test hook; default STOP_GRACE_MS).
 export async function runJob(dir, opts = {}) {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const onStatus = opts.onStatus;
@@ -438,13 +576,16 @@ export async function runJob(dir, opts = {}) {
   const outputLogPath = join(dir, 'output.log');
   let heartbeat = null;
   let cancelPoll = null;
-  let finished = false;
+  // gracefulStop: set by runProtocol while it runs (cancel file -> session/stop first).
+  const hooks = { gracefulStop: null };
+  const inbox = { seq: 0 }; // highest inbox seq handled
+  const stopGraceMs = opts.stopGraceMs ?? STOP_GRACE_MS;
 
   process.on('SIGTERM', abort);
   process.on('SIGINT', abort);
   if (opts.signal) {
     if (opts.signal.aborted) abort();
-    else opts.signal.addEventListener('abort', abort, { once: true });
+    else opts.signal.addEventListener('abort', abort);
   }
   try {
     const identity = opts.identity || getProcessIdentity;
@@ -472,12 +613,17 @@ export async function runJob(dir, opts = {}) {
       try { setStatus({ heartbeatAt: now() }); } catch { /* next beat retries */ }
     }, heartbeatMs);
     heartbeat.unref();
-    const checkCancel = () => { if (existsSync(cancelFile)) abort(); };
+    // SIGTERM/SIGINT abort at once; the cancel file stops gracefully where it can.
+    const checkCancel = () => {
+      if (!existsSync(cancelFile)) return;
+      if (hooks.gracefulStop) hooks.gracefulStop();
+      else abort();
+    };
     cancelPoll = setInterval(checkCancel, CANCEL_POLL_MS);
     cancelPoll.unref();
     checkCancel();
 
-    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs, identity, identityRetryDelayMs: retryDelayMs, retryDelaysMs: opts.retryDelaysMs };
+    const ctx = { job, params, runCwd, signal: ctl.signal, setStatus, warn, dir, outputLogPath, requestTimeoutMs: opts.requestTimeoutMs, identity, identityRetryDelayMs: retryDelayMs, retryDelaysMs: opts.retryDelaysMs, abort, hooks, inbox, stopGraceMs };
     let run = job.path === 'protocol' ? await runProtocol(ctx) : await runCli({ ...ctx, idle: true });
     if (run === null) {
       warn('idle_detection_unavailable');
@@ -485,13 +631,19 @@ export async function runJob(dir, opts = {}) {
     }
     clearInterval(heartbeat);
     clearInterval(cancelPoll);
-    // A cancel whose ZCode exit was seen before the abort (signal or cancel-file
-    // poll) is still a cancel; a genuinely completed run stays completed.
-    if (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile))) {
+    // A graceful stop (session/stop sent) is a cancel whatever turn type ended it;
+    // output, changes and session id are kept. Without a stop, a cancel whose ZCode
+    // exit was seen before the abort (signal or cancel-file poll) is still a cancel,
+    // but a genuinely completed run stays completed.
+    if (run.stopped || (run.state !== 'completed' && (ctl.signal.aborted || existsSync(cancelFile)))) {
       run = { ...run, ...CANCELLED, ...(run.retryOutcome && run.retryOutcome !== 'exhausted' ? { retryOutcome: 'cancelled' } : {}) };
     }
 
     const { state, errorKind, errorMessage, sessionId } = run;
+    // The CLI path appends raw chunks to output.log; scrub the finished file.
+    try {
+      if (existsSync(outputLogPath)) writeFileSync(outputLogPath, redactText(readFileSync(outputLogPath, 'utf8')));
+    } catch { warn('output_log_failed'); }
     const changes = await collectChanges(job, params);
     if (state === 'completed' && changes.available && changes.changedFiles.length === 0 && params.mode !== 'plan') {
       warn('no_changes');
@@ -522,7 +674,6 @@ export async function runJob(dir, opts = {}) {
 
     if (managerFinal) {
       if (job.lockCwd) releaseCwdLock(job.lockCwd, jobId); // only if still ours
-      finished = true;
       return;
     }
     // Lock release precedes the terminal status so the job counts as alive until the lock is gone.
@@ -530,7 +681,7 @@ export async function runJob(dir, opts = {}) {
     writeResult(dir, {
       state,
       sessionId,
-      output: cap(run.output),
+      output: cap(redactText(run.output)),
       outputLogPath,
       changedFiles: changes.changedFiles,
       diffStat: changes.diffStat,
@@ -538,30 +689,36 @@ export async function runJob(dir, opts = {}) {
       ...(job.worktree ? { worktree: { branch: job.worktree.branch, dir: job.worktree.dir, startSha: job.worktree.startSha } } : {}),
       warnings,
       errorKind,
-      errorMessage,
+      errorMessage: errorMessage == null ? errorMessage : redactText(errorMessage),
       timeoutKind: run.timeoutKind,
       exitCode: run.exitCode,
-      stderr: cap(run.stderr),
+      stderr: cap(redactText(run.stderr)),
       durationMs: Date.now() - startedMs,
       ...(run.retries ? { retries: run.retries, retryOutcome: run.retryOutcome } : {}),
+      ...(run.usage ? { usage: run.usage } : {}),
     });
     setFinalStatus({
       state, sessionId, warnings, errorKind, finishedAt: now(),
       ...(run.progress ? { progress: run.progress } : {}),
       ...(run.retries ? { retry: null } : {}),
+      ...(run.controlled ? { question: null, inputDeadline: null } : {}),
     });
-    finished = true;
   } catch (err) {
-    if (!finished) {
-      try {
-        writeCrashState(dir, job, err, { startedMs, warnings, onStatus });
-      } catch {
-        // State directory unusable: nothing more can be recorded.
-      }
+    // The try ends with the terminal writes: a throw always comes before they are complete.
+    try {
+      writeCrashState(dir, job, err, { startedMs, warnings, onStatus });
+    } catch {
+      // State directory unusable: nothing more can be recorded.
     }
   } finally {
     if (heartbeat) clearInterval(heartbeat);
     if (cancelPoll) clearInterval(cancelPoll);
+    // Entries nobody handled get an answer, so the sender is not left waiting.
+    try {
+      for (const e of readPending(dir, inbox.seq)) {
+        try { writeAck(dir, e.seq, { status: 'rejected', reason: 'finished' }); } catch { /* best effort */ }
+      }
+    } catch { /* best effort */ }
     process.off('SIGTERM', abort);
     process.off('SIGINT', abort);
     if (opts.signal) opts.signal.removeEventListener('abort', abort);
@@ -583,12 +740,12 @@ export function runnerEnvOptions(env = process.env) {
   let retryDelaysMs;
   if (testing && typeof env.ZCODE_MCP_TEST_RETRY_DELAYS_MS === 'string') {
     const list = env.ZCODE_MCP_TEST_RETRY_DELAYS_MS.split(',').map((v) => (v.trim() === '' ? NaN : Number(v)));
-    if (list.length && list.every((n) => Number.isInteger(n) && n >= 0)) retryDelaysMs = list;
+    if (list.every((n) => Number.isInteger(n) && n >= 0)) retryDelaysMs = list; // split() yields >= 1 entry
   }
   return { heartbeatMs, fatalAfterMs: testing && fatal > 0 ? fatal : 0, retryDelaysMs };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   // Signal handlers first, so an early SIGTERM/SIGINT still ends in a terminal state.
   const early = new AbortController();
   process.on('SIGTERM', () => early.abort());
@@ -596,10 +753,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const [dir, token] = process.argv.slice(2);
   const job = dir ? readJson(join(dir, 'job.json')) : null;
   if (!job || typeof token !== 'string' || token === '' || job.token !== token) process.exit(2);
-  let crashing = false;
+  // Synchronous to the end (process.exit), so it cannot be re-entered.
   const onFatal = (err) => {
-    if (crashing) process.exit(1);
-    crashing = true;
     try { killActiveChild(); } catch { /* proceed to the crash state */ }
     try {
       writeCrashState(dir, job, err, { startedMs: Date.parse(readStatus(dir)?.startedAt) });

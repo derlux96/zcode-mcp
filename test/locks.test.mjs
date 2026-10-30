@@ -4,7 +4,9 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, statSync, symlin
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { acquireCwdLock, releaseCwdLock, removeStaleLock, lockKey, isClaimAbandoned, stealClaim } from '../src/locks.mjs';
+import {
+  acquireCwdLock, releaseCwdLock, removeStaleLock, lockKey, isClaimAbandoned, stealClaim, pidAlive,
+} from '../src/locks.mjs';
 import { stateHome } from '../src/jobstore.mjs';
 
 const LOCKS_MODULE = new URL('../src/locks.mjs', import.meta.url).href;
@@ -221,4 +223,136 @@ test('lock files are created 0600 in a 0700 locks dir', withEnv((root) => {
   const lock = join(locksDir(), `${lockKey(cwd)}.lock`);
   assert.equal(statSync(lock).mode & 0o777, 0o600);
   assert.deepEqual(readdirSync(locksDir()), [`${lockKey(cwd)}.lock`], 'no temp files left');
+}));
+
+test('a lock whose JSON lacks a string jobId is corrupt: held while young', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  mkdirSync(locksDir(), { recursive: true });
+  for (const content of ['{}', '{"jobId":5}']) {
+    writeFileSync(join(locksDir(), `${lockKey(dir)}.lock`), content);
+    assert.deepEqual(acquireCwdLock(dir, 'job_a', never), { ok: false, blockingJobId: 'unknown' }, content);
+  }
+}));
+
+test('isClaimAbandoned: exactly 120 s old is not abandoned yet, one ms more is', () => {
+  const createdAt = '2026-01-01T00:00:00.000Z';
+  const t = Date.parse(createdAt);
+  assert.equal(isClaimAbandoned({ pid: 7, createdAt }, always, t + 120_000), false);
+  assert.equal(isClaimAbandoned({ pid: 7, createdAt }, always, t + 120_001), true);
+});
+
+test('pidAlive: only positive integer pids are probed; EPERM counts as alive, ESRCH as gone', () => {
+  const calls = [];
+  const fake = (err) => (pid, sig) => { calls.push([pid, sig]); if (err) throw Object.assign(new Error(err), { code: err }); };
+  for (const bad of [0, -1, -42, 1.5, NaN, '12', undefined, null]) {
+    assert.equal(pidAlive(bad, fake()), false, String(bad));
+  }
+  assert.deepEqual(calls, [], 'never signalled');
+  assert.equal(pidAlive(1, fake()), true);
+  assert.equal(pidAlive(4242, fake('EPERM')), true);
+  assert.equal(pidAlive(4242, fake('ESRCH')), false);
+  assert.deepEqual(calls, [[1, 0], [4242, 0], [4242, 0]]);
+});
+
+test('pidAlive with the real kill: own process alive, a reaped child gone', async () => {
+  assert.equal(pidAlive(process.pid), true);
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  await new Promise((r) => child.on('exit', r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(pidAlive(child.pid), false);
+});
+
+// A young claim that is not a JSON object (unreadable) is busy: never stolen before 120 s.
+function busyClaim(dir) {
+  writeFileSync(join(locksDir(), `${lockKey(dir)}.lock.claim`), '5');
+}
+
+// Math.random fixed at 0.5: every retry sleeps 20 + 15 ms.
+function withRandom(value, fn) {
+  const orig = Math.random;
+  Math.random = () => value;
+  try { return fn(); } finally { Math.random = orig; }
+}
+
+test('acquire: a busy claim is retried 40 times with a 20-50 ms backoff, then reports the holder', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  busyClaim(dir);
+  let checks = 0;
+  const isAlive = () => { checks++; return false; };
+  const t0 = performance.now();
+  const r = withRandom(0.5, () => acquireCwdLock(dir, 'job_new', isAlive));
+  const elapsed = performance.now() - t0;
+  assert.deepEqual(r, { ok: false, blockingJobId: 'job_dead' });
+  assert.equal(checks, 40);
+  assert.ok(elapsed >= 40 * 35, `slept ${elapsed} ms`);
+}));
+
+test('acquire: a lock that vanished during the last retry is reported as unknown', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  busyClaim(dir);
+  let checks = 0;
+  const isAlive = () => {
+    if (++checks === 40) rmSync(join(locksDir(), `${lockKey(dir)}.lock`));
+    return false;
+  };
+  assert.deepEqual(withRandom(0, () => acquireCwdLock(dir, 'job_new', isAlive)), { ok: false, blockingJobId: 'unknown' });
+}));
+
+test('acquire: a lock that turned corrupt during the last retry is reported as unknown', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  busyClaim(dir);
+  let checks = 0;
+  const isAlive = () => {
+    if (++checks === 40) writeFileSync(join(locksDir(), `${lockKey(dir)}.lock`), 'garbage');
+    return false;
+  };
+  assert.deepEqual(withRandom(0, () => acquireCwdLock(dir, 'job_new', isAlive)), { ok: false, blockingJobId: 'unknown' });
+}));
+
+test('removeStaleLock: a busy claim is retried 40 times with a 20-50 ms backoff, then gives up', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  acquireCwdLock(dir, 'job_dead', always);
+  busyClaim(dir);
+  let checks = 0;
+  const isAlive = () => { checks++; return false; };
+  const t0 = performance.now();
+  const removed = withRandom(0.5, () => removeStaleLock(dir, isAlive));
+  const elapsed = performance.now() - t0;
+  assert.equal(removed, false);
+  assert.equal(checks, 40);
+  assert.ok(elapsed >= 40 * 35, `slept ${elapsed} ms`);
+  assert.equal(JSON.parse(readFileSync(join(locksDir(), `${lockKey(dir)}.lock`), 'utf8')).jobId, 'job_dead');
+}));
+
+test('removeStaleLock re-checks under the claim: vanished or revived lock, or a lost claim, removes nothing', withEnv((root) => {
+  const dir = join(root, 'proj');
+  mkdirSync(dir);
+  const lock = join(locksDir(), `${lockKey(dir)}.lock`);
+  const claim = `${lock}.claim`;
+  // Vanished between the first look and the claim.
+  acquireCwdLock(dir, 'job_dead', always);
+  assert.equal(removeStaleLock(dir, () => { rmSync(lock); return false; }), false);
+  assert.equal(existsSync(lock), false);
+  // Revived: dead at the first look, alive under the claim.
+  acquireCwdLock(dir, 'job_dead', always);
+  let n = 0;
+  assert.equal(removeStaleLock(dir, () => n++ > 0), false);
+  assert.equal(JSON.parse(readFileSync(lock, 'utf8')).jobId, 'job_dead');
+  // The claim was replaced by a foreign one before the unlink.
+  let m = 0;
+  const swap = () => {
+    if (m++ === 1) writeFileSync(claim, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), nonce: 'other' }));
+    return false;
+  };
+  assert.equal(removeStaleLock(dir, swap), false);
+  assert.equal(JSON.parse(readFileSync(lock, 'utf8')).jobId, 'job_dead');
+  assert.equal(JSON.parse(readFileSync(claim, 'utf8')).nonce, 'other');
 }));

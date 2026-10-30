@@ -39,7 +39,7 @@ export async function probeModel({
   const cancel = () => ctl.abort();
   if (signal) {
     if (signal.aborted) cancel();
-    else signal.addEventListener('abort', cancel, { once: true });
+    else signal.addEventListener('abort', cancel);
   }
   let dir = null;
   try {

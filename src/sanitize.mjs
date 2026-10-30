@@ -9,7 +9,7 @@ const CONTROLS = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
 function escapeOne(c) {
   if (CONTROL_ESCAPES[c]) return CONTROL_ESCAPES[c];
   const code = c.charCodeAt(0);
-  return code > 0xff ? `\\u${code.toString(16).padStart(4, '0')}` : `\\x${code.toString(16).padStart(2, '0')}`;
+  return code > 0x9f ? `\\u${code.toString(16).padStart(4, '0')}` : `\\x${code.toString(16).padStart(2, '0')}`;
 }
 
 export const escapeControls = (s) => s.replace(CONTROLS, escapeOne);

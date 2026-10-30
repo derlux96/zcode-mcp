@@ -9,7 +9,7 @@
 import { existsSync, lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import {
-  TERMINAL_STATES, stateHome, jobsRoot, jobDir, isJobId, listJobDirs, readJson, readStatus, readResult,
+  TERMINAL_STATES, stateHome, jobsRoot, jobDir, listJobDirs, readJson, readStatus, readResult,
   patchStatus, writeResult,
 } from './jobstore.mjs';
 import { lockKey, removeStaleLock } from './locks.mjs';
@@ -32,7 +32,7 @@ function lockHolder(cwd) {
 
 async function waitGroupsGone(pgids, ms) {
   const end = Date.now() + ms;
-  while (pgids.some(groupHasMembers) && Date.now() < end) await sleep(POLL_MS);
+  while (pgids.some((p) => groupHasMembers(p)) && Date.now() < end) await sleep(POLL_MS);
 }
 
 // Lost = no terminal state on disk and the runner fails the identity check (fresh reads).
@@ -120,16 +120,17 @@ function newestMtime(dir) {
 }
 
 // Unreadable status, but nothing in it or only a terminal result: deletable by age only.
+// An unlistable dir throws: the caller skips it.
 function isHusk(dir) {
   const result = readResult(dir);
   if (result && isTerminal(result.state)) return true;
-  try { return readdirSync(dir).length === 0; } catch { return false; }
+  return readdirSync(dir).length === 0;
 }
 
 // Deletes a real job directory directly inside jobsRoot(); never follows a symlink.
 export function removeJobDir(dir, rootReal) {
   const id = basename(dir);
-  if (!isJobId(id) || dir !== jobDir(id)) return false;
+  if (dir !== jobDir(id)) return false; // jobDir: null for anything but a job id
   try {
     const st = lstatSync(dir);
     if (st.isSymbolicLink() || !st.isDirectory()) return false;
@@ -174,10 +175,9 @@ export async function reap({
   const out = { lost: [], deleted: [], killed: [] };
   for (const dir of listJobDirs()) {
     const jobId = basename(dir);
-    const own = jobDir(jobId);
-    if (!own || own !== dir) continue;
+    if (jobDir(jobId) !== dir) continue; // jobDir: null for anything but a job id
     try {
-      if ((await reapLost(jobId, own, o, out.killed)) === 'lost') out.lost.push(jobId);
+      if ((await reapLost(jobId, dir, o, out.killed)) === 'lost') out.lost.push(jobId);
     } catch { /* one bad job never stops the reaper */ }
   }
   try { out.deleted = retention(now); } catch { /* keep the lost results */ }

@@ -23,3 +23,14 @@ test('formatCatalog rows are escaped single lines (M3)', () => {
   assert.ok(!RAW.test(rows[0]), rows[0]);
   assert.ok(!rows[0].includes('\n'));
 });
+
+test('oneLine and cleanName: falsy values are kept, the cap is inclusive, \\x9f stays a byte escape', () => {
+  assert.equal(oneLine(0), '0');
+  assert.equal(cleanName(false), 'false');
+  assert.equal(oneLine(null), '');
+  const exact = 'a'.repeat(300);
+  assert.equal(oneLine(exact), exact);
+  assert.equal(cleanName(exact), exact);
+  assert.equal(oneLine(`${exact}b`), `${'a'.repeat(299)}…`);
+  assert.equal(cleanName('\x9f'), '\\x9f');
+});

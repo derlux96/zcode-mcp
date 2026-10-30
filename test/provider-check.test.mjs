@@ -117,3 +117,21 @@ test('a URL fragment is masked (it can carry tokens); the path is shown as is', 
   assert.equal(r.providers[0].baseUrl, 'https://api.example.com/v1#***');
   assert.ok(!JSON.stringify(r).includes(SECRET));
 });
+
+test('null config, api and access objects are tolerated', () => {
+  const rules = [
+    { providerId: 'a', enabled: true, config: null },
+    { providerId: 'b', enabled: true, config: { api: null, access: null } },
+  ];
+  assert.deepEqual(checkProviderConfig(home(cfg(...rules))).providers.map((p) => [p.id, p.baseUrl, p.apiType, p.accessType]), [
+    ['a', null, null, null], ['b', null, null, null],
+  ]);
+});
+
+test('the typo warning names the trailing character, also before a final slash, and an empty id stays empty', () => {
+  const r = checkProviderConfig(home(cfg(rule('p', { baseUrl: 'https://api.example.com./' }), rule('', { baseUrl: 'https://x.example.com,' }))));
+  assert.deepEqual(r.warnings, [
+    'provider p: baseUrl "https://api.example.com./" ends with "." — probably a typo',
+    'provider : baseUrl "https://x.example.com," ends with "," — probably a typo',
+  ]);
+});

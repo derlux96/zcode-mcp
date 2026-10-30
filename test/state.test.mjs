@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync, rmSync, mkdirSync, utimesSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, rmSync, mkdirSync, utimesSync, existsSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -149,4 +149,29 @@ test('defaultStatePath follows ZCODE_MCP_HOME', () => {
   } finally {
     if (prev === undefined) delete process.env.ZCODE_MCP_HOME; else process.env.ZCODE_MCP_HOME = prev;
   }
+});
+
+test('a lock left by a dead holder (older than 10 s) is removed and the append goes through', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zcode-state-'));
+  const file = join(dir, 'sessions.json');
+  const lock = `${file}.lock`;
+  mkdirSync(lock);
+  mkdirSync(join(lock, 'owner'));
+  const old = new Date(Date.now() - 60000);
+  utimesSync(lock, old, old);
+  const store = new SessionStore(file);
+  store.append(entry());
+  assert.equal(store.list().length, 1);
+  assert.equal(existsSync(lock), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('append skips null entries left in the file instead of crashing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zcode-state-'));
+  const file = join(dir, 'sessions.json');
+  writeFileSync(file, JSON.stringify([null, entry({ id: 'old' })]));
+  const store = new SessionStore(file);
+  store.append(entry({ id: 'new' }));
+  assert.deepEqual(store.list().map((e) => e && e.id), [null, 'old', 'new']);
+  rmSync(dir, { recursive: true, force: true });
 });

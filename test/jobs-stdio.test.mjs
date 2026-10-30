@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getProcessIdentity } from '../src/procid.mjs';
 import { TestScope, fakeAppserverBin, assertNoLeftoverProcesses, safeSignal, waitFor } from './helpers.mjs';
 
@@ -94,6 +95,55 @@ test('closing stdin ends in-flight waits at once: the reply still carries the jo
   const text = reply.content.map((c) => c.text).join('\n');
   assert.match(text, /^status: running$/m);
   assert.equal(jobIdOf(text), jobId);
+});
+
+// A server whose event loop stays busy (see keep-alive.cjs) ends only through its own exit.
+const KEEP_ALIVE = { NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --require ${fileURLToPath(new URL('./keep-alive.cjs', import.meta.url))}`.trim() };
+
+async function exitWithin(client, ms) {
+  let timer;
+  const exit = await Promise.race([client.exited, new Promise((r) => { timer = setTimeout(() => r(null), ms); })]);
+  clearTimeout(timer);
+  return exit;
+}
+
+test('a busy server exits 0 on stdin close, but only after the replies in flight', async () => {
+  const s = fresh();
+  const idle = s.client(KEEP_ALIVE);
+  await idle.initialize();
+  await idle.request('ping', {});
+  idle.closeStdin();
+  const first = await exitWithin(idle, 10000);
+  assert.ok(first, 'an idle server exits on stdin close');
+  assert.equal(first.code, 0);
+  const busy = s.client({ ...KEEP_ALIVE, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: join(s.home, 'none.json') });
+  await busy.initialize();
+  assert.equal(busy.hasExited, undefined, 'still serving after a request');
+  const check = busy.callTool('zcode_check', {});
+  busy.closeStdin();
+  const reply = await check;
+  assert.equal(reply.isError, false, reply.text);
+  const second = await exitWithin(busy, 10000);
+  assert.ok(second, 'exits once the reply is out');
+  assert.equal(second.code, 0);
+});
+
+test('closing stdin right after a large request: the whole reply is written, then exit 0', async () => {
+  const s = fresh();
+  const a = s.client(KEEP_ALIVE);
+  await a.initialize();
+  a.writeRaw('this is not json {');
+  const name = 'x'.repeat(300000); // the error reply echoes it: far more than a pipe buffer
+  const { promise } = a.requestWithId('tools/call', { name, arguments: {} }, { timeoutMs: 20000 });
+  const outcome = promise.then(() => 'resolved', (e) => e.message);
+  a.closeStdin();
+  let timer;
+  const exit = await Promise.race([a.exited, new Promise((r) => { timer = setTimeout(() => r(null), 10000); })]);
+  clearTimeout(timer);
+  assert.ok(exit, 'server did not exit after stdin closed');
+  assert.equal(exit.code, 0);
+  assert.equal(await outcome, `Unknown tool: ${name}`);
+  assert.match(a.stderr, /^\[zcode-delegate\] non-JSON line ignored: this is not json \{$/m);
 });
 
 test('two servers starting a job in the same cwd: exactly one wins', async () => {

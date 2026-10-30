@@ -513,3 +513,176 @@ test('timeout_ms default and maximum are 6 hours', () => {
   assert.equal(validateRunArgs({ ...base, timeout_ms: 21600000 }).ok, true);
   assert.match(validateRunArgs({ ...base, timeout_ms: 21600001 }).error, /timeout_ms/);
 });
+
+import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { buildSpawnEnv, MIN_TIMEOUT_MS, MAX_TRANSIENT_RETRIES } from '../src/runner.mjs';
+
+test('validateRunArgs: every rejection says ok: false and names the field', () => {
+  const file = join(mk(), 'plain-file');
+  writeFileSync(file, 'x');
+  const cases = [
+    [{ prompt: ' ' }, /prompt/],
+    [{ cwd: 'relative/x' }, /absolute/],
+    [{ cwd: '/no/such/dir/at/all' }, /does not exist/],
+    [{ cwd: file }, /not a directory/],
+    [{ mode: 'fast' }, /mode/],
+    [{ resume: 42 }, /resume/],
+    [{ target: 42 }, /target/],
+    [{ timeout_ms: MIN_TIMEOUT_MS - 1 }, /timeout_ms/],
+    [{ idle_timeout_ms: MIN_TIMEOUT_MS - 1 }, /idle_timeout_ms/],
+    [{ idle_timeout_ms: MAX_TIMEOUT_MS + 1 }, /idle_timeout_ms/],
+    [{ idle_timeout_ms: 1500.5 }, /idle_timeout_ms/],
+    [{ isolate_worktree: 'yes' }, /isolate_worktree/],
+    [{ max_transient_retries: -1 }, /max_transient_retries/],
+    [{ max_transient_retries: MAX_TRANSIENT_RETRIES + 1 }, /max_transient_retries/],
+    [{ max_transient_retries: 1.5 }, /max_transient_retries/],
+    [{ input_timeout_ms: 0 }, /input_timeout_ms/],
+    [{ input_timeout_ms: MAX_TIMEOUT_MS + 1 }, /input_timeout_ms/],
+    [{ input_timeout_ms: 1.5 }, /input_timeout_ms/],
+  ];
+  for (const [patch, re] of cases) {
+    const v = validateRunArgs({ ...base, ...patch });
+    assert.equal(v.ok, false, `${JSON.stringify(patch)} must be rejected`);
+    assert.match(v.error, re);
+  }
+});
+
+test('validateRunArgs accepts the range boundaries and passes the optional fields through', () => {
+  const accepted = [
+    { timeout_ms: MIN_TIMEOUT_MS },
+    { idle_timeout_ms: MIN_TIMEOUT_MS },
+    { idle_timeout_ms: MAX_TIMEOUT_MS },
+    { max_transient_retries: 0 },
+    { max_transient_retries: MAX_TRANSIENT_RETRIES },
+    { input_timeout_ms: 1 },
+    { input_timeout_ms: MAX_TIMEOUT_MS },
+  ];
+  for (const patch of accepted) {
+    assert.equal(validateRunArgs({ ...base, ...patch }).ok, true, `${JSON.stringify(patch)} must be accepted`);
+  }
+  const v = validateRunArgs({
+    ...base, resume: 'sess_r1', target: 'goal', isolate_worktree: true, max_transient_retries: 3, input_timeout_ms: 5000,
+  });
+  assert.equal(v.ok, true);
+  assert.equal(v.value.resume, 'sess_r1');
+  assert.equal(v.value.target, 'goal');
+  assert.equal(v.value.isolateWorktree, true);
+  assert.equal(v.value.maxTransientRetries, 3);
+  assert.equal(v.value.inputTimeoutMs, 5000);
+});
+
+test('buildSpawnEnv completes the pair without HOME set (falls back to the account home)', () => {
+  const saved = { ...process.env };
+  try {
+    process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = '/x/zcode-builtin.json';
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    delete process.env.HOME;
+    const env = buildSpawnEnv('/no/such/bin/zcode');
+    assert.equal(env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, '/x/zcode-builtin.json');
+  } finally {
+    for (const k of ['ZCODE_BUILTIN_PROVIDER_CONFIG_FILE', 'ZCODE_PERSONAL_PROVIDER_CONFIG_FILE', 'HOME']) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+});
+
+// A child script (run with node, since it ends in .cjs) written for one test.
+function script(name, code) {
+  const file = join(mk('zcode-script-'), name);
+  writeFileSync(file, code);
+  return file;
+}
+
+test('output of exactly OUTPUT_CAP characters is kept whole; longer output keeps its head', async () => {
+  const bin = script('print.cjs', "process.stdout.write('a' + 'x'.repeat(Number(process.argv[2]) - 1));");
+  const cwd = mk();
+  const exact = await runZCodeArgs(bin, [String(OUTPUT_CAP)], { cwd, timeoutMs: 10000 });
+  assert.equal(exact.stdout, 'a' + 'x'.repeat(OUTPUT_CAP - 1));
+  const over = await runZCodeArgs(bin, [String(OUTPUT_CAP + 1)], { cwd, timeoutMs: 10000 });
+  assert.equal(over.stdout, `a${'x'.repeat(OUTPUT_CAP - 1)}\n[... output truncated at ${OUTPUT_CAP} chars]`);
+});
+
+test('without killGroup the child stays in our process group and no leftovers are reported', async () => {
+  const cwd = mk();
+  let pgid;
+  const res = await runZCodeTask({
+    binPath: fakeBin, prompt: 'hi', cwd,
+    onSpawn: (child) => { pgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(child.pid)], { encoding: 'utf8' })); },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(pgid, Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' })));
+  assert.equal(res.leftoverKilled, false);
+});
+
+test('a second stop while the first is still ending keeps the first kind', async () => {
+  // Silent child that takes 800 ms to exit after SIGTERM: the idle stop fires
+  // at 300 ms, the cancel at 700 ms must not relabel it.
+  const bin = script('slow-term.cjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 800)); setTimeout(() => process.exit(3), 20000);");
+  const ctl = new AbortController();
+  setTimeout(() => ctl.abort(), 700);
+  const res = await runZCodeArgs(bin, [], { cwd: mk(), timeoutMs: 20000, idleTimeoutMs: 300, signal: ctl.signal });
+  assert.equal(res.timedOut, true);
+  assert.equal(res.timeoutKind, 'idle');
+});
+
+test('timeoutMs 1 is a real (1 ms) total cap', async () => {
+  const cwd = mk();
+  process.env.FAKE_ZCODE_MODE = 'hang';
+  const ctl = new AbortController();
+  const backstop = setTimeout(() => ctl.abort(), 5000); // ends the run if no cap was armed
+  try {
+    const res = await runZCodeTask({ binPath: fakeBin, prompt: 'hi', cwd, timeoutMs: 1, signal: ctl.signal });
+    assert.equal(res.timedOut, true);
+    assert.equal(res.timeoutKind, 'total');
+  } finally {
+    clearTimeout(backstop);
+    delete process.env.FAKE_ZCODE_MODE;
+  }
+});
+
+test('a binary that cannot be spawned yields code null and no leftovers', async () => {
+  const res = await runZCodeArgs('/no/such/dir/zcode-bin', [], { cwd: mk(), timeoutMs: 5000, killGroup: true });
+  assert.equal(res.code, null);
+  assert.equal(res.timedOut, false);
+  assert.equal(res.leftoverKilled, false);
+  assert.match(res.stderr, /failed to spawn/);
+});
+
+test('output after ZCode exited does not arm the idle timer again', async () => {
+  // The leader exits at once; a child holding the pipes writes 100 ms later
+  // and ends by itself at 1.2 s, well past the 300 ms idle limit.
+  const bin = script('late-writer.cjs', [
+    "const { spawn } = require('node:child_process');",
+    "spawn(process.execPath, ['-e', \"setTimeout(() => process.stdout.write('late\\\\n'), 100); setTimeout(() => process.exit(0), 1200);\"], { stdio: 'inherit' });",
+    'process.exit(0);',
+  ].join('\n'));
+  const res = await runZCodeArgs(bin, [], { cwd: mk(), timeoutMs: 20000, idleTimeoutMs: 300, stdioGraceMs: 5000 });
+  assert.equal(res.code, 0);
+  assert.match(res.stdout, /late/);
+  assert.equal(res.timedOut, false);
+  assert.equal(res.timeoutKind, null);
+});
+
+test('killGroup: a leftover that ends itself on SIGTERM gets the grace before any SIGKILL', async () => {
+  const dir = mk('zcode-script-');
+  const marker = join(dir, 'clean-exit');
+  const leftover = `process.on('SIGTERM', () => setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x'); process.exit(0); }, 300)); setTimeout(() => process.exit(0), 15000);`;
+  const bin = join(dir, 'leader.cjs');
+  writeFileSync(bin, [
+    "const { spawn } = require('node:child_process');",
+    `const gc = spawn(process.execPath, ['-e', ${JSON.stringify(leftover)}, 'fake-zcode-graceful'], { stdio: 'ignore' });`,
+    'process.stderr.write(`grandchild pid ${gc.pid}\\n`);',
+    'setTimeout(() => process.exit(0), 300);',
+  ].join('\n'));
+  let gc;
+  try {
+    const res = await runZCodeArgs(bin, [], { cwd: dir, timeoutMs: 20000, killGroup: true, leftoverGraceMs: 3000 });
+    gc = Number(res.stderr.match(/grandchild pid (\d+)/)[1]);
+    assert.equal(res.leftoverKilled, true);
+    assert.equal(existsSync(marker), true, 'the leftover finished its SIGTERM handler');
+    assert.equal(readFileSync(marker, 'utf8'), 'x');
+  } finally {
+    if (gc) safeSignal(gc, 'SIGKILL', { marker: 'fake-zcode-graceful' });
+  }
+});

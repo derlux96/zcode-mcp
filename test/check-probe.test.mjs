@@ -1,7 +1,7 @@
 // zcode_check: probe_model (one tiny real model request) and the provider config check.
 import { test, before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { createProtocol } from '../src/protocol.mjs';
 import { buildTools } from '../src/mcp-server.mjs';
@@ -251,4 +251,54 @@ test('the probe hint comes from the full error text, not the 300-char excerpt', 
   assert.equal(probe.hint, LOGIN_HINT);
   const ok = await probeModel({ run: async () => ({ ok: false, model: null, error: { message: 'HTTP 401 Unauthorized' } }), tmpRoot: ctx.tmpRoot });
   assert.equal('hint' in ok, false);
+});
+
+test('probeModel runs one killGroup turn without retries in a dir it removes, files and all', async () => {
+  const seen = [];
+  const run = async (opts) => {
+    seen.push(opts);
+    writeFileSync(join(opts.cwd, 'left-by-the-model.txt'), 'x');
+    mkdirSync(join(opts.cwd, 'sub'));
+    return { ok: true, model: { providerId: 'p', modelId: 'm' } };
+  };
+  const t0 = Date.now();
+  const probe = await probeModel({ run, tmpRoot: ctx.tmpRoot, timeoutMs: 1234, idleTimeoutMs: 567 });
+  assert.equal(probe.ok, true);
+  assert.equal(probe.model, 'p/m');
+  assert.ok(probe.durationMs >= 0 && probe.durationMs <= Date.now() - t0, String(probe.durationMs));
+  assert.equal(seen.length, 1);
+  const { cwd, signal, binPath, ...rest } = seen[0];
+  assert.equal(typeof binPath, 'string');
+  assert.ok(signal instanceof AbortSignal);
+  assert.ok(cwd.startsWith(realpathSync(ctx.tmpRoot)), cwd); // macOS: /var -> /private/var
+  assert.deepEqual(rest, { prompt: PROBE_PROMPT, timeoutMs: 1234, idleTimeoutMs: 567, killGroup: true, transientRetry: { maxRetries: 0 } });
+  // afterEach asserts the work dir is gone although it was not empty.
+});
+
+test('probeModel names the model only when both provider and model id are known', async () => {
+  for (const [model, want] of [[null, null], [{ providerId: 'p' }, null], [{ modelId: 'm' }, null], [{ providerId: 'p', modelId: 'm' }, 'p/m']]) {
+    const probe = await probeModel({ run: async () => ({ ok: true, model }), tmpRoot: ctx.tmpRoot });
+    assert.equal(probe.ok, true, JSON.stringify(model));
+    assert.equal(probe.model, want, JSON.stringify(model));
+  }
+});
+
+test('probeModel: "model is unavailable" is kind model without the login hint', async () => {
+  const probe = await probeModel({ run: async () => ({ ok: false, model: null, error: { message: 'the model is unavailable' } }), tmpRoot: ctx.tmpRoot });
+  assert.equal(probe.errorKind, 'model');
+  assert.equal('hint' in probe, false);
+  // The kind is decided on every diagnostic field (here the structured status), not only on the message.
+  const denied = await probeModel({ run: async () => ({ ok: false, model: null, error: { message: 'denied', statusCode: 401 } }), tmpRoot: ctx.tmpRoot });
+  assert.equal(denied.errorKind, 'auth');
+  assert.equal(denied.error, 'denied');
+});
+
+test('probeModel: a thrown error reports its message and is classified, not taken for a timeout', async () => {
+  const probe = await probeModel({ run: async () => { throw new Error('boom ECONNREFUSED'); }, tmpRoot: ctx.tmpRoot });
+  assert.deepEqual({ ...probe, durationMs: 0 }, { durationMs: 0, ok: false, model: null, errorKind: 'network', error: 'boom ECONNREFUSED' });
+  const timedOut = await probeModel({ run: async () => { throw Object.assign(new Error('idle for 3 s'), { code: 'idle' }); }, tmpRoot: ctx.tmpRoot });
+  assert.equal(timedOut.errorKind, 'timeout');
+  const thrownString = await probeModel({ run: async () => { throw 'plain text'; }, tmpRoot: ctx.tmpRoot }); // eslint-disable-line no-throw-literal
+  assert.equal(thrownString.error, 'plain text');
+  assert.equal(thrownString.errorKind, 'unknown');
 });
