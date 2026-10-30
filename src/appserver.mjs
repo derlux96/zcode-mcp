@@ -217,12 +217,14 @@ export class AppServerClient {
     }
   }
 
-  // Signal the child, or its whole process group when killGroup is set
-  // (signalGroup refuses a missing pid or a pgid <= 1 with a RangeError).
+  // Signal the child, or its whole process group when killGroup is set. The pid
+  // check repeats signalGroup's own guard on purpose: a second safety net on a
+  // kill path (a mutant of one guard must never reach process.kill(-1)).
   _kill(sig) {
-    if (this._killGroup) {
+    const pid = this.child.pid;
+    if (this._killGroup && Number.isInteger(pid) && pid > 1) {
       try {
-        signalGroup(this.child.pid, sig);
+        signalGroup(pid, sig);
         return;
       } catch {
         // fall back to the child alone
